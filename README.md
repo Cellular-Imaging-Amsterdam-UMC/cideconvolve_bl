@@ -13,14 +13,14 @@ SPITFIRE-style variational solver — all via PyTorch.
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v1.4.2 |
+| **Version** | v1.5.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
 | **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
 
 ---
 
-## Recent updates in v1.4.2
+## Recent updates in v1.5.0
 
 - **Finite confocal pinholes:** confocal PSF generation now supports a
   user-facing pinhole diameter in Airy disk units via `--pinhole_airy`.
