@@ -24,7 +24,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -201,9 +201,126 @@ def _format_pinhole_values(values: list[float]) -> str:
     return ", ".join(f"{value:.2f}" for value in values)
 
 
+def _metadata_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _metadata_float_list(value: Any) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = value
+    else:
+        values = str(value).replace(";", ",").split(",")
+    parsed: list[float] = []
+    for item in values:
+        number = _metadata_float(str(item).strip())
+        if number is not None:
+            parsed.append(number)
+    return parsed
+
+
+def _apply_map_metadata(meta: dict, values: dict[str, Any]) -> set[str]:
+    """Apply custom OME MapAnnotation values from benchmark-style OME-TIFFs."""
+    if not values:
+        return set()
+
+    applied: set[str] = set()
+    normalized = {str(key).strip().lower(): value for key, value in values.items()}
+
+    sample_ri = _metadata_float(normalized.get("samplerefractiveindex"))
+    if sample_ri is not None:
+        meta["sample_refractive_index"] = sample_ri
+        applied.add("sample_refractive_index")
+
+    pinhole_values = _metadata_float_list(normalized.get("pinholeairyunits"))
+    if pinhole_values:
+        channels = meta.get("channels") or []
+        if not channels:
+            channels = [{}]
+            meta["channels"] = channels
+        for idx, ch in enumerate(channels):
+            ch["pinhole_airy_units"] = (
+                pinhole_values[idx] if idx < len(pinhole_values) else pinhole_values[-1]
+            )
+        applied.add("pinhole_airy_units")
+
+    return applied
+
+
+def _microscope_type_from_text(value: Any) -> Optional[str]:
+    text = str(value or "").replace("_", " ").replace("-", " ").lower()
+    if "confocal" in text or "multi photon" in text:
+        return "confocal"
+    if "wide" in text:
+        return "widefield"
+    return None
+
+
+def _iter_annotation_dict_items(node: Any):
+    if isinstance(node, dict):
+        qname = node.get("qname")
+        attrs = node.get("attributes") or {}
+        if qname:
+            yield str(qname), {str(k): str(v) for k, v in attrs.items()}
+        for child in node.get("children") or []:
+            yield from _iter_annotation_dict_items(child)
+        for child in node.get("any_elements") or []:
+            yield from _iter_annotation_dict_items(child)
+
+
+def _apply_svi_xml_metadata(meta: dict, items) -> set[str]:
+    """Apply SVI/Huygens custom XML annotation values when present."""
+    applied: set[str] = set()
+    channels = meta.get("channels") or []
+    channel_by_id = {
+        str(ch.get("id", f"Channel:{idx}")).lower(): ch
+        for idx, ch in enumerate(channels)
+    }
+
+    for qname, attrs in items:
+        if qname.split("}")[-1] != "ChannelData":
+            continue
+
+        sample_ri = _metadata_float(attrs.get("RefrIndexMedium"))
+        if sample_ri is not None and meta.get("sample_refractive_index") is None:
+            meta["sample_refractive_index"] = sample_ri
+            applied.add("sample_refractive_index")
+
+        immersion_ri = _metadata_float(attrs.get("RefrIndexLensMedium"))
+        if immersion_ri is not None and meta.get("refractive_index") is None:
+            meta["refractive_index"] = immersion_ri
+            applied.add("refractive_index")
+
+        microscope_type = _microscope_type_from_text(attrs.get("MicroscopeSpec"))
+        if microscope_type is not None and not meta.get("microscope_type"):
+            meta["microscope_type"] = microscope_type
+            applied.add("microscope_type")
+
+        channel = channel_by_id.get(str(attrs.get("ChannelID", "")).lower())
+        if channel is None:
+            continue
+        emission = _metadata_float(attrs.get("LambdaEm"))
+        if emission is not None and channel.get("emission_wavelength") is None:
+            channel["emission_wavelength"] = emission
+            applied.add("emission_wavelength")
+        excitation = _metadata_float(attrs.get("LambdaEx"))
+        if excitation is not None and channel.get("excitation_wavelength") is None:
+            channel["excitation_wavelength"] = excitation
+            applied.add("excitation_wavelength")
+
+    return applied
+
+
 def _apply_pinhole_airy_units(meta: dict, fallback_airy_units: float = _DEFAULT_PINHOLE_AIRY_UNITS) -> bool:
     metadata_used = False
     for ch in meta.get("channels") or []:
+        if ch.get("pinhole_airy_units") is not None:
+            metadata_used = True
+            continue
         calculated = _calculate_pinhole_airy_units(
             ch.get("pinhole_size"),
             ch.get("pinhole_size_unit"),
@@ -562,6 +679,7 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
             ch_list = []
             for c in (im0.pixels.channels or []):
                 ch_d: dict = {}
+                ch_d["id"] = getattr(c, "id", None)
                 if c.emission_wavelength is not None:
                     ch_d["emission_wavelength"] = float(c.emission_wavelength)
                 if c.excitation_wavelength is not None:
@@ -580,6 +698,29 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
                 ch_list.append(ch_d)
             if ch_list:
                 meta["channels"] = ch_list
+
+            structured = getattr(ome, "structured_annotations", None)
+            map_values: dict[str, str] = {}
+            if structured is not None:
+                for annotation in getattr(structured, "map_annotations", []) or []:
+                    value = getattr(annotation, "value", None)
+                    for item in getattr(value, "ms", []) or []:
+                        key = getattr(item, "k", None)
+                        val = getattr(item, "value", None)
+                        if key and val is not None:
+                            map_values[str(key)] = str(val)
+            _apply_map_metadata(meta, map_values)
+
+            xml_items = []
+            if structured is not None:
+                for annotation in getattr(structured, "xml_annotations", []) or []:
+                    value = getattr(annotation, "value", None)
+                    if hasattr(value, "model_dump"):
+                        value = value.model_dump()
+                    elif hasattr(value, "dict"):
+                        value = value.dict()
+                    xml_items.extend(_iter_annotation_dict_items(value))
+            _apply_svi_xml_metadata(meta, xml_items)
 
             # Objective (NA, immersion → RI)
             if ome.instruments:
@@ -3417,9 +3558,13 @@ class DeconvolveCIWindow(QMainWindow):
         self._le_pinhole_na.setStyleSheet(
             _bg("pinhole_airy_units" in from_file))
 
-        # RI sample is never in metadata — red (needs user input)
-        self._sp_ri_sample.setStyleSheet(
-            "background-color: #ffe0e0; color: black;")  # pastel red
+        sample_ri = meta.get("sample_refractive_index")
+        if sample_ri:
+            self._sp_ri_sample.setValue(float(sample_ri))
+            self._sp_ri_sample.setStyleSheet(_bg("sample_refractive_index" in from_file))
+        else:
+            self._sp_ri_sample.setStyleSheet(
+                "background-color: #ffe0e0; color: black;")  # pastel red
 
         self._viewer.set_input_data([], self._metadata)
         self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)

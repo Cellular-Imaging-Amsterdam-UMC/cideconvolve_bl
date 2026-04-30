@@ -4,19 +4,41 @@
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
-images.  It generates a physically accurate PSF from OME-TIFF metadata
-(Gibson–Lanni model) and applies one of three native GPU-capable
-deconvolution methods: SHB-accelerated Richardson-Lucy, SHB-RL with
-Total Variation regularisation, or a sparse-Hessian / SPITFIRE-style
-variational solver — all on the GPU via PyTorch.
+images.  It reads OME-TIFF / OME-Zarr metadata where available, generates a
+physically accurate PSF from the optical parameters, and applies one of three
+native GPU-capable deconvolution methods: SHB-accelerated Richardson-Lucy,
+SHB-RL with Total Variation regularisation, or a sparse-Hessian /
+SPITFIRE-style variational solver — all via PyTorch.
 
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v1.0.0 |
+| **Version** | v1.4.2 |
 | **Container type** | Singularity (pulled from Docker Hub) |
 | **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
+
+---
+
+## Recent updates in v1.4.2
+
+- **Finite confocal pinholes:** confocal PSF generation now supports a
+  user-facing pinhole diameter in Airy disk units via `--pinhole_airy`.
+  Per-channel metadata pinhole sizes are converted to Airy units when NA,
+  magnification, and emission wavelength are available.
+- **Richer OME metadata reading:** OME MapAnnotation and SVI/Huygens XML
+  annotations are now used for sample RI, immersion RI, wavelengths,
+  acquisition mode, and custom pinhole Airy values when present.
+- **Per-channel optics in the GUI:** emission wavelength, excitation
+  wavelength, and confocal pinhole Airy units can be shown and edited as
+  comma-separated per-channel values.
+- **Improved GUI image viewing:** loaded-image logs show per-channel
+  metadata, pinhole values, intensity statistics, and sample RI. The
+  advanced scaling dialog uses faster histogram sampling, debounced slider
+  updates, and works with slice, MIP, and SUM projections.
+- **2D widefield auto mode:** single-plane widefield data can use the
+  enhanced widefield-aware 2D model with expert controls for aggressiveness
+  and background estimation.
 
 ---
 
@@ -49,7 +71,7 @@ high-contrast structures while suppressing noise.  Controlled by
 The RL-family methods also support:
 
 - **Noise-gated damping** via `--damping`
-- **Positive offseting** via `--offset`
+- **Positive offsetting** via `--offset`
 - **Anscombe-domain Gaussian prefiltering** via `--prefilter_sigma`
 - **Initial estimate selection** via `--start flat|observed|lowpass`
 - **Enhanced 2D widefield restoration** via `--two_d_mode auto`, which uses a
@@ -117,7 +139,7 @@ See `cideconvolve.slurm` for full usage and resource settings.
 ## Building the Docker image locally
 
 ```bash
-docker build -t w_cideconvolve:v1.0.0 -t w_cideconvolve:latest .
+docker build -t w_cideconvolve:v1.4.2 -t w_cideconvolve:latest .
 ```
 
 The Dockerfile builds on the **NVIDIA CUDA 12.6 runtime** image with
@@ -149,8 +171,8 @@ Replace paths as needed.  The `--gpus all` flag enables NVIDIA GPU
 pass-through.  Omit it to force CPU-only execution.
 
 By default, image metadata is used for NA, wavelengths, pixel sizes,
-microscope type, and refractive indices where present; descriptor/CLI values
-are used as fallbacks when image metadata is missing. Add
+microscope type, confocal pinhole, and refractive indices where present;
+descriptor/CLI values are used as fallbacks when image metadata is missing. Add
 `--overrule_image_metadata True` to force the descriptor/CLI values for those
 fields.
 
@@ -207,9 +229,10 @@ python launcher.py
 The launcher saves your last-used settings and can restore them on next
 launch via the **Restore Last Settings** button.
 
-The standalone deconvolution GUI also supports OMERO browsing plus
-synchronized dual-pane XYZT / 3D viewing when the `omero-browser-qt[viewer]`
-dependency is installed.
+The standalone deconvolution GUI also supports local OME-TIFF / OME-Zarr
+opening, OMERO browsing, synchronized dual-pane XYZT / 3D viewing, per-channel
+optics fields, SUM/MIP projections, and an advanced scaling dialog when the
+GUI dependencies are installed.
 
 ---
 
@@ -244,12 +267,40 @@ command line via `wrapper.py`:
 | `--start` | flat | Initial estimate: `flat`, `observed`, or `lowpass` |
 | `--convergence` | auto | Early-stopping convergence: `auto` or `none` |
 | `--rel_threshold` | 0.005 | Relative change threshold for early stopping |
+| `--two_d_wf_aggressiveness` | 0.6 | Expert tuning for enhanced 2D widefield auto mode |
+| `--two_d_wf_bg_radius_um` | 2.0 | Background-estimator radius in micrometers for enhanced 2D widefield auto mode |
+| `--two_d_wf_bg_scale` | 0.75 | Background-estimator scale factor for enhanced 2D widefield auto mode |
 | `--pixel_size_xy` | 65 | Lateral pixel size fallback in nm, or override when metadata is overruled |
 | `--pixel_size_z` | 200 | Axial pixel size fallback in nm, or override when metadata is overruled |
 | `--projection` | none | Z-projection: `none`, `mip`, `sum` |
 | `--benchmark` | false | Run benchmark mode |
 | `--bench_crop` | false | Centre-crop image to tile-size limits before benchmarking |
 | `--compute_metrics` | false | Compute optional deconvolution-effect image metrics |
+
+---
+
+## Metadata behavior
+
+When `--overrule_image_metadata false`, image metadata wins and descriptor /
+CLI values are used only as fallbacks. When it is true, descriptor / CLI
+values replace image metadata.
+
+OME-TIFF and OME-Zarr readers use standard OME fields for pixel size,
+objective NA, magnification, immersion RI, wavelengths, acquisition mode, and
+pinhole size. The OME-TIFF reader also understands benchmark-style
+`MapAnnotation` keys such as `SampleRefractiveIndex` and `PinholeAiryUnits`,
+plus SVI/Huygens XML annotations such as `RefrIndexMedium`,
+`RefrIndexLensMedium`, `LambdaEm`, and `LambdaEx`.
+
+For confocal data, physical metadata pinhole diameters are converted to Airy
+disk units as:
+
+```text
+AU = pinhole_um / (1.22 * emission_um * magnification / NA)
+```
+
+Use `--pinhole_airy 0` for the legacy point-detector confocal model. Widefield
+PSFs ignore the pinhole parameter.
 
 ---
 
