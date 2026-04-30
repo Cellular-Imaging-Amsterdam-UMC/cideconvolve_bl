@@ -92,6 +92,31 @@ _VOLUME_METHOD_UI = {
     "additive": {"label": "Gain:", "range": (1, 200), "default": 28, "role": "gain"},
 }
 _INTERPOLATION_TOGGLE_METHODS = set(_VOLUME_METHODS) - {"iso"}
+_MAX_HIST_SAMPLES = 1_000_000
+_MAX_VIEW_PIXELS = 2_000_000
+
+
+def _sample_flat_for_hist(arr: np.ndarray, max_samples: int = _MAX_HIST_SAMPLES) -> np.ndarray:
+    """Return a cheap representative 1-D sample for histogram/percentile work."""
+    flat = np.asarray(arr).ravel()
+    if flat.size <= max_samples:
+        return flat
+    step = max(1, int(np.ceil(flat.size / max_samples)))
+    return flat[::step]
+
+
+def _finite_sample(arr: np.ndarray, max_samples: int = _MAX_HIST_SAMPLES) -> np.ndarray:
+    sample = _sample_flat_for_hist(arr, max_samples)
+    if sample.size == 0:
+        return sample
+    return sample[np.isfinite(sample)]
+
+
+def _display_stride(shape: tuple[int, int], max_pixels: int = _MAX_VIEW_PIXELS) -> int:
+    pixels = int(shape[0]) * int(shape[1])
+    if pixels <= max_pixels:
+        return 1
+    return max(1, int(np.ceil(np.sqrt(pixels / max_pixels))))
 
 
 def _emission_to_rgb(wavelength_nm: Optional[float]) -> tuple[int, int, int]:
@@ -198,12 +223,15 @@ def _composite_to_pixmap(
 ) -> QPixmap:
     if not slices:
         return QPixmap()
+    stride = _display_stride(slices[0][0].shape)
+    if stride > 1:
+        slices = [(arr[::stride, ::stride], color, contrast) for arr, color, contrast in slices]
     height, width = slices[0][0].shape
-    canvas = np.zeros((height, width, 3), dtype=np.float64)
+    canvas = np.zeros((height, width, 3), dtype=np.float32)
     for arr, (cr, cg, cb), (lo, hi, gamma) in slices:
         if hi <= lo:
             hi = lo + 1.0
-        norm = (arr.astype(np.float64) - lo) / (hi - lo)
+        norm = (arr.astype(np.float32, copy=False) - np.float32(lo)) / np.float32(hi - lo)
         np.clip(norm, 0.0, 1.0, out=norm)
         gamma_safe = max(float(gamma), 1e-3)
         if abs(gamma_safe - 1.0) > 1e-6:
@@ -839,6 +867,11 @@ class _AdvancedScalingWindow(QWidget):
         self._channel_maxima: list[dict[str, float]] = []
         self._histograms: list[dict[str, object]] = []
         self._current_range_max: dict[str, float] = {"original": 1.0, "deconvolved": 1.0}
+        self._pending_levels_index: Optional[int] = None
+        self._levels_emit_timer = QTimer(self)
+        self._levels_emit_timer.setSingleShot(True)
+        self._levels_emit_timer.setInterval(120)
+        self._levels_emit_timer.timeout.connect(self._emit_pending_levels)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -1202,14 +1235,23 @@ class _AdvancedScalingWindow(QWidget):
         self._updating = False
         self._refresh_histogram()
         if emit:
-            self.channelLevelsChanged.emit(
-                idx,
-                {
-                    "original": dict(original),
-                    "deconvolved": dict(deconvolved),
-                    "gamma": gamma_val,
-                },
-            )
+            self._pending_levels_index = idx
+            self._levels_emit_timer.start()
+
+    def _emit_pending_levels(self) -> None:
+        idx = self._pending_levels_index
+        self._pending_levels_index = None
+        if idx is None or idx < 0 or idx >= len(self._channel_levels):
+            return
+        levels = self._normalize_levels(idx)
+        self.channelLevelsChanged.emit(
+            idx,
+            {
+                "original": dict(levels["original"]),
+                "deconvolved": dict(levels["deconvolved"]),
+                "gamma": float(levels["gamma"]),
+            },
+        )
 
     def _normalize_levels(self, index: int) -> dict[str, object]:
         maxima = self._channel_maxima[index] if index < len(self._channel_maxima) else {}
@@ -1366,6 +1408,7 @@ class DualViewerWidget(QWidget):
         self._channel_buttons: list[QPushButton] = []
         self._channel_colors: list[tuple[int, int, int]] = []
         self._channel_scaling: list[dict[str, float]] = []
+        self._channel_scaling_projection: Optional[str] = None
         self._advanced_scaling_window: Optional[_AdvancedScalingWindow] = None
         self._advanced_scaling_active = False
         self._available_volume_methods = list(_VOLUME_METHODS)
@@ -1379,6 +1422,7 @@ class DualViewerWidget(QWidget):
         # Histogram cache: id(numpy_array) -> (bin_edges, counts).
         # Cleared when new image data is loaded so stale entries don't accumulate.
         self._hist_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._max_cache: dict[int, float] = {}
         # SUM projection cache: id(stack) -> precomputed 2-D sum plane.
         # Held here so the array stays alive and its id() is stable for
         # _hist_cache keying (SUM values are n_z× larger than stack values
@@ -1440,7 +1484,7 @@ class DualViewerWidget(QWidget):
         view_layout.addWidget(QLabel("View:"))
         self._projection_combo = QComboBox()
         self._projection_combo.addItems(_PROJECTION_MODES)
-        self._projection_combo.currentTextChanged.connect(self._refresh_view)
+        self._projection_combo.currentTextChanged.connect(self._on_projection_changed)
         view_layout.addWidget(self._projection_combo)
         top.addWidget(view_group)
 
@@ -1571,6 +1615,7 @@ class DualViewerWidget(QWidget):
 
     def set_input_data(self, channels: list[np.ndarray], metadata: dict) -> None:
         self._hist_cache.clear()
+        self._max_cache.clear()
         self._sum_cache.clear()
         self._input_channels = channels
         self._loaded_input_timepoint = None
@@ -1602,6 +1647,7 @@ class DualViewerWidget(QWidget):
 
     def set_input_timepoint_data(self, timepoint: int, channels_zyx: list[np.ndarray]) -> None:
         self._hist_cache.clear()
+        self._max_cache.clear()
         self._sum_cache.clear()
         self._input_channels = list(channels_zyx)
         self._loaded_input_timepoint = int(timepoint)
@@ -1612,6 +1658,7 @@ class DualViewerWidget(QWidget):
 
     def clear_preview_results(self) -> None:
         self._hist_cache.clear()
+        self._max_cache.clear()
         self._sum_cache.clear()
         self._preview_by_t.clear()
         self._sync_advanced_scaling_window()
@@ -1625,9 +1672,11 @@ class DualViewerWidget(QWidget):
             for arr in old:
                 key = id(arr)
                 self._hist_cache.pop(key, None)
+                self._max_cache.pop(key, None)
                 sum_plane = self._sum_cache.pop(key, None)
                 if sum_plane is not None:
                     self._hist_cache.pop(id(sum_plane), None)
+                    self._max_cache.pop(id(sum_plane), None)
         self._preview_by_t[int(timepoint)] = channels_zyx
         self._ensure_channel_scaling_defaults()
         self._sync_advanced_scaling_window()
@@ -1673,9 +1722,14 @@ class DualViewerWidget(QWidget):
 
     def _reset_channel_scaling(self) -> None:
         self._channel_scaling = []
+        self._channel_scaling_projection = self._active_scaling_projection()
         self._ensure_channel_scaling_defaults()
 
     def _ensure_channel_scaling_defaults(self) -> None:
+        projection = self._active_scaling_projection()
+        if self._channel_scaling_projection != projection:
+            self._channel_scaling = []
+            self._channel_scaling_projection = projection
         channel_count = len(self._display_channels())
         while len(self._channel_scaling) < channel_count:
             idx = len(self._channel_scaling)
@@ -1683,11 +1737,11 @@ class DualViewerWidget(QWidget):
                 {
                     "original": {
                         "min": 0.0,
-                        "max": self._pane_channel_max_value(idx, "original"),
+                        "max": self._pane_channel_max_value(idx, "original", projection),
                     },
                     "deconvolved": {
                         "min": 0.0,
-                        "max": self._pane_channel_max_value(idx, "deconvolved"),
+                        "max": self._pane_channel_max_value(idx, "deconvolved", projection),
                     },
                     "gamma": 1.0,
                 }
@@ -1695,8 +1749,8 @@ class DualViewerWidget(QWidget):
         if len(self._channel_scaling) > channel_count:
             self._channel_scaling = self._channel_scaling[:channel_count]
         for idx, state in enumerate(self._channel_scaling):
-            original_max = self._pane_channel_max_value(idx, "original")
-            deconvolved_max = self._pane_channel_max_value(idx, "deconvolved")
+            original_max = self._pane_channel_max_value(idx, "original", projection)
+            deconvolved_max = self._pane_channel_max_value(idx, "deconvolved", projection)
             if not isinstance(state.get("original"), dict):
                 state["original"] = {"min": 0.0, "max": original_max}
             if not isinstance(state.get("deconvolved"), dict):
@@ -1771,6 +1825,11 @@ class DualViewerWidget(QWidget):
             histograms,
         )
 
+    def _active_scaling_projection(self) -> str:
+        if self._mode_combo.currentText() != _TWO_D_MODE:
+            return "Slice"
+        return self._projection_combo.currentText()
+
     def _pane_channel_source(self, index: int, pane: str) -> Optional[np.ndarray]:
         if pane == "original":
             if 0 <= index < len(self._input_channels):
@@ -1781,38 +1840,58 @@ class DualViewerWidget(QWidget):
             return preview[index]
         return None
 
-    def _pane_channel_max_value(self, index: int, pane: str) -> float:
+    def _pane_channel_projection_source(
+        self,
+        index: int,
+        pane: str,
+        projection: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
         source = self._pane_channel_source(index, pane)
         if source is None:
+            return None
+        projection = projection or self._active_scaling_projection()
+        if projection == "SUM":
+            key = id(source)
+            if key not in self._sum_cache:
+                self._sum_cache[key] = np.asarray(source).sum(axis=0).astype(np.float64)
+            return self._sum_cache[key]
+        return source
+
+    def _pane_channel_max_value(self, index: int, pane: str, projection: Optional[str] = None) -> float:
+        source = self._pane_channel_projection_source(index, pane, projection)
+        if source is None:
             return 0.0
-        arr = np.asarray(source, dtype=np.float64)
+        arr = np.asarray(source)
         if arr.size == 0:
             return 0.0
+        key = id(source)
+        cached = self._max_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             max_val = float(np.nanmax(arr))
         except ValueError:
             return 0.0
         if not np.isfinite(max_val):
             return 0.0
-        return max(max_val, 0.0)
+        result = max(max_val, 0.0)
+        self._max_cache[key] = result
+        return result
 
-    def _channel_maxima(self, index: int) -> dict[str, float]:
-        original_max = self._pane_channel_max_value(index, "original")
-        deconvolved_max = self._pane_channel_max_value(index, "deconvolved")
+    def _channel_maxima(self, index: int, projection: Optional[str] = None) -> dict[str, float]:
+        original_max = self._pane_channel_max_value(index, "original", projection)
+        deconvolved_max = self._pane_channel_max_value(index, "deconvolved", projection)
         return {
             "original": original_max,
             "deconvolved": deconvolved_max,
             "shared": max(original_max, deconvolved_max, 1.0),
         }
 
-    def _channel_histogram_counts(self, index: int, pane: str, hist_max: float) -> np.ndarray:
-        source = self._pane_channel_source(index, pane)
+    def _channel_histogram_counts(self, index: int, pane: str, hist_max: float, projection: Optional[str] = None) -> np.ndarray:
+        source = self._pane_channel_projection_source(index, pane, projection)
         if source is None:
             return np.zeros(512, dtype=np.int64)
-        arr = np.asarray(source, dtype=np.float64)
-        if arr.size == 0:
-            return np.zeros(512, dtype=np.int64)
-        finite = arr[np.isfinite(arr)]
+        finite = _finite_sample(np.asarray(source))
         if finite.size == 0:
             return np.zeros(512, dtype=np.int64)
         finite = np.clip(finite, 0.0, hist_max)
@@ -1820,21 +1899,23 @@ class DualViewerWidget(QWidget):
         return counts.astype(np.int64, copy=False)
 
     def _channel_histogram_bundle(self, index: int) -> dict[str, object]:
-        maxima = self._channel_maxima(index)
+        projection = self._active_scaling_projection()
+        maxima = self._channel_maxima(index, projection)
         original_hist_max = max(float(maxima.get("original", 0.0)), 1.0)
         deconvolved_hist_max = max(float(maxima.get("deconvolved", 0.0)), 1.0)
         return {
             "original_bin_edges": np.linspace(0.0, original_hist_max, 513, dtype=np.float64),
             "deconvolved_bin_edges": np.linspace(0.0, deconvolved_hist_max, 513, dtype=np.float64),
-            "original": self._channel_histogram_counts(index, "original", original_hist_max),
-            "deconvolved": self._channel_histogram_counts(index, "deconvolved", deconvolved_hist_max),
+            "original": self._channel_histogram_counts(index, "original", original_hist_max, projection),
+            "deconvolved": self._channel_histogram_counts(index, "deconvolved", deconvolved_hist_max, projection),
             "has_original": self._pane_channel_source(index, "original") is not None,
             "has_deconvolved": self._pane_channel_source(index, "deconvolved") is not None,
         }
 
     def _channel_contrast(self, stack: np.ndarray, index: int, pane: str, projection: str = "Slice") -> tuple[float, float, float]:
         if self._advanced_scaling_active and 0 <= index < len(self._channel_scaling):
-            maxima = self._channel_maxima(index)
+            self._ensure_channel_scaling_defaults()
+            maxima = self._channel_maxima(index, projection)
             pane_max = max(float(maxima.get(pane, 0.0)), 0.0)
             levels = self._channel_scaling[index]
             pane_levels = dict(levels.get(pane) or {})
@@ -1921,6 +2002,17 @@ class DualViewerWidget(QWidget):
         self._z_slider.setEnabled(mode == _TWO_D_MODE and self._z_slider.maximum() > 0 and self._projection_combo.currentText() == "Slice")
         self._refresh_view()
 
+    def _on_projection_changed(self, _projection: str) -> None:
+        self._z_slider.setEnabled(
+            self._mode_combo.currentText() == _TWO_D_MODE
+            and self._z_slider.maximum() > 0
+            and self._projection_combo.currentText() == "Slice"
+        )
+        self._channel_scaling_projection = None
+        self._ensure_channel_scaling_defaults()
+        self._sync_advanced_scaling_window()
+        self._refresh_view()
+
     def _on_time_changed(self, value: int) -> None:
         self._update_labels()
         self.timepointChanged.emit(value)
@@ -1964,14 +2056,15 @@ class DualViewerWidget(QWidget):
         original = dict(data.get("original") or self._channel_scaling[index].get("original") or {})
         deconvolved = dict(data.get("deconvolved") or self._channel_scaling[index].get("deconvolved") or {})
         gamma = float(data.get("gamma", self._channel_scaling[index].get("gamma", 1.0)))
+        projection = self._active_scaling_projection()
         self._channel_scaling[index] = {
             "original": {
                 "min": float(original.get("min", 0.0)),
-                "max": float(original.get("max", self._pane_channel_max_value(index, "original"))),
+                "max": float(original.get("max", self._pane_channel_max_value(index, "original", projection))),
             },
             "deconvolved": {
                 "min": float(deconvolved.get("min", 0.0)),
-                "max": float(deconvolved.get("max", self._pane_channel_max_value(index, "deconvolved"))),
+                "max": float(deconvolved.get("max", self._pane_channel_max_value(index, "deconvolved", projection))),
             },
             "gamma": gamma,
         }
@@ -1985,8 +2078,9 @@ class DualViewerWidget(QWidget):
         deconvolved_bin_edges = np.asarray(bundle["deconvolved_bin_edges"], dtype=np.float64)
         original_counts = np.asarray(bundle["original"], dtype=np.float64)
         deconvolved_counts = np.asarray(bundle["deconvolved"], dtype=np.float64)
-        original_max = self._pane_channel_max_value(index, "original")
-        deconvolved_max = self._pane_channel_max_value(index, "deconvolved")
+        projection = self._active_scaling_projection()
+        original_max = self._pane_channel_max_value(index, "original", projection)
+        deconvolved_max = self._pane_channel_max_value(index, "deconvolved", projection)
         if bool(bundle.get("has_original", False)) and np.any(original_counts > 0):
             original_lo = _percentile_from_hist(original_bin_edges, original_counts, self._lo_spin.value())
             original_hi = _percentile_from_hist(original_bin_edges, original_counts, self._hi_spin.value())
@@ -2020,11 +2114,11 @@ class DualViewerWidget(QWidget):
         self._channel_scaling[index] = {
             "original": {
                 "min": 0.0,
-                "max": self._pane_channel_max_value(index, "original"),
+                "max": self._pane_channel_max_value(index, "original", self._active_scaling_projection()),
             },
             "deconvolved": {
                 "min": 0.0,
-                "max": self._pane_channel_max_value(index, "deconvolved"),
+                "max": self._pane_channel_max_value(index, "deconvolved", self._active_scaling_projection()),
             },
             "gamma": 1.0,
         }
@@ -2212,7 +2306,9 @@ class DualViewerWidget(QWidget):
             src = stack
         key = id(src)
         if key not in self._hist_cache:
-            flat = src.ravel()
+            flat = _finite_sample(src)
+            if flat.size == 0:
+                return 0.0, 1.0
             vmin, vmax = float(flat.min()), float(flat.max())
             if vmax <= vmin:
                 vmax = vmin + 1.0

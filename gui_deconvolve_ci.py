@@ -63,6 +63,7 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QToolButton,
     QVBoxLayout,
@@ -131,6 +132,92 @@ def _default_settings_dir() -> str:
         if docs.is_dir():
             return str(docs)
     return str(Path.home())
+
+
+_DEFAULT_PINHOLE_AIRY_UNITS = 1.0
+
+
+def _ome_enum_name(value: Any) -> str:
+    if value is None:
+        return ""
+    name = getattr(value, "name", None)
+    text = str(name if name is not None else value).strip()
+    return text.split(".")[-1].lower()
+
+
+def _display_enum_name(value: Any) -> str:
+    """Return a readable label for OME enum-like metadata values."""
+    if value is None:
+        return ""
+    name = getattr(value, "name", None)
+    text = str(name if name is not None else value).strip().split(".")[-1]
+    return text.replace("_", " ").title() if text.isupper() else text
+
+
+def _pinhole_size_to_um(size: Any, unit: Any) -> Optional[float]:
+    if size is None:
+        return None
+    try:
+        size_f = float(size)
+    except (TypeError, ValueError):
+        return None
+    unit_name = _ome_enum_name(unit)
+    if unit_name in ("", "µm", "um", "micrometer", "micrometre", "micrometers", "micrometres"):
+        return size_f
+    if unit_name in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
+        return size_f / 1000.0
+    if unit_name in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
+        return size_f * 1000.0
+    if unit_name in ("m", "meter", "metre", "meters", "metres"):
+        return size_f * 1_000_000.0
+    return None
+
+
+def _calculate_pinhole_airy_units(
+    pinhole_size: Any,
+    pinhole_unit: Any,
+    emission_wavelength_nm: Any,
+    na: Any,
+    magnification: Any,
+) -> Optional[float]:
+    pinhole_um = _pinhole_size_to_um(pinhole_size, pinhole_unit)
+    try:
+        emission_um = float(emission_wavelength_nm) / 1000.0
+        na_f = float(na)
+        mag_f = float(magnification)
+    except (TypeError, ValueError):
+        return None
+    denom = 1.22 * emission_um * mag_f / max(na_f, 1e-12)
+    if pinhole_um is None or denom <= 0.0:
+        return None
+    return float(pinhole_um / denom)
+
+
+def _format_float_list(values: list[float]) -> str:
+    return ", ".join(f"{value:g}" for value in values)
+
+
+def _format_pinhole_values(values: list[float]) -> str:
+    return ", ".join(f"{value:.2f}" for value in values)
+
+
+def _apply_pinhole_airy_units(meta: dict, fallback_airy_units: float = _DEFAULT_PINHOLE_AIRY_UNITS) -> bool:
+    metadata_used = False
+    for ch in meta.get("channels") or []:
+        calculated = _calculate_pinhole_airy_units(
+            ch.get("pinhole_size"),
+            ch.get("pinhole_size_unit"),
+            ch.get("emission_wavelength"),
+            meta.get("na"),
+            meta.get("magnification"),
+        )
+        if calculated is not None:
+            ch["pinhole_airy_units"] = calculated
+            ch["pinhole_airy_units_from_metadata"] = calculated
+            metadata_used = True
+        else:
+            ch.setdefault("pinhole_airy_units", float(fallback_airy_units))
+    return metadata_used
 
 # ---------------------------------------------------------------------------
 # Channel colour helpers (same scheme as deconvolve.save_mip_png)
@@ -340,6 +427,8 @@ def _apply_metadata_defaults(images: list, meta: dict) -> dict:
             meta_keys_from_file.add("emission_wavelength")
         if all("excitation_wavelength" in c for c in ch_list):
             meta_keys_from_file.add("excitation_wavelength")
+        if all("acquisition_mode" in c for c in ch_list):
+            meta_keys_from_file.add("acquisition_mode")
 
     meta.setdefault("na", 1.4)
     meta.setdefault("pixel_size_x", 0.065)
@@ -347,7 +436,9 @@ def _apply_metadata_defaults(images: list, meta: dict) -> dict:
     meta.setdefault("refractive_index", 1.515)
     meta.setdefault("microscope_type", "widefield")
     if "channels" not in meta:
-        meta["channels"] = [{"emission_wavelength": 520.0}] * len(images)
+        meta["channels"] = [{"emission_wavelength": 520.0} for _ in images]
+    if _apply_pinhole_airy_units(meta):
+        meta_keys_from_file.add("pinhole_airy_units")
     if "channel_names" not in meta:
         meta["channel_names"] = [f"Ch {i}" for i in range(len(images))]
     meta["n_channels"] = len(images)
@@ -475,13 +566,18 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
                     ch_d["emission_wavelength"] = float(c.emission_wavelength)
                 if c.excitation_wavelength is not None:
                     ch_d["excitation_wavelength"] = float(c.excitation_wavelength)
-                ch_list.append(ch_d)
-                # Acquisition mode (use first channel's)
-                if c.acquisition_mode and "microscope_type" not in meta:
+                if getattr(c, "pinhole_size", None) is not None:
+                    ch_d["pinhole_size"] = float(c.pinhole_size)
+                    ch_d["pinhole_size_unit"] = _ome_enum_name(getattr(c, "pinhole_size_unit", None))
+                # Acquisition mode (use first channel's for top-level microscope type)
+                if c.acquisition_mode:
                     name = getattr(c.acquisition_mode, "name",
                                    str(c.acquisition_mode))
-                    meta["microscope_type"] = _ACQ_MODE_MAP.get(
-                        name, "widefield")
+                    ch_d["acquisition_mode"] = _display_enum_name(c.acquisition_mode)
+                    if "microscope_type" not in meta:
+                        meta["microscope_type"] = _ACQ_MODE_MAP.get(
+                            name, "widefield")
+                ch_list.append(ch_d)
             if ch_list:
                 meta["channels"] = ch_list
 
@@ -491,6 +587,8 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
                     for obj in (inst.objectives or []):
                         if obj.lens_na and "na" not in meta:
                             meta["na"] = float(obj.lens_na)
+                        if obj.nominal_magnification and "magnification" not in meta:
+                            meta["magnification"] = float(obj.nominal_magnification)
                         if obj.immersion and "refractive_index" not in meta:
                             imm_name = getattr(
                                 obj.immersion, "name",
@@ -927,6 +1025,10 @@ def _image_detail_lines(display_name: str, source_path: Optional[Path], meta: di
             f"mode={ch_meta.get('acquisition_mode', '?')}"
         )
         lines.append(
+            f"    pinhole    : size={_format_value(ch_meta.get('pinhole_size'), ch_meta.get('pinhole_size_unit') or '')}  "
+            f"effective={_format_value(ch_meta.get('pinhole_airy_units'), 'AU')}"
+        )
+        lines.append(
             f"    intensity  : min={stats['min']:.4g} p1={stats['p1']:.4g} "
             f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
             f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
@@ -953,14 +1055,17 @@ def _format_channel_values(
     channels: list[dict],
     key: str,
     default: float,
+    *,
+    digits: Optional[int] = None,
 ) -> str:
     values: list[str] = []
     for channel in channels:
         value = channel.get(key)
         try:
-            values.append(str(float(value if value is not None else default)))
+            numeric = float(value if value is not None else default)
         except (TypeError, ValueError):
-            values.append(str(float(default)))
+            numeric = float(default)
+        values.append(f"{numeric:.{digits}f}" if digits is not None else str(numeric))
     return ", ".join(values)
 
 
@@ -1878,6 +1983,12 @@ def _deconvolve_channel_stacks(
         ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
         if params["microscope_type"] != "confocal":
             ex_wl = None
+        pinhole_list = params["pinhole_airy_units"]
+        pinhole_airy = (
+            pinhole_list[ci] if ci < len(pinhole_list)
+            else pinhole_list[-1] if pinhole_list
+            else _DEFAULT_PINHOLE_AIRY_UNITS
+        )
 
         use_2d_wf_auto = (
             ch_data.ndim == 2
@@ -1929,6 +2040,7 @@ def _deconvolve_channel_stacks(
             z_p=params["z_p"],
             microscope_type=params["microscope_type"],
             excitation_nm=ex_wl,
+            pinhole_airy_units=pinhole_airy,
             integrate_pixels=params["integrate_pixels"],
             n_subpixels=params["n_subpixels"],
             n_pupil=params["n_pupil"],
@@ -2086,6 +2198,10 @@ class _DeconvolveWorker(QThread):
                 self.progress.emit(f"  TV lambda   : {self.params['tv_lambda']}")
             if self.params["method"] in ("ci_rl", "ci_rl_tv"):
                 self.progress.emit(f"  Damping     : {self.params['damping']}")
+                if self.params["microscope_type"] == "confocal":
+                    self.progress.emit(
+                        f"  Pinhole     : {_format_float_list(self.params['pinhole_airy_units'])} AU"
+                    )
                 self.progress.emit(
                     f"  2D WF mode  : {self.params['two_d_mode']} "
                     f"(aggr={self.params['two_d_wf_aggressiveness']}, "
@@ -2272,6 +2388,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._omero_gw = None  # OmeroGateway instance (lazy)
         self._omero_session_deadline: float = 0.0
         self._excitation_saved: str = "488"  # remembered when field is disabled
+        self._pinhole_airy_saved: str = str(_DEFAULT_PINHOLE_AIRY_UNITS)
 
         self._build_ui()
 
@@ -2520,6 +2637,18 @@ class DeconvolveCIWindow(QMainWindow):
         )
         self._le_excitation.setEnabled(True)
         ol.addRow("Excitation (nm):", self._le_excitation)
+
+        self._le_pinhole_airy = QLineEdit(str(_DEFAULT_PINHOLE_AIRY_UNITS))
+        self._le_pinhole_airy.setToolTip(
+            "Confocal pinhole diameter(s) in Airy disk units, comma-separated per channel. "
+            "0 uses the legacy point-detector model."
+        )
+        self._le_pinhole_na = QLineEdit("N/A")
+        self._le_pinhole_na.setEnabled(False)
+        self._pinhole_stack = QStackedWidget()
+        self._pinhole_stack.addWidget(self._le_pinhole_airy)
+        self._pinhole_stack.addWidget(self._le_pinhole_na)
+        ol.addRow("Pinhole (AU):", self._pinhole_stack)
 
         ctrl_layout.addWidget(optics_group)
 
@@ -3104,6 +3233,8 @@ class DeconvolveCIWindow(QMainWindow):
         if text == "confocal":
             self._le_excitation.setEnabled(True)
             self._le_excitation.setText(self._excitation_saved)
+            self._le_pinhole_airy.setText(self._pinhole_airy_saved)
+            self._pinhole_stack.setCurrentWidget(self._le_pinhole_airy)
             self._le_niter.setText("50")
         else:
             current = self._le_excitation.text()
@@ -3111,6 +3242,8 @@ class DeconvolveCIWindow(QMainWindow):
                 self._excitation_saved = current
             self._le_excitation.setText("N/A")
             self._le_excitation.setEnabled(False)
+            self._pinhole_airy_saved = self._le_pinhole_airy.text()
+            self._pinhole_stack.setCurrentWidget(self._le_pinhole_na)
             self._le_niter.setText("150")
         self._refresh_two_d_wf_expert_state()
 
@@ -3272,6 +3405,17 @@ class DeconvolveCIWindow(QMainWindow):
             _bg("emission_wavelength" in from_file))
         self._le_excitation.setStyleSheet(
             _bg("excitation_wavelength" in from_file))
+        if ch_info:
+            pinhole_text = _format_channel_values(
+                ch_info, "pinhole_airy_units", _DEFAULT_PINHOLE_AIRY_UNITS, digits=2
+            )
+            self._pinhole_airy_saved = pinhole_text
+            if self._micro_combo.currentText() == "confocal":
+                self._le_pinhole_airy.setText(pinhole_text)
+        self._le_pinhole_airy.setStyleSheet(
+            _bg("pinhole_airy_units" in from_file))
+        self._le_pinhole_na.setStyleSheet(
+            _bg("pinhole_airy_units" in from_file))
 
         # RI sample is never in metadata — red (needs user input)
         self._sp_ri_sample.setStyleSheet(
@@ -3398,6 +3542,9 @@ class DeconvolveCIWindow(QMainWindow):
 
         em_list = _parse_float_list(self._le_emission.text())
         ex_list = _parse_float_list(self._le_excitation.text())
+        pinhole_list = _parse_float_list(self._le_pinhole_airy.text())
+        if not pinhole_list:
+            pinhole_list = [_DEFAULT_PINHOLE_AIRY_UNITS]
 
         niter_list = []
         for s in self._le_niter.text().split(","):
@@ -3440,6 +3587,7 @@ class DeconvolveCIWindow(QMainWindow):
             "na": self._sp_na.value(),
             "emission_wavelengths": em_list,
             "excitation_wavelengths": ex_list,
+            "pinhole_airy_units": pinhole_list,
             "pixel_size_xy_nm": self._sp_px_xy.value(),
             "pixel_size_z_nm": self._sp_px_z.value(),
             "ri_immersion": self._sp_ri_imm.value(),
@@ -3710,6 +3858,7 @@ class DeconvolveCIWindow(QMainWindow):
             "na": self._sp_na.value(),
             "emission_wavelengths": self._le_emission.text(),
             "excitation_wavelengths": self._excitation_saved if not self._le_excitation.isEnabled() else self._le_excitation.text(),
+            "pinhole_airy_units": self._pinhole_airy_saved if self._pinhole_stack.currentWidget() is self._le_pinhole_na else self._le_pinhole_airy.text(),
             "pixel_size_xy_nm": self._sp_px_xy.value(),
             "pixel_size_z_nm": self._sp_px_z.value(),
             "ri_immersion": self._sp_ri_imm.value(),
@@ -3788,6 +3937,15 @@ class DeconvolveCIWindow(QMainWindow):
             self._excitation_saved = str(ex_val)
             if self._le_excitation.isEnabled():
                 self._le_excitation.setText(self._excitation_saved)
+        pinhole_val = data.get("pinhole_airy_units")
+        if pinhole_val is not None:
+            if isinstance(pinhole_val, list):
+                pinhole_text = _format_pinhole_values([float(value) for value in pinhole_val])
+            else:
+                pinhole_text = f"{float(pinhole_val):.2f}"
+            self._pinhole_airy_saved = pinhole_text
+            if self._pinhole_stack.currentWidget() is self._le_pinhole_airy:
+                self._le_pinhole_airy.setText(pinhole_text)
         _spin(self._sp_px_xy, "pixel_size_xy_nm")
         _spin(self._sp_px_z, "pixel_size_z_nm")
         _spin(self._sp_ri_imm, "ri_immersion")

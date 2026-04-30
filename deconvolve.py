@@ -50,6 +50,88 @@ logger = logging.getLogger(__name__)
 
 # OME XML namespace
 _OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+_DEFAULT_PINHOLE_AIRY_UNITS = 1.0
+
+
+def _ome_enum_name(value: Any) -> str:
+    """Return a compact lowercase name for OME enum-like values."""
+    if value is None:
+        return ""
+    name = getattr(value, "name", None)
+    text = str(name if name is not None else value).strip()
+    return text.split(".")[-1].lower()
+
+
+def _pinhole_size_to_um(size: Any, unit: Any) -> Optional[float]:
+    """Convert metadata pinhole size to micrometers when possible."""
+    if size is None:
+        return None
+    try:
+        size_f = float(size)
+    except (TypeError, ValueError):
+        return None
+    unit_name = _ome_enum_name(unit)
+    if unit_name in ("", "µm", "um", "micrometer", "micrometre", "micrometers", "micrometres"):
+        return size_f
+    if unit_name in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
+        return size_f / 1000.0
+    if unit_name in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
+        return size_f * 1000.0
+    if unit_name in ("m", "meter", "metre", "meters", "metres"):
+        return size_f * 1_000_000.0
+    return None
+
+
+def _calculate_pinhole_airy_units(
+    pinhole_size: Any,
+    pinhole_unit: Any,
+    emission_wavelength_nm: Any,
+    na: Any,
+    magnification: Any,
+) -> Optional[float]:
+    """Convert detector-plane pinhole diameter metadata to Airy disk units."""
+    pinhole_um = _pinhole_size_to_um(pinhole_size, pinhole_unit)
+    try:
+        emission_um = float(emission_wavelength_nm) / 1000.0
+        na_f = float(na)
+        mag_f = float(magnification)
+    except (TypeError, ValueError):
+        return None
+    denom = 1.22 * emission_um * mag_f / max(na_f, 1e-12)
+    if pinhole_um is None or denom <= 0.0:
+        return None
+    return float(pinhole_um / denom)
+
+
+def _apply_pinhole_airy_units(
+    meta: dict[str, Any],
+    fallback_airy_units: Optional[float | Sequence[float]] = _DEFAULT_PINHOLE_AIRY_UNITS,
+    *,
+    overrule_metadata: bool = False,
+) -> bool:
+    """Populate per-channel pinhole Airy units; return True if metadata converted."""
+    metadata_used = False
+    if fallback_airy_units is None:
+        fallbacks = [_DEFAULT_PINHOLE_AIRY_UNITS]
+    elif isinstance(fallback_airy_units, Sequence) and not isinstance(fallback_airy_units, (str, bytes)):
+        fallbacks = [float(value) for value in fallback_airy_units] or [_DEFAULT_PINHOLE_AIRY_UNITS]
+    else:
+        fallbacks = [float(fallback_airy_units)]
+    for i, ch in enumerate(meta.get("channels") or []):
+        fallback = fallbacks[i] if i < len(fallbacks) else fallbacks[-1]
+        calculated = _calculate_pinhole_airy_units(
+            ch.get("pinhole_size"),
+            ch.get("pinhole_size_unit"),
+            ch.get("emission_wavelength"),
+            meta.get("na"),
+            meta.get("magnification"),
+        )
+        if calculated is not None:
+            ch["pinhole_airy_units_from_metadata"] = calculated
+            metadata_used = True
+        if overrule_metadata or ch.get("pinhole_airy_units") is None:
+            ch["pinhole_airy_units"] = fallback if overrule_metadata or calculated is None else calculated
+    return metadata_used
 
 # ---------------------------------------------------------------------------
 # Helper: detect GPU availability
@@ -118,6 +200,7 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
         info["pinhole_size"] = (
             float(ch.get("PinholeSize")) if ch.get("PinholeSize") else None
         )
+        info["pinhole_size_unit"] = ch.get("PinholeSizeUnit")
         acq = ch.get("AcquisitionMode")
         info["acquisition_mode"] = acq
         if acq and "confocal" in acq.lower():
@@ -170,6 +253,7 @@ def _extract_bioio_metadata(img) -> dict[str, Any]:
             info["pinhole_size"] = (
                 float(ch.pinhole_size) if ch.pinhole_size is not None else None
             )
+            info["pinhole_size_unit"] = _ome_enum_name(getattr(ch, "pinhole_size_unit", None))
             acq = getattr(ch, "acquisition_mode", None)
             info["acquisition_mode"] = str(acq) if acq else None
             if acq and "confocal" in str(acq).lower():
@@ -318,6 +402,7 @@ def load_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
+    pinhole_airy_units: Optional[float | list[float]] = _DEFAULT_PINHOLE_AIRY_UNITS,
     sample_refractive_index: Optional[float] = 1.47,
     overrule_metadata: bool = True,
 ) -> dict[str, Any]:
@@ -343,6 +428,10 @@ def load_image(
         Override emission wavelengths in nm, one per channel.
     excitation_wavelengths : list[float], optional
         Override excitation wavelengths in nm, one per channel.
+    pinhole_airy_units : float or list[float], optional
+        Confocal pinhole diameter(s) in Airy disk units. A list applies values
+        per channel. Used as a fallback when image metadata is missing, or as
+        an override when metadata is overruled.
     sample_refractive_index : float, optional
         Fallback refractive index of the sample medium (default 1.47).
 
@@ -560,6 +649,15 @@ def load_image(
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
 
+    if _apply_pinhole_airy_units(
+        meta,
+        pinhole_airy_units,
+        overrule_metadata=overrule_metadata,
+    ):
+        _defaulted.discard("pinhole_airy_units")
+    else:
+        _defaulted.add("pinhole_airy_units")
+
     logger.info(
         "Loaded %d channel(s), shape=%s, microscope=%s, NA=%.2f",
         len(images),
@@ -603,6 +701,7 @@ def generate_psf(
     t_i0: float = 100e3,
     z_p: float = 0.0,
     two_d_mode: str = "auto",
+    pinhole_airy_units: Optional[float] = None,
 ) -> np.ndarray:
     """Generate a physically accurate PSF from microscopy metadata.
 
@@ -644,6 +743,9 @@ def generate_psf(
     ch = metadata["channels"][channel_idx]
     wavelength_nm = ch.get("emission_wavelength", 520.0)
     excitation_nm = ch.get("excitation_wavelength")
+    pinhole_airy = ch.get("pinhole_airy_units", _DEFAULT_PINHOLE_AIRY_UNITS)
+    if pinhole_airy_units is not None:
+        pinhole_airy = pinhole_airy_units
 
     # Convert units to nm
     pix_xy_nm = pix_xy_um * 1000.0
@@ -693,6 +795,7 @@ def generate_psf(
         z_p=z_p,
         microscope_type=microscope_type,
         excitation_nm=excitation_nm,
+        pinhole_airy_units=pinhole_airy,
         n_pupil=n_pix_pupil,
     )
 
@@ -924,6 +1027,7 @@ def deconvolve_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
+    pinhole_airy_units: Optional[float | list[float]] = _DEFAULT_PINHOLE_AIRY_UNITS,
     sample_refractive_index: Optional[float] = 1.47,
     overrule_metadata: bool = True,
     # PSF options
@@ -992,6 +1096,7 @@ def deconvolve_image(
         pixel_size_z=pixel_size_z,
         emission_wavelengths=emission_wavelengths,
         excitation_wavelengths=excitation_wavelengths,
+        pinhole_airy_units=pinhole_airy_units,
         sample_refractive_index=sample_refractive_index,
         overrule_metadata=overrule_metadata,
     )

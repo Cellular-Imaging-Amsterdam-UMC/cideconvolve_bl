@@ -42,6 +42,8 @@ from bioflows_local import (
 
 # Import deconvolve first (handles torch-before-numpy DLL load order)
 from deconvolve import (
+    _DEFAULT_PINHOLE_AIRY_UNITS,
+    _apply_pinhole_airy_units,
     deconvolve,
     deconvolve_image,
     generate_psf,
@@ -84,6 +86,7 @@ _DEFAULT_PIXEL_SIZE_XY_NM = 65.0
 _DEFAULT_PIXEL_SIZE_Z_NM = 200.0
 _DEFAULT_MICROSCOPE_TYPE = "confocal"
 _DEFAULT_EXCITATION_WL = "488"
+_DEFAULT_PINHOLE_AIRY = _DEFAULT_PINHOLE_AIRY_UNITS
 _DEFAULT_IMMERSION_RI_CHOICE = "oil (1.515)"
 _DEFAULT_SAMPLE_RI_CHOICE = "prolong gold (1.47)"
 _SAMPLE_RI_DEFAULT = 1.47
@@ -132,6 +135,10 @@ def _parse_float_list_or_default(raw, default: str) -> list[float]:
         text = default
     values = [float(x.strip()) for x in text.split(",") if x.strip()]
     return values or [float(default)]
+
+
+def _format_float_list(values: list[float]) -> str:
+    return ", ".join(f"{value:g}" for value in values)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +404,8 @@ def _print_image_details(filename: str, img_path: Path, meta: dict, images: list
         print(f"      wavelengths: em={_format_value(ch_meta.get('emission_wavelength'), 'nm')}  "
               f"ex={_format_value(ch_meta.get('excitation_wavelength'), 'nm')}  "
               f"mode={ch_meta.get('acquisition_mode', '?')}")
+        print(f"      pinhole    : size={_format_value(ch_meta.get('pinhole_size'), ch_meta.get('pinhole_size_unit') or '')}  "
+              f"effective={_format_value(ch_meta.get('pinhole_airy_units'), 'AU')}")
         print(f"      intensity  : min={stats['min']:.4g} p1={stats['p1']:.4g} "
               f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
               f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
@@ -558,6 +567,7 @@ def _load_zarr_field(
     pixel_size_z=None,
     emission_wavelengths=None,
     excitation_wavelengths=None,
+    pinhole_airy_units=None,
     overrule_metadata: bool = True,
 ) -> dict:
     """Load a single field from an HCS plate zarr.
@@ -702,6 +712,15 @@ def _load_zarr_field(
             _em_defaulted = True
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
+
+    if _apply_pinhole_airy_units(
+        meta,
+        _DEFAULT_PINHOLE_AIRY if pinhole_airy_units is None else pinhole_airy_units,
+        overrule_metadata=overrule_metadata,
+    ):
+        _defaulted.discard("pinhole_airy_units")
+    else:
+        _defaulted.add("pinhole_airy_units")
 
     if overrule_metadata and sample_refractive_index is not None:
         meta["sample_refractive_index"] = sample_refractive_index
@@ -902,6 +921,7 @@ def _run_plate_zarr(
     microscope_type,
     emission_wavelengths,
     excitation_wavelengths,
+    pinhole_airy_units,
     pixel_size_xy,
     pixel_size_z,
     overrule_metadata: bool,
@@ -971,6 +991,7 @@ def _run_plate_zarr(
             pixel_size_z=pixel_size_z,
             emission_wavelengths=emission_wavelengths,
             excitation_wavelengths=excitation_wavelengths,
+            pinhole_airy_units=pinhole_airy_units,
             overrule_metadata=overrule_metadata,
         )
         images = data["images"]
@@ -1077,6 +1098,10 @@ def main(argv):
         em_value = _parse_float_list_or_default(em_raw, _DEFAULT_EMISSION_WL)
         ex_raw = str(getattr(parameters, "excitation_wl", _DEFAULT_EXCITATION_WL)).strip()
         ex_value = _parse_float_list_or_default(ex_raw, _DEFAULT_EXCITATION_WL)
+        pinhole_airy = _parse_float_list_or_default(
+            getattr(parameters, "pinhole_airy", str(_DEFAULT_PINHOLE_AIRY)),
+            str(_DEFAULT_PINHOLE_AIRY),
+        )
 
         # Deconvolution parameters
         tv_lambda = float(getattr(parameters, "tv_lambda", 0.0001))
@@ -1126,6 +1151,7 @@ def main(argv):
         micro_override = micro_value
         em_override = em_value
         ex_override = ex_value
+        pinhole_airy_override = pinhole_airy
         px_xy_override = px_xy_value
         px_z_override = px_z_value
 
@@ -1172,6 +1198,7 @@ def main(argv):
             print(f"  Microscope   : {micro_value}")
             print(f"  Emission WL  : {em_value}")
             print(f"  Excitation WL: {ex_value or 'none'}")
+            print(f"  Pinhole      : {_format_float_list(pinhole_airy)} AU")
             print(f"  Pixel size   : XY={px_xy_nm:g} nm  Z={px_z_nm:g} nm")
         else:
             print("  Metadata params: descriptor values used only where image metadata is missing")
@@ -1206,6 +1233,7 @@ def main(argv):
                     microscope_type=micro_override,
                     emission_wavelengths=em_override,
                     excitation_wavelengths=ex_override,
+                    pinhole_airy_units=pinhole_airy_override,
                     overrule_metadata=overrule_metadata,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
@@ -1269,6 +1297,7 @@ def main(argv):
                     microscope_type=micro_override,
                     emission_wavelengths=em_override,
                     excitation_wavelengths=ex_override,
+                    pinhole_airy_units=pinhole_airy_override,
                     overrule_metadata=overrule_metadata,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
@@ -1323,6 +1352,7 @@ def main(argv):
                     microscope_type=micro_override,
                     emission_wavelengths=em_override,
                     excitation_wavelengths=ex_override,
+                    pinhole_airy_units=pinhole_airy_override,
                     overrule_metadata=overrule_metadata,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
@@ -2108,6 +2138,7 @@ def _run_benchmark(
     microscope_type,
     emission_wavelengths,
     excitation_wavelengths,
+    pinhole_airy_units,
     pixel_size_xy,
     pixel_size_z,
     overrule_metadata,
@@ -2178,6 +2209,7 @@ def _run_benchmark(
             pixel_size_z=pixel_size_z,
             emission_wavelengths=emission_wavelengths,
             excitation_wavelengths=excitation_wavelengths,
+            pinhole_airy_units=pinhole_airy_units,
             overrule_metadata=overrule_metadata,
         )
         meta = data["metadata"]
@@ -2196,6 +2228,7 @@ def _run_benchmark(
             microscope_type=microscope_type,
             emission_wavelengths=emission_wavelengths,
             excitation_wavelengths=excitation_wavelengths,
+            pinhole_airy_units=pinhole_airy_units,
             pixel_size_xy=pixel_size_xy,
             pixel_size_z=pixel_size_z,
             overrule_metadata=overrule_metadata,
@@ -2247,6 +2280,7 @@ def _run_benchmark(
         microscope_type=microscope_type,
         emission_wavelengths=emission_wavelengths,
         excitation_wavelengths=excitation_wavelengths,
+        pinhole_airy_units=pinhole_airy_units,
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
         overrule_metadata=overrule_metadata,

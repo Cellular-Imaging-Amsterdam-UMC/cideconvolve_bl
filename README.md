@@ -236,6 +236,7 @@ command line via `wrapper.py`:
 | `--two_d_mode` | auto | RL-family 2D widefield mode: `auto` (widefield-aware 2D PSF) or `legacy_2d` |
 | `--emission_wl` | 520 | Emission wavelength fallback, or override when metadata is overruled |
 | `--excitation_wl` | 488 | Excitation wavelength fallback, or override when metadata is overruled |
+| `--pinhole_airy` | 1.00 | Confocal pinhole diameter in Airy disk units, comma-separated per channel; metadata pinhole sizes are converted when possible, or this value is used as fallback/override |
 | `--background` | auto | Background subtraction: `auto`, numeric value, or `0` to disable |
 | `--damping` | none | Noise-gated damping for `ci_rl` / `ci_rl_tv`: `none`, `auto`, or numeric |
 | `--offset` | auto | Positive processing offset: `auto`, `none`, or numeric |

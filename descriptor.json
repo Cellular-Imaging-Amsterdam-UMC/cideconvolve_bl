@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "method",
@@ -145,6 +145,17 @@
       "name": "(ess) Excitation wavelengths",
       "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used as fallbacks when image metadata is missing, or as overrides when image metadata is overruled.",
       "default-value": "488",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "pinhole_airy",
+      "value-key": "@pinhole_airy",
+      "command-line-flag": "--pinhole_airy",
+      "name": "(ess) Confocal pinhole (AU)",
+      "description": "Confocal pinhole diameter in Airy disk units, comma-separated per channel. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled. Use 0 for the legacy point-detector model.",
+      "default-value": "1.0",
       "set-by-server": false,
       "optional": true,
       "type": "String"

@@ -298,10 +298,13 @@ Controllable via `integrate_pixels=True` (default) or `False` for speed.
 ### Confocal PSF
 For confocal microscopy:
 ```
-PSF_confocal = PSF_emission × PSF_excitation
+PSF_confocal = convolve_lateral(PSF_emission, pinhole_disk) × PSF_excitation
 ```
-With separate wavelengths for excitation and emission. Falls back to PSF² when
-excitation wavelength is not provided.
+With separate wavelengths for excitation and emission. Falls back to the
+emission PSF as the excitation term when excitation wavelength is not provided.
+The pinhole diameter is specified in Airy disk units; `1.0` means one Airy
+diameter (`1.22 × emission wavelength / NA`) in object space. Use `0` for the
+legacy point-detector model.
 
 ### Numerical Integration
 Uses Simpson's rule quadrature with a configurable number of pupil samples
@@ -401,6 +404,7 @@ The return dictionary has the same structure as `ci_rl_deconvolve`, but the
 | `z_p` | float | 0.0 | Particle depth below the coverslip in nm |
 | `microscope_type` | str | "widefield" | "widefield" or "confocal" |
 | `excitation_nm` | float/None | None | Excitation wavelength (confocal) |
+| `pinhole_airy_units` | float | 1.0 | Confocal pinhole diameter in Airy disk units; 0 keeps the legacy point-detector model |
 | `integrate_pixels` | bool | True | Enable sub-pixel integration |
 | `n_subpixels` | int | 3 | Sub-pixel grid size per dimension |
 | `n_pupil` | int | 129 | Number of pupil integration samples |
