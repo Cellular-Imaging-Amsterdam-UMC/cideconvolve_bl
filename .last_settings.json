@@ -1,6 +1,6 @@
 {
   "values": {
-    "method": "ci_rl",
+    "method": "ci_sparse_hessian",
     "iterations": "150",
     "convergence": "auto",
     "rel_threshold": 0.005,
@@ -14,8 +14,8 @@
     "refractive_index": "oil (1.515)",
     "sample_ri": "prolong gold (1.47)",
     "projection": "none",
-    "benchmark": false,
-    "bench_crop": false,
+    "benchmark": true,
+    "bench_crop": true,
     "compute_metrics": false,
     "tv_lambda": 0.0001,
     "damping": "none",
@@ -26,7 +26,7 @@
     "offset": "auto",
     "prefilter_sigma": 0.0,
     "start": "flat",
-    "device": "cuda",
+    "device": "auto",
     "two_d_wf_aggressiveness": "Balanced",
     "two_d_wf_bg_radius_um": 0.5,
     "two_d_wf_bg_scale": 1.0
@@ -37,6 +37,6 @@
     "gtfolder": "C:\\rahoebe\\Python\\cideconvolve\\gtfolder"
   },
   "docker_options": {
-    "use_gpus": false
+    "use_gpus": true
   }
 }
