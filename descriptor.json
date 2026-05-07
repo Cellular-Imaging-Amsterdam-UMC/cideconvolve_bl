@@ -351,15 +351,20 @@
       "value-key": "@start",
       "command-line-flag": "--start",
       "name": "(adv) Initial estimate",
-      "description": "Initial estimate for iterative solvers. 'flat' uses a uniform mean image, 'observed' uses the raw observation, and 'lowpass' uses a strongly smoothed observation.",
-      "default-value": "flat",
+      "description": "Initial estimate for iterative solvers. 'auto' chooses from image statistics and microscope type; 'flat' uses a uniform mean image; 'percentile_flat' uses a robust median flat image; 'observed' uses the raw observation; 'observed_bgsub' subtracts background first; 'lowpass' uses a strongly smoothed observation; 'lowpass_bgsub' smooths after background subtraction; 'hybrid' blends background-subtracted observed and smoothed structure.",
+      "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
+        "auto",
         "flat",
+        "percentile_flat",
         "observed",
-        "lowpass"
+        "observed_bgsub",
+        "lowpass",
+        "lowpass_bgsub",
+        "hybrid"
       ]
     },
     {

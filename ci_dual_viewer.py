@@ -218,14 +218,11 @@ def _percentile_from_hist(bin_edges: np.ndarray, counts: np.ndarray, pct: float)
     return float(bin_edges[idx] + bin_frac * (bin_edges[idx + 1] - bin_edges[idx]))
 
 
-def _composite_to_pixmap(
+def _composite_to_rgb(
     slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
-) -> QPixmap:
+) -> np.ndarray:
     if not slices:
-        return QPixmap()
-    stride = _display_stride(slices[0][0].shape)
-    if stride > 1:
-        slices = [(arr[::stride, ::stride], color, contrast) for arr, color, contrast in slices]
+        return np.zeros((0, 0, 3), dtype=np.uint8)
     height, width = slices[0][0].shape
     canvas = np.zeros((height, width, 3), dtype=np.float32)
     for arr, (cr, cg, cb), (lo, hi, gamma) in slices:
@@ -240,9 +237,27 @@ def _composite_to_pixmap(
         canvas[..., 1] += norm * (cg / 255.0)
         canvas[..., 2] += norm * (cb / 255.0)
     np.clip(canvas, 0.0, 1.0, out=canvas)
-    rgb = np.ascontiguousarray((canvas * 255).astype(np.uint8))
+    return np.ascontiguousarray((canvas * 255).astype(np.uint8))
+
+
+def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
+    if rgb.size == 0:
+        return QImage()
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+    height, width = rgb.shape[:2]
     qimg = QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg.copy())
+    return qimg.copy()
+
+
+def _composite_to_pixmap(
+    slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
+) -> QPixmap:
+    if not slices:
+        return QPixmap()
+    stride = _display_stride(slices[0][0].shape)
+    if stride > 1:
+        slices = [(arr[::stride, ::stride], color, contrast) for arr, color, contrast in slices]
+    return QPixmap.fromImage(_rgb_to_qimage(_composite_to_rgb(slices)))
 
 
 class ZoomableImageView(QGraphicsView):
@@ -407,6 +422,22 @@ class _PaneWidget(QWidget):
 
     def copy_2d_view_from(self, other: "_PaneWidget") -> None:
         self.view2d.copy_view_state_from(other.view2d)
+
+    def grab_3d_image(self) -> QImage:
+        if not _HAS_VISPY or self._vispy_canvas is None:
+            return QImage()
+        try:
+            self._vispy_canvas.update()
+            rgba = np.ascontiguousarray(self._vispy_canvas.render(), dtype=np.uint8)
+        except Exception:
+            return QImage()
+        if rgba.ndim != 3 or rgba.shape[2] < 3:
+            return QImage()
+        if rgba.shape[2] >= 4:
+            height, width = rgba.shape[:2]
+            qimg = QImage(rgba.data, width, height, 4 * width, QImage.Format.Format_RGBA8888)
+            return qimg.copy()
+        return _rgb_to_qimage(rgba[..., :3])
 
     def clear_3d(self) -> None:
         if not _HAS_VISPY or self._vispy_view is None:
@@ -1704,6 +1735,51 @@ class DualViewerWidget(QWidget):
     def hi_percentile(self) -> float:
         return float(self._hi_spin.value())
 
+    def movie_render_state(self) -> dict[str, object]:
+        """Return a GUI-thread snapshot of the current 2-D rendering settings."""
+        self._ensure_channel_scaling_defaults()
+        return {
+            "projection": self._projection_combo.currentText(),
+            "z_index": int(self._z_slider.value()),
+            "active_channels": self._active_channel_indices(),
+            "channel_colors": list(self._channel_colors),
+            "advanced_scaling_active": bool(self._advanced_scaling_active),
+            "channel_scaling": [
+                {
+                    "original": dict(state.get("original") or {}),
+                    "deconvolved": dict(state.get("deconvolved") or {}),
+                    "gamma": float(state.get("gamma", 1.0)),
+                }
+                for state in self._channel_scaling
+            ],
+            "lo_percentile": float(self._lo_spin.value()),
+            "hi_percentile": float(self._hi_spin.value()),
+        }
+
+    def current_view_images(self) -> dict[str, QImage]:
+        """Return PNG-ready images matching the current Original/Deconvolved panes."""
+        self._ensure_channel_scaling_defaults()
+        mode = self._mode_combo.currentText()
+        timepoint = self.current_timepoint()
+        if mode == _THREE_D_MODE and self._can_show_3d():
+            return {
+                "original": self._input_pane.grab_3d_image(),
+                "deconvolved": self._output_pane.grab_3d_image() if timepoint in self._preview_by_t else QImage(),
+            }
+
+        projection = self._projection_combo.currentText()
+        original = self._build_2d_image(self._input_channels, projection, pane="original")
+        preview = self._preview_by_t.get(timepoint)
+        deconvolved = (
+            self._build_2d_image(preview, projection, pane="deconvolved")
+            if preview
+            else QImage()
+        )
+        return {
+            "original": original,
+            "deconvolved": deconvolved,
+        }
+
     def set_lo_percentile(self, value: float) -> None:
         self._lo_spin.setValue(value)
 
@@ -2334,6 +2410,22 @@ class DualViewerWidget(QWidget):
             plane = _project_stack(stack, projection, self._z_slider.value())
             slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         return _composite_to_pixmap(slices)
+
+    def _build_2d_image(
+        self,
+        channels_zyx: list[np.ndarray],
+        projection: str,
+        *,
+        pane: str,
+    ) -> QImage:
+        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]] = []
+        for idx in self._active_channel_indices():
+            if idx >= len(channels_zyx):
+                continue
+            stack = channels_zyx[idx]
+            plane = _project_stack(stack, projection, self._z_slider.value())
+            slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
+        return _rgb_to_qimage(_composite_to_rgb(slices))
 
     def _build_3d_channel_payload(
         self,

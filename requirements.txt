@@ -18,6 +18,7 @@ psutil>=5.9
 
 # GUI
 PyQt6>=6.5.0
+imageio[ffmpeg]>=2.34.0
 
 # OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
 bioio==3.2.0

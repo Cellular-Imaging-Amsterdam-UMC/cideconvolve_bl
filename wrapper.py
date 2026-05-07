@@ -90,6 +90,16 @@ _DEFAULT_PINHOLE_AIRY = _DEFAULT_PINHOLE_AIRY_UNITS
 _DEFAULT_IMMERSION_RI_CHOICE = "oil (1.515)"
 _DEFAULT_SAMPLE_RI_CHOICE = "prolong gold (1.47)"
 _SAMPLE_RI_DEFAULT = 1.47
+_START_MODES = (
+    "auto",
+    "flat",
+    "percentile_flat",
+    "observed",
+    "observed_bgsub",
+    "lowpass",
+    "lowpass_bgsub",
+    "hybrid",
+)
 
 
 def _to_bool(value) -> bool:
@@ -1122,8 +1132,8 @@ def main(argv):
         else:
             offset = float(offset_raw)
         prefilter_sigma = float(getattr(parameters, "prefilter_sigma", 0.0))
-        start = str(getattr(parameters, "start", "flat")).strip().lower()
-        if start not in ("flat", "observed", "lowpass"):
+        start = str(getattr(parameters, "start", "auto")).strip().lower()
+        if start not in _START_MODES:
             start = "flat"
         sparse_hessian_weight = float(getattr(parameters, "sparse_hessian_weight", 0.6))
         sparse_hessian_reg = float(getattr(parameters, "sparse_hessian_reg", 0.98))

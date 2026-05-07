@@ -181,9 +181,14 @@ Anscombe-transformed domain before deconvolution, reducing the impact of
 non-Poisson detector noise.
 
 **Initial estimate**:
+- `start="auto"` — choose a concrete mode from robust image statistics and microscope type
 - `start="flat"` — uniform mean image
+- `start="percentile_flat"` — robust median-valued uniform image
 - `start="observed"` — padded observed image
+- `start="observed_bgsub"` — observed image with background clipped to the solver floor
 - `start="lowpass"` — strongly smoothed observed image (deconwolf-style conservative start)
+- `start="lowpass_bgsub"` — background-subtracted signal smoothed, then placed on the solver floor
+- `start="hybrid"` — blend of background-subtracted observed and lowpass-smoothed signal
 
 ### 7. Real-Valued FFT (Memory Optimization)
 **What it does**: Uses `torch.fft.rfftn` / `irfftn` throughout, which exploits the
@@ -327,6 +332,7 @@ Uses Simpson's rule quadrature with a configurable number of pupil samples
 | PSF Aberration | Gibson-Lanni | Accounts for real-world RI mismatches; critical for accurate PSF at depth |
 | Pixel integration | Sub-pixel grid | Measurable accuracy gain, optional for speed |
 | Background | Auto-estimate | Median of lowest 10% voxels — robust to outliers and signal |
+| Initial estimate | Auto-resolved microscopy-aware mode | `start="auto"` chooses a concrete initializer from microscope type and robust intensity statistics; widefield/hazy or noisy data prefer background-subtracted lowpass starts, sparse high-SNR confocal data can start closer to the observation, and low-signal images fall back to a robust flat start |
 | Damping | Noise-gated (optional) | Per-voxel γ attenuates background noise; single parameter, auto mode available |
 | Tiling | XY overlap-stitch | Process arbitrarily large images within GPU memory; 16 px overlap removes boundary artefacts |
 | dtype | float32 (GPU) / float64 (CPU) | Optimal throughput on GPU; CPU can afford double precision |
@@ -351,7 +357,7 @@ historical center-slice-only 2D PSF approximation.
 | `damping` | str/float | 0.0 | Noise-gated damping: `0` (disabled), `"auto"` (strength 3.0), or float > 0 |
 | `offset` | str/float | "auto" | Positive processing offset: `"auto"` (=5), float, or 0 |
 | `prefilter_sigma` | float | 0.0 | Anscombe-domain Gaussian prefilter sigma in pixels |
-| `start` | str | "flat" | Initial estimate: `"flat"`, `"observed"`, or `"lowpass"` |
+| `start` | str | "auto" | Initial estimate: `"auto"`, `"flat"`, `"percentile_flat"`, `"observed"`, `"observed_bgsub"`, `"lowpass"`, `"lowpass_bgsub"`, or `"hybrid"` |
 | `background` | str/float | "auto" | Background level: "auto" or float; values ≤ 0 are clamped to a tiny positive floor |
 | `convergence` | str | "auto" | "fixed" (exact niter) or "auto" (I-divergence stop) |
 | `rel_threshold` | float | 0.005 | Relative I-divergence change threshold for auto-stop |

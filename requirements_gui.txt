@@ -9,9 +9,11 @@ torch>=2.4
 
 # Core
 numpy>=1.26,<3
+Pillow>=10.0
 
 # GUI
 PyQt6>=6.5.0
+imageio[ffmpeg]>=2.34.0
 
 # OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
 bioio==3.2.0

@@ -13,11 +13,13 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import logging
 import os
 import platform
+import shutil
 import sys
 import tempfile
 import threading
@@ -132,6 +134,19 @@ def _default_settings_dir() -> str:
         if docs.is_dir():
             return str(docs)
     return str(Path.home())
+
+
+def _default_downloads_dir() -> Path:
+    downloads = Path.home() / "Downloads"
+    if downloads.is_dir():
+        return downloads
+    return Path(_default_settings_dir())
+
+
+def _safe_filename_stem(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text.strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "deconvolution"
 
 
 _DEFAULT_PINHOLE_AIRY_UNITS = 1.0
@@ -2074,6 +2089,697 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
 
 
 # ---------------------------------------------------------------------------
+# Iteration movie helpers
+# ---------------------------------------------------------------------------
+
+_MOVIE_MIN_WIDTH = 1200
+_MOVIE_MACRO_BLOCK = 16
+
+
+def _movie_normalize_zyx(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr[np.newaxis, :, :]
+    if arr.ndim == 3:
+        return arr
+    raise ValueError(f"Movie frame expected 2D or 3D data, got {arr.shape}.")
+
+
+def _movie_project_stack(stack_zyx: np.ndarray, projection: str, z_index: int) -> np.ndarray:
+    stack = _movie_normalize_zyx(stack_zyx)
+    if projection == "Slice":
+        z = max(0, min(int(z_index), stack.shape[0] - 1))
+        return stack[z].astype(np.float32, copy=False)
+    if projection == "MIP":
+        return stack.max(axis=0).astype(np.float32, copy=False)
+    if projection == "SUM":
+        return stack.sum(axis=0).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported movie projection mode: {projection}")
+
+
+def _movie_percentile_levels(arr: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[float, float, float]:
+    flat = np.asarray(arr).ravel()
+    if flat.size == 0:
+        return 0.0, 1.0, 1.0
+    if flat.size > 1_000_000:
+        step = max(1, int(np.ceil(flat.size / 1_000_000)))
+        flat = flat[::step]
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
+        return 0.0, 1.0, 1.0
+    lo, hi = np.percentile(flat, [lo_pct, hi_pct])
+    lo_f = float(lo)
+    hi_f = float(hi)
+    if hi_f <= lo_f:
+        hi_f = lo_f + 1.0
+    return lo_f, hi_f, 1.0
+
+
+def _movie_composite_rgb(
+    planes: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
+    *,
+    normalize_additive: bool = True,
+) -> np.ndarray:
+    if not planes:
+        return np.zeros((2, 2, 3), dtype=np.uint8)
+    height, width = planes[0][0].shape
+    canvas = np.zeros((height, width, 3), dtype=np.float32)
+    for plane, (cr, cg, cb), (lo, hi, gamma) in planes:
+        if hi <= lo:
+            hi = lo + 1.0
+        norm = (np.asarray(plane, dtype=np.float32) - np.float32(lo)) / np.float32(hi - lo)
+        np.clip(norm, 0.0, 1.0, out=norm)
+        gamma_safe = max(float(gamma), 1e-3)
+        if abs(gamma_safe - 1.0) > 1e-6:
+            np.power(norm, 1.0 / gamma_safe, out=norm)
+        canvas[..., 0] += norm * (cr / 255.0)
+        canvas[..., 1] += norm * (cg / 255.0)
+        canvas[..., 2] += norm * (cb / 255.0)
+    if normalize_additive:
+        finite = canvas[np.isfinite(canvas)]
+        if finite.size:
+            exposure = float(np.percentile(finite, 99.95))
+            if exposure > 1.0:
+                canvas /= np.float32(exposure)
+    np.clip(canvas, 0.0, 1.0, out=canvas)
+    return np.ascontiguousarray((canvas * 255).astype(np.uint8))
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return max(multiple, int(np.ceil(value / multiple)) * multiple)
+
+
+def _movie_resize_rgb(
+    rgb: np.ndarray,
+    min_width: int = _MOVIE_MIN_WIDTH,
+    macro_block: int = _MOVIE_MACRO_BLOCK,
+) -> np.ndarray:
+    height, width = rgb.shape[:2]
+    if width >= min_width and width % macro_block == 0 and height % macro_block == 0:
+        return np.ascontiguousarray(rgb)
+    from PIL import Image
+
+    target_width = _round_up_to_multiple(max(width, min_width), macro_block)
+    target_height = _round_up_to_multiple(
+        max(1, int(round(height * (target_width / max(width, 1))))),
+        macro_block,
+    )
+    image = Image.fromarray(rgb, mode="RGB")
+    resized = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    return np.ascontiguousarray(np.asarray(resized, dtype=np.uint8))
+
+
+def _movie_pad_even_rgb(rgb: np.ndarray) -> np.ndarray:
+    if rgb.shape[0] % 2 or rgb.shape[1] % 2:
+        padded = np.zeros((rgb.shape[0] + rgb.shape[0] % 2, rgb.shape[1] + rgb.shape[1] % 2, 3), dtype=np.uint8)
+        padded[:rgb.shape[0], :rgb.shape[1], :] = rgb
+        rgb = padded
+    return np.ascontiguousarray(rgb)
+
+
+def _movie_letterbox_rgb(rgb: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    target_h, target_w = target_shape
+    if rgb.shape[0] == target_h and rgb.shape[1] == target_w:
+        return np.ascontiguousarray(rgb)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    y0 = max(0, (target_h - rgb.shape[0]) // 2)
+    x0 = max(0, (target_w - rgb.shape[1]) // 2)
+    h = min(rgb.shape[0], target_h)
+    w = min(rgb.shape[1], target_w)
+    canvas[y0:y0 + h, x0:x0 + w, :] = rgb[:h, :w, :]
+    return np.ascontiguousarray(canvas)
+
+
+def _movie_fit_rgb_to_box(rgb: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    from PIL import Image
+
+    source_h, source_w = rgb.shape[:2]
+    scale = max(target_width / max(source_w, 1), target_height / max(source_h, 1))
+    resized_w = max(1, int(round(source_w * scale)))
+    resized_h = max(1, int(round(source_h * scale)))
+    image = Image.fromarray(rgb, mode="RGB").resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+    arr = np.asarray(image, dtype=np.uint8)
+    y0 = max(0, (resized_h - target_height) // 2)
+    x0 = max(0, (resized_w - target_width) // 2)
+    return np.ascontiguousarray(arr[y0:y0 + target_height, x0:x0 + target_width, :])
+
+
+def _movie_font(size: int, *, bold: bool = False):
+    from PIL import ImageFont
+
+    candidates = (
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "arialbd.ttf" if bold else "arial.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def _movie_text_size(draw, text: str, font) -> tuple[int, int]:
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        return box[2] - box[0], box[3] - box[1]
+    except Exception:
+        return draw.textsize(text, font=font)
+
+
+def _movie_overlay_rgb(
+    rgb: np.ndarray,
+    *,
+    title: str,
+    bottom_lines: list[str],
+    convergence_series: Optional[list[Optional[float]]] = None,
+    convergence_total_points: Optional[int] = None,
+    convergence_log_scale: bool = False,
+) -> np.ndarray:
+    if not title and not bottom_lines and not convergence_series:
+        return rgb
+    from PIL import Image, ImageDraw
+
+    image = Image.fromarray(rgb, mode="RGB").convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    width, height = image.size
+    pad = max(8, min(width, height) // 80)
+    title_font = _movie_font(max(15, min(width, height) // 44), bold=True)
+    info_font = _movie_font(max(11, min(width, height) // 62), bold=False)
+
+    if title:
+        title_text = title.strip()
+        tw, th = _movie_text_size(draw, title_text, title_font)
+        x = max(pad, (width - tw) // 2)
+        y = pad
+        draw.rounded_rectangle(
+            (x - pad, y - pad // 2, x + tw + pad, y + th + pad),
+            radius=max(4, pad // 2),
+            fill=(0, 0, 0, 150),
+        )
+        draw.text((x, y), title_text, font=title_font, fill=(255, 255, 255, 235))
+
+    if bottom_lines:
+        sizes = [_movie_text_size(draw, line, info_font) for line in bottom_lines]
+        line_gap = max(2, pad // 4)
+        block_w = max((size[0] for size in sizes), default=0)
+        block_h = sum(size[1] for size in sizes) + line_gap * max(len(sizes) - 1, 0)
+        x = pad
+        y = max(pad, height - block_h - pad)
+        draw.rounded_rectangle(
+            (x - pad // 2, y - pad // 2, min(width - pad // 2, x + block_w + pad), y + block_h + pad // 2),
+            radius=max(4, pad // 2),
+            fill=(0, 0, 0, 155),
+        )
+        cursor_y = y
+        for line, (_, line_h) in zip(bottom_lines, sizes):
+            draw.text((x, cursor_y), line, font=info_font, fill=(255, 255, 255, 230))
+            cursor_y += line_h + line_gap
+
+    if convergence_series:
+        values = [
+            float(value) for value in convergence_series
+            if value is not None and np.isfinite(float(value))
+        ]
+        if values:
+            if convergence_log_scale:
+                plotted = [np.log10(max(value, 1e-12)) for value in values]
+            else:
+                plotted = values
+            plot_w = min(max(220, width // 5), width - 2 * pad)
+            plot_h = min(max(110, height // 7), height - 2 * pad)
+            x0 = width - plot_w - pad
+            y0 = height - plot_h - pad
+            x1 = width - pad
+            y1 = height - pad
+            draw.rounded_rectangle(
+                (x0, y0, x1, y1),
+                radius=max(4, pad // 2),
+                fill=(0, 0, 0, 155),
+            )
+            axis_pad = max(10, pad)
+            px0 = x0 + axis_pad
+            py0 = y0 + axis_pad
+            px1 = x1 - axis_pad // 2
+            py1 = y1 - axis_pad
+            draw.line((px0, py1, px1, py1), fill=(255, 255, 255, 95), width=1)
+            draw.line((px0, py0, px0, py1), fill=(255, 255, 255, 95), width=1)
+            vmin = min(plotted)
+            vmax = max(plotted)
+            flat_series = vmax <= vmin
+            if flat_series:
+                vmax = vmin + 1.0
+            points: list[tuple[float, float]] = []
+            denom_x = max(int(convergence_total_points or len(convergence_series)) - 1, 1)
+            for idx, value in enumerate(convergence_series):
+                if value is None or not np.isfinite(float(value)):
+                    continue
+                plot_value = np.log10(max(float(value), 1e-12)) if convergence_log_scale else float(value)
+                norm = 1.0 if flat_series else (plot_value - vmin) / (vmax - vmin)
+                x = px0 + (px1 - px0) * (idx / denom_x)
+                y = py1 - (py1 - py0) * norm
+                points.append((x, y))
+            if len(points) >= 2:
+                draw.line(points, fill=(117, 211, 255, 235), width=max(2, pad // 4), joint="curve")
+            if points:
+                r = max(3, pad // 4)
+                x, y = points[-1]
+                draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 245))
+            label = "log convergence" if convergence_log_scale else "convergence"
+            lw, lh = _movie_text_size(draw, label, info_font)
+            draw.text((x0 + axis_pad, y0 + max(4, axis_pad // 3)), label, font=info_font, fill=(255, 255, 255, 210))
+            latest = f"{values[-1]:.3g}"
+            vw, _ = _movie_text_size(draw, latest, info_font)
+            draw.text((x1 - axis_pad - vw, y0 + max(4, axis_pad // 3)), latest, font=info_font, fill=(255, 255, 255, 210))
+
+    composed = Image.alpha_composite(image, overlay).convert("RGB")
+    return np.ascontiguousarray(np.asarray(composed, dtype=np.uint8))
+
+
+def _movie_difference_inset_rgb(
+    rgb: np.ndarray,
+    current_rgb: np.ndarray,
+    reference_rgb: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    mode = str(mode or "None")
+    if mode == "None":
+        return rgb
+    from PIL import Image, ImageDraw
+
+    current = np.asarray(current_rgb, dtype=np.float32)
+    reference = np.asarray(reference_rgb, dtype=np.float32)
+    if current.shape != reference.shape:
+        ref_image = Image.fromarray(np.asarray(reference_rgb, dtype=np.uint8), mode="RGB")
+        ref_image = ref_image.resize((current.shape[1], current.shape[0]), Image.Resampling.BILINEAR)
+        reference = np.asarray(ref_image, dtype=np.float32)
+
+    if mode.startswith("Ratio"):
+        current_luma = (
+            0.2126 * current[..., 0]
+            + 0.7152 * current[..., 1]
+            + 0.0722 * current[..., 2]
+        )
+        reference_luma = (
+            0.2126 * reference[..., 0]
+            + 0.7152 * reference[..., 1]
+            + 0.0722 * reference[..., 2]
+        )
+        signal = np.maximum(current_luma, reference_luma)
+        finite_signal = signal[np.isfinite(signal)]
+        signal_floor = float(np.percentile(finite_signal, 35.0)) if finite_signal.size else 0.0
+        signal_mask = signal > max(signal_floor, 1.0)
+        eps = max(float(np.percentile(finite_signal, 99.0)) * 0.01 if finite_signal.size else 1.0, 1.0)
+        data_2d = np.log2((current_luma + eps) / (reference_luma + eps))
+        finite = data_2d[signal_mask & np.isfinite(data_2d)]
+        if finite.size:
+            center = float(np.median(finite))
+            spread = max(float(np.percentile(np.abs(finite - center), 98.0)), 1e-6)
+        else:
+            center = 0.0
+            spread = 1.0
+        norm_2d = np.clip((data_2d - center) / spread, -1.0, 1.0)
+        norm_2d[~signal_mask] = 0.0
+        norm = np.repeat(norm_2d[:, :, np.newaxis], 3, axis=2)
+        label = mode
+    else:
+        data = current - reference
+        finite = data[np.isfinite(data)]
+        spread = max(float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0, 1e-6)
+        norm = np.clip(data / spread, -1.0, 1.0)
+        label = mode
+
+    inset_rgb = np.zeros_like(current, dtype=np.uint8)
+    pos = np.clip(norm, 0.0, 1.0)
+    neg = np.clip(-norm, 0.0, 1.0)
+    inset_rgb[..., 0] = np.clip(pos.max(axis=2) * 255.0, 0, 255).astype(np.uint8)
+    inset_rgb[..., 1] = np.clip(neg.max(axis=2) * 180.0, 0, 255).astype(np.uint8)
+    inset_rgb[..., 2] = np.clip(neg.max(axis=2) * 255.0, 0, 255).astype(np.uint8)
+
+    base = Image.fromarray(rgb, mode="RGB").convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    width, height = base.size
+    pad = max(8, min(width, height) // 80)
+    inset_w = min(max(220, width // 5), width - 2 * pad)
+    inset_h = max(80, int(inset_w * current.shape[0] / max(current.shape[1], 1)))
+    inset_h = min(inset_h, max(80, height // 5))
+    x0 = width - inset_w - pad
+    y0 = pad
+    inset = Image.fromarray(inset_rgb, mode="RGB").resize((inset_w, inset_h), Image.Resampling.BILINEAR)
+    draw.rounded_rectangle(
+        (x0 - pad // 2, y0 - pad // 2, x0 + inset_w + pad // 2, y0 + inset_h + pad * 2),
+        radius=max(4, pad // 2),
+        fill=(0, 0, 0, 155),
+    )
+    overlay.alpha_composite(inset.convert("RGBA"), (x0, y0))
+    font = _movie_font(max(11, min(width, height) // 62), bold=False)
+    draw.text((x0, y0 + inset_h + max(2, pad // 4)), label, font=font, fill=(255, 255, 255, 220))
+    return np.ascontiguousarray(np.asarray(Image.alpha_composite(base, overlay).convert("RGB"), dtype=np.uint8))
+
+
+def _movie_metrics_line(channels: list[np.ndarray]) -> str:
+    metrics = _quality_metrics(channels)
+    return (
+        f"detail={metrics['detail_energy_mean']:.3f}  "
+        f"bright={metrics['bright_detail_energy_mean']:.3f}  "
+        f"edge={metrics['edge_strength_mean']:.3f}  "
+        f"sparse={metrics['signal_sparsity_mean']:.3f}  "
+        f"range={metrics['robust_range_mean']:.3f}"
+    )
+
+
+class _IterationMovieRecorder:
+    """Stage projected iteration planes and encode a composite MP4 at the end."""
+
+    def __init__(
+        self,
+        initial_channels: list[np.ndarray],
+        render_state: dict[str, object],
+        niter_list: list[int],
+        output_path: str,
+        fps: int,
+        method: str,
+        start_mode: str,
+        title_text: str,
+        show_info_metrics: bool,
+        hold_endpoints: bool,
+        layout_mode: str,
+        difference_inset: str,
+        convergence_log_scale: bool,
+        progress_cb: Callable[[str], None],
+    ) -> None:
+        self.output_path = output_path
+        self.fps = int(fps)
+        self.method = str(method)
+        self.start_mode = str(start_mode or "").strip()
+        self.title_text = str(title_text or "").strip()
+        self.show_info_metrics = bool(show_info_metrics)
+        self.hold_endpoints = bool(hold_endpoints)
+        self.layout_mode = str(layout_mode or "Standard")
+        self.difference_inset = str(difference_inset or "None")
+        self.convergence_log_scale = bool(convergence_log_scale)
+        self.progress_cb = progress_cb
+        self.projection = str(render_state.get("projection", "Slice"))
+        self.z_index = int(render_state.get("z_index", 0))
+        self.active_channels = [int(v) for v in render_state.get("active_channels", [])]
+        self.channel_colors = [
+            tuple(int(c) for c in color)
+            for color in render_state.get("channel_colors", [])
+        ]
+        self.advanced_scaling_active = bool(render_state.get("advanced_scaling_active", False))
+        self.channel_scaling = list(render_state.get("channel_scaling", []))
+        self.lo_pct = float(render_state.get("lo_percentile", 0.1))
+        self.hi_pct = float(render_state.get("hi_percentile", 100.0))
+        self.temp_dir = tempfile.mkdtemp(prefix="cideconvolve_movie_")
+        self.initial_planes: dict[int, np.ndarray] = {}
+        self.initial_levels: dict[int, tuple[float, float, float]] = {}
+        self.memmaps: dict[int, np.memmap] = {}
+        self.iter_counts: dict[int, int] = {}
+        self.frame_levels: dict[tuple[int, int], tuple[float, float, float]] = {}
+        self.frame_convergence: dict[tuple[int, int], Optional[float]] = {}
+        self._closed = False
+
+        if not self.active_channels:
+            raise ValueError("Movie export has no visible channels to render.")
+
+        for ch_idx in self.active_channels:
+            if ch_idx >= len(initial_channels):
+                continue
+            initial = _movie_normalize_zyx(initial_channels[ch_idx])
+            initial_plane = np.ascontiguousarray(_movie_project_stack(initial, self.projection, self.z_index))
+            self.initial_planes[ch_idx] = initial_plane.astype(np.float32, copy=False)
+            self.initial_levels[ch_idx] = self._levels_for(ch_idx, self.initial_planes[ch_idx], "original", initial)
+            niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
+            stage_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}.dat"
+            self.memmaps[ch_idx] = np.memmap(
+                stage_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(max(int(niter), 1), initial_plane.shape[0], initial_plane.shape[1]),
+            )
+            self.iter_counts[ch_idx] = 0
+
+    def _levels_for(
+        self,
+        ch_idx: int,
+        plane: np.ndarray,
+        pane: str,
+        contrast_source: Optional[np.ndarray] = None,
+    ) -> tuple[float, float, float]:
+        if self.advanced_scaling_active and ch_idx < len(self.channel_scaling):
+            state = dict(self.channel_scaling[ch_idx])
+            pane_levels = dict(state.get(pane) or {})
+            pane_max = max(
+                float(pane_levels.get("max", 0.0)),
+                float(np.nanmax(plane)) if plane.size else 0.0,
+                0.0,
+            )
+            lo = min(max(float(pane_levels.get("min", 0.0)), 0.0), pane_max)
+            hi = min(max(float(pane_levels.get("max", pane_max)), lo), pane_max)
+            gamma = min(max(float(state.get("gamma", 1.0)), 0.10), 5.00)
+            return lo, hi, gamma
+        source = plane
+        if contrast_source is not None and self.projection != "SUM":
+            source = contrast_source
+        return _movie_percentile_levels(source, self.lo_pct, self.hi_pct)
+
+    def capture(self, payload: dict[str, Any]) -> None:
+        ch_idx = int(payload.get("channel_index", 0))
+        if ch_idx not in self.memmaps:
+            return
+        iteration = max(1, int(payload.get("iteration", 1)))
+        mm = self.memmaps[ch_idx]
+        if iteration > mm.shape[0]:
+            return
+        stack = _movie_normalize_zyx(payload["image"])
+        plane = np.ascontiguousarray(
+            _movie_project_stack(stack, self.projection, self.z_index)
+        )
+        mm[iteration - 1, :, :] = plane
+        self.iter_counts[ch_idx] = max(self.iter_counts.get(ch_idx, 0), iteration)
+        self.frame_levels[(ch_idx, iteration - 1)] = self._levels_for(ch_idx, plane, "deconvolved", stack)
+        convergence = payload.get("convergence")
+        if convergence is not None:
+            self.frame_convergence[(ch_idx, iteration - 1)] = float(convergence)
+        if iteration == 1 or iteration % 10 == 0 or bool(payload.get("is_final", False)):
+            self.progress_cb(f"  Movie staged Ch{ch_idx + 1} iteration {iteration}")
+
+    def _latest_convergence_for_channel(self, ch_idx: int, frame_idx: int) -> Optional[float]:
+        count = self.iter_counts.get(ch_idx, 0)
+        if count <= 0:
+            return None
+        latest_frame = min(frame_idx, count - 1)
+        for idx in range(latest_frame, -1, -1):
+            value = self.frame_convergence.get((ch_idx, idx))
+            if value is not None:
+                return value
+        return None
+
+    def _convergence_values_at(self, frame_idx: int) -> list[float]:
+        return [
+            value
+            for ch_idx in self.active_channels
+            for value in [self._latest_convergence_for_channel(ch_idx, frame_idx)]
+            if value is not None
+        ]
+
+    def _convergence_series_for(self, frame_idx: int) -> list[Optional[float]]:
+        series: list[Optional[float]] = []
+        for idx in range(frame_idx + 1):
+            values = self._convergence_values_at(idx)
+            series.append(float(np.mean(values)) if values else None)
+        return series
+
+    def _bottom_lines_for(self, frame_idx: int, frame_count: int, channels: list[np.ndarray]) -> list[str]:
+        if not self.show_info_metrics:
+            return []
+        if frame_idx < 0:
+            return [
+                f"{self.method}  original input",
+                _movie_metrics_line(channels),
+            ]
+        convergence_values = self._convergence_values_at(frame_idx)
+        convergence_text = (
+            f"{float(np.mean(convergence_values)):.6g}"
+            if convergence_values
+            else "pending"
+        )
+        start_text = f"  start={self.start_mode}" if frame_idx == 0 and self.start_mode else ""
+        return [
+            f"{self.method}  iteration {frame_idx + 1}/{frame_count}{start_text}  convergence {convergence_text}",
+            _movie_metrics_line(channels),
+        ]
+
+    def _levels_for_frame(self, ch_idx: int, frame_idx: int) -> tuple[float, float, float]:
+        if (ch_idx, frame_idx) in self.frame_levels:
+            return self.frame_levels[(ch_idx, frame_idx)]
+        return self.initial_levels[ch_idx]
+
+    def _frame_payload(self, frame_idx: int) -> tuple[list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]], list[np.ndarray]]:
+        planes = []
+        metric_channels = []
+        for ch_idx in self.active_channels:
+            color = self.channel_colors[ch_idx] if ch_idx < len(self.channel_colors) else _FALLBACK_COLORS[ch_idx % len(_FALLBACK_COLORS)]
+            count = self.iter_counts.get(ch_idx, 0)
+            if frame_idx < 0:
+                plane = self.initial_planes[ch_idx]
+                levels = self.initial_levels[ch_idx]
+            elif count <= 0:
+                plane = self.initial_planes[ch_idx]
+                levels = self.initial_levels[ch_idx]
+            elif frame_idx >= count:
+                plane = self.memmaps[ch_idx][count - 1]
+                levels = self._levels_for_frame(ch_idx, count - 1)
+            else:
+                plane = self.memmaps[ch_idx][frame_idx]
+                levels = self._levels_for_frame(ch_idx, frame_idx)
+            planes.append((plane, color, levels))
+            metric_channels.append(np.asarray(plane, dtype=np.float32))
+        return planes, metric_channels
+
+    def _standard_rgb_for_frame(self, frame_idx: int) -> tuple[np.ndarray, list[np.ndarray]]:
+        planes, metric_channels = self._frame_payload(frame_idx)
+        return _movie_composite_rgb(planes), metric_channels
+
+    def _final_frame_index(self, frame_count: int) -> int:
+        return max(0, frame_count - 1)
+
+    def _sequence_frame_indices(self, frame_count: int) -> list[int]:
+        hold_frames = max(1, int(round(self.fps))) if self.hold_endpoints else 1
+        indices = [-1] * hold_frames
+        indices.extend(range(frame_count))
+        if frame_count > 0 and hold_frames > 1:
+            indices.extend([frame_count - 1] * (hold_frames - 1))
+        return indices
+
+    def _layout_sequence(self) -> list[str]:
+        mode = self.layout_mode.strip().lower()
+        if mode == "split-screen":
+            return ["split"]
+        if mode == "standard + split-screen":
+            return ["standard", "split"]
+        return ["standard"]
+
+    def _difference_reference_rgb(self, frame_count: int) -> Optional[np.ndarray]:
+        mode = self.difference_inset.strip().lower()
+        if mode == "none":
+            return None
+        if "final" in mode:
+            return self._standard_rgb_for_frame(self._final_frame_index(frame_count))[0]
+        return self._standard_rgb_for_frame(-1)[0]
+
+    def _render_frame(
+        self,
+        frame_idx: int,
+        frame_count: int,
+        layout: str,
+        reference_rgb: Optional[np.ndarray],
+        target_shape: Optional[tuple[int, int]] = None,
+    ) -> np.ndarray:
+        current_rgb, metric_channels = self._standard_rgb_for_frame(frame_idx)
+        if layout == "split":
+            original_rgb = self._standard_rgb_for_frame(-1)[0]
+            frame_h, frame_w = current_rgb.shape[:2]
+            left_w = max(1, frame_w // 2)
+            right_w = max(1, frame_w - left_w)
+            rgb = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+            if original_rgb.shape != current_rgb.shape:
+                original_rgb = _movie_fit_rgb_to_box(original_rgb, frame_w, frame_h)
+            rgb[:, :left_w, :] = original_rgb[:, :left_w, :]
+            rgb[:, left_w:, :] = current_rgb[:, left_w:, :]
+        else:
+            rgb = current_rgb
+
+        rgb = _movie_resize_rgb(rgb)
+        if reference_rgb is not None and frame_idx >= 0:
+            rgb = _movie_difference_inset_rgb(
+                rgb,
+                current_rgb,
+                reference_rgb,
+                self.difference_inset,
+            )
+        if self.title_text or self.show_info_metrics:
+            rgb = _movie_overlay_rgb(
+                rgb,
+                title=self.title_text,
+                bottom_lines=self._bottom_lines_for(frame_idx, frame_count, metric_channels),
+                convergence_series=(
+                    self._convergence_series_for(frame_idx)
+                    if self.show_info_metrics and frame_idx >= 0
+                    else None
+                ),
+                convergence_total_points=frame_count,
+                convergence_log_scale=self.convergence_log_scale,
+            )
+        if target_shape is not None:
+            rgb = _movie_letterbox_rgb(rgb, target_shape)
+        return rgb
+
+    def encode(self) -> None:
+        try:
+            import imageio.v2 as imageio
+            import imageio_ffmpeg  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Movie export requires imageio and imageio-ffmpeg. "
+                "Install the GUI requirements again, or run: pip install \"imageio[ffmpeg]\""
+            ) from exc
+
+        frame_count = max(self.iter_counts.values(), default=0)
+        if frame_count <= 0:
+            raise RuntimeError("No movie frames were captured.")
+        output = Path(self.output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        frame_indices = self._sequence_frame_indices(frame_count)
+        layouts = self._layout_sequence()
+        total_frames = len(frame_indices) * len(layouts)
+        reference_rgb = self._difference_reference_rgb(frame_count)
+        sample_shapes = [
+            self._render_frame(frame_indices[0], frame_count, layout, reference_rgb).shape[:2]
+            for layout in layouts
+        ]
+        target_shape = (
+            max(shape[0] for shape in sample_shapes),
+            max(shape[1] for shape in sample_shapes),
+        )
+        self.progress_cb(f"Encoding MP4 movie ({total_frames} frames at {self.fps} fps)…")
+        with imageio.get_writer(
+            str(output),
+            fps=self.fps,
+            codec="libx264",
+            quality=10,
+            ffmpeg_params=["-crf", "16"],
+        ) as writer:
+            movie_frame_idx = 0
+            for layout in layouts:
+                for frame_idx in frame_indices:
+                    movie_frame_idx += 1
+                    rgb = self._render_frame(frame_idx, frame_count, layout, reference_rgb, target_shape)
+                    writer.append_data(_movie_pad_even_rgb(rgb))
+                    if movie_frame_idx % 25 == 0 or movie_frame_idx == total_frames:
+                        self.progress_cb(f"  Movie encoded frame {movie_frame_idx}/{total_frames}")
+        self.progress_cb(f"Movie saved: {output}")
+
+    def close(self, *, remove_output: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for mm in self.memmaps.values():
+            try:
+                mm.flush()
+            except Exception:
+                pass
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if remove_output:
+            try:
+                Path(self.output_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Worker thread for deconvolution
 # ---------------------------------------------------------------------------
 
@@ -2113,166 +2819,208 @@ def _deconvolve_channel_stacks(
 
     results: list[np.ndarray] = []
     n_channels = len(channels_zyx)
-    for ci, channel_zyx in enumerate(channels_zyx):
-        if _stopped():
-            raise RuntimeError("Stopped by user")
-
-        ch_data = _channel_stack_to_solver_input(channel_zyx)
-        em_list = params["emission_wavelengths"]
-        em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
-        ex_list = params["excitation_wavelengths"]
-        ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
-        if params["microscope_type"] != "confocal":
-            ex_wl = None
-        pinhole_list = params["pinhole_airy_units"]
-        pinhole_airy = (
-            pinhole_list[ci] if ci < len(pinhole_list)
-            else pinhole_list[-1] if pinhole_list
-            else _DEFAULT_PINHOLE_AIRY_UNITS
+    movie_recorder: Optional[_IterationMovieRecorder] = None
+    movie_params = dict(params.get("movie") or {})
+    if movie_params.get("enabled"):
+        movie_recorder = _IterationMovieRecorder(
+            channels_zyx,
+            dict(movie_params.get("render_state") or {}),
+            params["niter_list"],
+            str(movie_params.get("path") or ""),
+            int(movie_params.get("fps", 10)),
+            str(params.get("method", "")),
+            str(params.get("start", "")),
+            str(movie_params.get("title_text") or ""),
+            bool(movie_params.get("show_info_metrics", False)),
+            bool(movie_params.get("hold_endpoints", False)),
+            str(movie_params.get("layout_mode") or "Standard"),
+            str(movie_params.get("difference_inset") or "None"),
+            bool(movie_params.get("convergence_log_scale", False)),
+            _progress,
+        )
+        _progress(
+            f"Movie export enabled: {movie_recorder.output_path} "
+            f"({movie_recorder.projection}, {movie_recorder.fps} fps)"
         )
 
-        use_2d_wf_auto = (
-            ch_data.ndim == 2
-            and params["microscope_type"] == "widefield"
-            and params["method"] in ("ci_rl", "ci_rl_tv")
-            and params["two_d_mode"] == "auto"
-        )
+    try:
+        for ci, channel_zyx in enumerate(channels_zyx):
+            if _stopped():
+                raise RuntimeError("Stopped by user")
 
-        psf_pixel_size_z_nm = params["pixel_size_z_nm"]
-        if use_2d_wf_auto:
-            n_z_psf = 65
-            psf_pixel_size_z_nm = _estimate_two_d_wf_psf_z_nm(
-                em_wl,
-                params["na"],
-                params["ri_sample"],
-                params["pixel_size_xy_nm"],
+            ch_data = _channel_stack_to_solver_input(channel_zyx)
+            em_list = params["emission_wavelengths"]
+            em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
+            ex_list = params["excitation_wavelengths"]
+            ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
+            if params["microscope_type"] != "confocal":
+                ex_wl = None
+            pinhole_list = params["pinhole_airy_units"]
+            pinhole_airy = (
+                pinhole_list[ci] if ci < len(pinhole_list)
+                else pinhole_list[-1] if pinhole_list
+                else _DEFAULT_PINHOLE_AIRY_UNITS
             )
-        elif ch_data.ndim == 3:
-            nz_img, _, _ = ch_data.shape
-            n_z_psf = max(2 * nz_img - 1, 1) | 1
-        else:
-            n_z_psf = 1
 
-        airy_radius_nm = 0.61 * em_wl / params["na"]
-        airy_radius_px = airy_radius_nm / params["pixel_size_xy_nm"]
-        n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
-        if n_xy_psf % 2 == 0:
-            n_xy_psf += 1
+            use_2d_wf_auto = (
+                ch_data.ndim == 2
+                and params["microscope_type"] == "widefield"
+                and params["method"] in ("ci_rl", "ci_rl_tv")
+                and params["two_d_mode"] == "auto"
+            )
 
-        _progress(
-            f"T {t_index + 1} — generating PSF for channel {ci + 1}/{n_channels} (λ={em_wl:.0f} nm)…"
-        )
-        t_psf = time.time()
-        psf = ci_generate_psf(
-            na=params["na"],
-            wavelength_nm=em_wl,
-            pixel_size_xy_nm=params["pixel_size_xy_nm"],
-            pixel_size_z_nm=psf_pixel_size_z_nm,
-            n_xy=n_xy_psf,
-            n_z=n_z_psf,
-            ri_immersion=params["ri_immersion"],
-            ri_sample=params["ri_sample"],
-            ri_coverslip=params["ri_immersion"],
-            ri_coverslip_design=params["ri_immersion"],
-            ri_immersion_design=params["ri_immersion"],
-            t_g=params["t_g"],
-            t_g0=params["t_g0"],
-            t_i0=params["t_i0"],
-            z_p=params["z_p"],
-            microscope_type=params["microscope_type"],
-            excitation_nm=ex_wl,
-            pinhole_airy_units=pinhole_airy,
-            integrate_pixels=params["integrate_pixels"],
-            n_subpixels=params["n_subpixels"],
-            n_pupil=params["n_pupil"],
-            device=params["device"],
-        )
-        _progress(
-            f"  Ch{ci}: PSF shape={psf.shape} sum={float(psf.sum()):.6g} "
-            f"peak={float(psf.max()):.6g} generated in {_format_duration(time.time() - t_psf)}"
-        )
-
-        if ch_data.ndim == 2 and psf.ndim == 3 and not use_2d_wf_auto:
-            if psf.shape[0] != 1:
-                raise ValueError(
-                    f"Expected a singleton-Z PSF for 2D data, got shape {psf.shape}."
+            psf_pixel_size_z_nm = params["pixel_size_z_nm"]
+            if use_2d_wf_auto:
+                n_z_psf = 65
+                psf_pixel_size_z_nm = _estimate_two_d_wf_psf_z_nm(
+                    em_wl,
+                    params["na"],
+                    params["ri_sample"],
+                    params["pixel_size_xy_nm"],
                 )
-            psf = psf[0]
+            elif ch_data.ndim == 3:
+                nz_img, _, _ = ch_data.shape
+                n_z_psf = max(2 * nz_img - 1, 1) | 1
+            else:
+                n_z_psf = 1
 
-        if psf.ndim == 3 and ch_data.ndim == 3 and psf.shape[0] > ch_data.shape[0]:
-            start = (psf.shape[0] - ch_data.shape[0]) // 2
-            psf = psf[start:start + ch_data.shape[0]]
+            airy_radius_nm = 0.61 * em_wl / params["na"]
+            airy_radius_px = airy_radius_nm / params["pixel_size_xy_nm"]
+            n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+            if n_xy_psf % 2 == 0:
+                n_xy_psf += 1
 
-        gc.collect()
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        niter_list = params["niter_list"]
-        niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
-        if _stopped():
-            raise RuntimeError("Stopped by user")
-
-        _progress(
-            f"T {t_index + 1} — deconvolving channel {ci + 1}/{n_channels} "
-            f"(image={ch_data.shape}, psf={psf.shape}, {niter} iter)…"
-        )
-        t_deconv = time.time()
-        common = dict(
-            niter=niter,
-            offset=params["offset"],
-            prefilter_sigma=params["prefilter_sigma"],
-            start=params["start"],
-            background=params["background"],
-            convergence=params["convergence"],
-            rel_threshold=params["rel_threshold"],
-            check_every=params["check_every"],
-            pixel_size_xy=params["pixel_size_xy_nm"],
-            pixel_size_z=psf_pixel_size_z_nm if use_2d_wf_auto else params["pixel_size_z_nm"],
-            device=params["device"],
-        )
-        if params["method"] == "ci_sparse_hessian":
-            out = ci_sparse_hessian_deconvolve(
-                ch_data,
-                psf,
-                sparse_hessian_weight=params["sparse_hessian_weight"],
-                sparse_hessian_reg=params["sparse_hessian_reg"],
-                **common,
+            _progress(
+                f"T {t_index + 1} — generating PSF for channel {ci + 1}/{n_channels} (λ={em_wl:.0f} nm)…"
             )
-        else:
-            out = ci_rl_deconvolve(
-                ch_data,
-                psf,
-                tv_lambda=params["tv_lambda"],
-                damping=params["damping"],
+            t_psf = time.time()
+            psf = ci_generate_psf(
+                na=params["na"],
+                wavelength_nm=em_wl,
+                pixel_size_xy_nm=params["pixel_size_xy_nm"],
+                pixel_size_z_nm=psf_pixel_size_z_nm,
+                n_xy=n_xy_psf,
+                n_z=n_z_psf,
+                ri_immersion=params["ri_immersion"],
+                ri_sample=params["ri_sample"],
+                ri_coverslip=params["ri_immersion"],
+                ri_coverslip_design=params["ri_immersion"],
+                ri_immersion_design=params["ri_immersion"],
+                t_g=params["t_g"],
+                t_g0=params["t_g0"],
+                t_i0=params["t_i0"],
+                z_p=params["z_p"],
                 microscope_type=params["microscope_type"],
-                two_d_mode=params["two_d_mode"],
-                two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
-                two_d_wf_bg_radius_um=params["two_d_wf_bg_radius_um"],
-                two_d_wf_bg_scale=params["two_d_wf_bg_scale"],
-                **common,
+                excitation_nm=ex_wl,
+                pinhole_airy_units=pinhole_airy,
+                integrate_pixels=params["integrate_pixels"],
+                n_subpixels=params["n_subpixels"],
+                n_pupil=params["n_pupil"],
+                device=params["device"],
             )
-        iterations_used = out.get("iterations_used", niter)
-        convergence_history = out.get("convergence") or []
-        conv_text = f", last objective={convergence_history[-1]:.6g}" if convergence_history else ""
-        _progress(
-            f"  Ch{ci}: done in {_format_duration(time.time() - t_deconv)} "
-            f"(iterations used={iterations_used}{conv_text})"
-        )
-        results.append(_solver_output_to_zyx(out["result"].copy()))
+            _progress(
+                f"  Ch{ci}: PSF shape={psf.shape} sum={float(psf.sum()):.6g} "
+                f"peak={float(psf.max()):.6g} generated in {_format_duration(time.time() - t_psf)}"
+            )
 
-        del psf
-        del out
-        gc.collect()
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
+            if ch_data.ndim == 2 and psf.ndim == 3 and not use_2d_wf_auto:
+                if psf.shape[0] != 1:
+                    raise ValueError(
+                        f"Expected a singleton-Z PSF for 2D data, got shape {psf.shape}."
+                    )
+                psf = psf[0]
+
+            if psf.ndim == 3 and ch_data.ndim == 3 and psf.shape[0] > ch_data.shape[0]:
+                start = (psf.shape[0] - ch_data.shape[0]) // 2
+                psf = psf[start:start + ch_data.shape[0]]
+
+            gc.collect()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+            niter_list = params["niter_list"]
+            niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
+            if _stopped():
+                raise RuntimeError("Stopped by user")
+
+            _progress(
+                f"T {t_index + 1} — deconvolving channel {ci + 1}/{n_channels} "
+                f"(image={ch_data.shape}, psf={psf.shape}, {niter} iter)…"
+            )
+            t_deconv = time.time()
+            common = dict(
+                niter=niter,
+                offset=params["offset"],
+                prefilter_sigma=params["prefilter_sigma"],
+                start=params["start"],
+                background=params["background"],
+                convergence=params["convergence"],
+                rel_threshold=params["rel_threshold"],
+                check_every=params["check_every"],
+                pixel_size_xy=params["pixel_size_xy_nm"],
+                pixel_size_z=psf_pixel_size_z_nm if use_2d_wf_auto else params["pixel_size_z_nm"],
+                device=params["device"],
+                iteration_callback=movie_recorder.capture if movie_recorder is not None else None,
+                channel_index=ci,
+            )
+            if movie_recorder is not None:
+                common["tiling"] = "none"
+            if params["method"] == "ci_sparse_hessian":
+                out = ci_sparse_hessian_deconvolve(
+                    ch_data,
+                    psf,
+                    sparse_hessian_weight=params["sparse_hessian_weight"],
+                    sparse_hessian_reg=params["sparse_hessian_reg"],
+                    **common,
+                )
+            else:
+                out = ci_rl_deconvolve(
+                    ch_data,
+                    psf,
+                    tv_lambda=params["tv_lambda"],
+                    damping=params["damping"],
+                    microscope_type=params["microscope_type"],
+                    two_d_mode=params["two_d_mode"],
+                    two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
+                    two_d_wf_bg_radius_um=params["two_d_wf_bg_radius_um"],
+                    two_d_wf_bg_scale=params["two_d_wf_bg_scale"],
+                    **common,
+                )
+            iterations_used = out.get("iterations_used", niter)
+            convergence_history = out.get("convergence") or []
+            conv_text = f", last objective={convergence_history[-1]:.6g}" if convergence_history else ""
+            _progress(
+                f"  Ch{ci}: done in {_format_duration(time.time() - t_deconv)} "
+                f"(iterations used={iterations_used}{conv_text})"
+            )
+            results.append(_solver_output_to_zyx(out["result"].copy()))
+
+            del psf
+            del out
+            gc.collect()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        if movie_recorder is not None:
+            if _stopped():
+                raise RuntimeError("Stopped by user")
+            movie_recorder.encode()
+    except Exception:
+        if movie_recorder is not None:
+            movie_recorder.close(remove_output=True)
+            movie_recorder = None
+        raise
+    finally:
+        if movie_recorder is not None:
+            movie_recorder.close()
 
     return results
 
@@ -2357,6 +3105,11 @@ class _DeconvolveWorker(QThread):
             if self.params["prefilter_sigma"] > 0.0:
                 self.progress.emit(f"  Prefilter   : sigma={self.params['prefilter_sigma']}")
             self.progress.emit(f"  Image metrics: {'enabled' if self.params.get('compute_metrics') else 'disabled'}")
+            movie_params = self.params.get("movie") or {}
+            if movie_params.get("enabled"):
+                self.progress.emit(
+                    f"  Movie       : {movie_params.get('path')} at {movie_params.get('fps', 10)} fps"
+                )
 
             monitor = _RunMetricsMonitor()
             monitor.start()
@@ -2494,7 +3247,7 @@ def _detect_gpu_info() -> str:
 
 
 class DeconvolveCIWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, *, movie_available: bool = False):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
@@ -2517,6 +3270,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._log_lines: list[str] = []
         self._log_running = False
         self._compute_image_metrics = False
+        self._movie_available = bool(movie_available)
         self._log_emitter = _GuiLogEmitter(self)
         self._log_handler = _QtLogHandler(self._log_emitter)
         self._log_emitter.line.connect(self._log_from_logging)
@@ -2526,6 +3280,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_zarr_dir: str = _default_settings_dir()
         self._last_save_dir: str = _default_settings_dir()
         self._last_settings_dir: str = _default_settings_dir()
+        self._movie_default_path: Optional[str] = None
         self._omero_gw = None  # OmeroGateway instance (lazy)
         self._omero_session_deadline: float = 0.0
         self._excitation_saved: str = "488"  # remembered when field is disabled
@@ -2688,7 +3443,16 @@ class DeconvolveCIWindow(QMainWindow):
         aml.addRow("Prefilter sigma:", self._sp_prefilter)
 
         self._start_combo = NoWheelComboBox()
-        self._start_combo.addItems(["flat", "observed", "lowpass"])
+        self._start_combo.addItems([
+            "auto",
+            "flat",
+            "percentile_flat",
+            "observed",
+            "observed_bgsub",
+            "lowpass",
+            "lowpass_bgsub",
+            "hybrid",
+        ])
         aml.addRow("Start:", self._start_combo)
 
         self._sp_check_every = NoWheelSpinBox()
@@ -2890,6 +3654,79 @@ class DeconvolveCIWindow(QMainWindow):
         pl.addRow("Pupil samples:", self._sp_n_pupil)
 
         advanced_layout.addWidget(psf_group)
+
+        # --- Iteration movie (hidden unless launched with --movie) ---
+        self._movie_group = QGroupBox("Iteration Movie")
+        movie_layout = QFormLayout()
+        self._movie_group.setLayout(movie_layout)
+
+        self._cb_movie = QCheckBox()
+        self._cb_movie.setChecked(False)
+        movie_layout.addRow("Save MP4:", self._cb_movie)
+
+        movie_path_row = QWidget()
+        movie_path_layout = QHBoxLayout(movie_path_row)
+        movie_path_layout.setContentsMargins(0, 0, 0, 0)
+        movie_path_layout.setSpacing(6)
+        self._le_movie_path = QLineEdit()
+        self._le_movie_path.setPlaceholderText("Choose an MP4 output path")
+        movie_path_layout.addWidget(self._le_movie_path, stretch=1)
+        self._btn_movie_browse = QPushButton("Browse…")
+        self._btn_movie_browse.clicked.connect(self._on_browse_movie_path)
+        movie_path_layout.addWidget(self._btn_movie_browse)
+        movie_layout.addRow("Output:", movie_path_row)
+
+        self._sp_movie_fps = NoWheelSpinBox()
+        self._sp_movie_fps.setRange(1, 60)
+        self._sp_movie_fps.setValue(10)
+        movie_layout.addRow("Framerate:", self._sp_movie_fps)
+
+        self._cb_movie_hold = QCheckBox()
+        self._cb_movie_hold.setChecked(False)
+        self._cb_movie_hold.setToolTip("Hold the original and final frames for one second each.")
+        movie_layout.addRow("Hold endpoints:", self._cb_movie_hold)
+
+        self._movie_layout_combo = NoWheelComboBox()
+        self._movie_layout_combo.addItems(["Standard", "Split-screen", "Standard + split-screen"])
+        self._movie_layout_combo.setCurrentText("Standard")
+        self._movie_layout_combo.setToolTip(
+            "Standard renders the iteration view; split-screen compares original on the left with the current iteration on the right."
+        )
+        movie_layout.addRow("Movie view:", self._movie_layout_combo)
+
+        self._movie_inset_combo = NoWheelComboBox()
+        self._movie_inset_combo.addItems([
+            "None",
+            "Difference vs original",
+            "Difference vs final",
+            "Ratio vs original",
+            "Ratio vs final",
+        ])
+        self._movie_inset_combo.setCurrentText("None")
+        self._movie_inset_combo.setToolTip("Add a small top-right panel showing current-frame change.")
+        movie_layout.addRow("Mini-panel:", self._movie_inset_combo)
+
+        self._le_movie_title = QLineEdit()
+        self._le_movie_title.setPlaceholderText("Optional title overlay")
+        movie_layout.addRow("Top text:", self._le_movie_title)
+
+        self._cb_movie_info = QCheckBox()
+        self._cb_movie_info.setChecked(False)
+        self._cb_movie_info.setToolTip(
+            "Overlay method, iteration, convergence, and rendered-frame image quality metrics."
+        )
+        movie_layout.addRow("Info overlay:", self._cb_movie_info)
+
+        self._cb_movie_log_convergence = QCheckBox()
+        self._cb_movie_log_convergence.setChecked(False)
+        self._cb_movie_log_convergence.setToolTip("Plot the convergence curve on a log10 scale.")
+        movie_layout.addRow("Log convergence:", self._cb_movie_log_convergence)
+
+        quality_label = QLabel("High (H.264 CRF 16)")
+        movie_layout.addRow("Quality:", quality_label)
+        self._movie_group.setVisible(self._movie_available)
+        advanced_layout.addWidget(self._movie_group)
+
         advanced_layout.addStretch()
         ctrl_layout.addWidget(advanced_section)
 
@@ -2989,8 +3826,9 @@ class DeconvolveCIWindow(QMainWindow):
         _set_field_tooltip(
             aml,
             self._start_combo,
-            "Initial estimate for iterative deconvolution. `flat` is robust, `observed` starts "
-            "from the input image, and `lowpass` starts from a smoothed version.",
+            "Initial estimate for iterative deconvolution. `auto` chooses from image statistics "
+            "and microscope type; `flat` is robust, `_bgsub` modes subtract background first, "
+            "and `hybrid` blends background-subtracted observed and smoothed structure.",
         )
         _set_field_tooltip(
             aml,
@@ -3200,6 +4038,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         self._btn_save.clicked.connect(self._on_save)
         bottom.addWidget(self._btn_save)
+
+        self._btn_save_view = QPushButton("Save View\u2026")
+        self._btn_save_view.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._btn_save_view.setEnabled(False)
+        self._btn_save_view.clicked.connect(self._on_save_view)
+        bottom.addWidget(self._btn_save_view)
 
         self._btn_save_series = QPushButton("Save T-Series\u2026")
         self._btn_save_series.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -3583,9 +4427,29 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save_series.setEnabled(self._viewer.has_time_axis())
         self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
+        self._btn_save_view.setEnabled(False)
         self._sync_preview_buttons()
         self._viewer.refresh_view()
+        self._set_default_movie_output_path(display_name, source_path)
         self._status.showMessage(f"Loaded {display_name}", 5000)
+
+    def _default_movie_output_path(self, display_name: str, source_path: Optional[Path]) -> str:
+        if source_path is not None:
+            stem = source_path.stem
+        else:
+            stem = Path(str(display_name)).stem
+        stem = _safe_filename_stem(stem)
+        return str(_default_downloads_dir() / f"{stem}_iterations.mp4")
+
+    def _set_default_movie_output_path(self, display_name: str, source_path: Optional[Path]) -> None:
+        if not self._movie_available:
+            return
+        current = self._le_movie_path.text().strip()
+        old_default = self._movie_default_path
+        new_default = self._default_movie_output_path(display_name, source_path)
+        if not current or current == old_default:
+            self._le_movie_path.setText(new_default)
+        self._movie_default_path = new_default
 
     # -----------------------------------------------------------------------
     # Open from OMERO
@@ -3709,9 +4573,32 @@ class DeconvolveCIWindow(QMainWindow):
         elif damping_text == "manual":
             damping = self._sp_damping.value()
 
+        movie_enabled = (
+            self._movie_available
+            and hasattr(self, "_cb_movie")
+            and self._cb_movie.isChecked()
+        )
+        movie = {
+            "enabled": bool(movie_enabled),
+        }
+        if movie_enabled:
+            movie = {
+                "enabled": True,
+                "path": self._le_movie_path.text().strip(),
+                "fps": self._sp_movie_fps.value(),
+                "hold_endpoints": self._cb_movie_hold.isChecked(),
+                "layout_mode": self._movie_layout_combo.currentText(),
+                "difference_inset": self._movie_inset_combo.currentText(),
+                "title_text": self._le_movie_title.text().strip(),
+                "show_info_metrics": self._cb_movie_info.isChecked(),
+                "convergence_log_scale": self._cb_movie_log_convergence.isChecked(),
+                "render_state": self._viewer.movie_render_state(),
+            }
+
         return {
             "method": self._method_combo.currentText(),
             "compute_metrics": self._compute_image_metrics,
+            "movie": movie,
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": damping,
@@ -3773,6 +4660,7 @@ class DeconvolveCIWindow(QMainWindow):
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_save.setEnabled(False)
+        self._btn_save_view.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._begin_busy_progress("Running deconvolution …")
 
@@ -3784,6 +4672,42 @@ class DeconvolveCIWindow(QMainWindow):
 
         current_t = self._viewer.current_timepoint()
         params = self._collect_params()
+        movie_params = params.get("movie") or {}
+        if movie_params.get("enabled"):
+            movie_path = str(movie_params.get("path") or "").strip()
+            if not movie_path:
+                self._end_progress()
+                self._monitor_bar.set_active(False)
+                self._btn_run.setText("Run Deconvolution")
+                self._btn_run.setStyleSheet(
+                    "QPushButton { background-color: #4CAF50; color: white; "
+                    "font-weight: bold; padding: 8px; }"
+                )
+                self._btn_run.setEnabled(True)
+                self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+                QMessageBox.warning(self, "Movie Export", "Choose an MP4 output path before running.")
+                return
+            try:
+                import imageio.v2  # noqa: F401
+                import imageio_ffmpeg  # noqa: F401
+            except ImportError:
+                self._end_progress()
+                self._monitor_bar.set_active(False)
+                self._btn_run.setText("Run Deconvolution")
+                self._btn_run.setStyleSheet(
+                    "QPushButton { background-color: #4CAF50; color: white; "
+                    "font-weight: bold; padding: 8px; }"
+                )
+                self._btn_run.setEnabled(True)
+                self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+                QMessageBox.warning(
+                    self,
+                    "Movie Export",
+                    "Movie export requires imageio and imageio-ffmpeg.\n\n"
+                    "Install the GUI requirements again, or run:\n"
+                    "  pip install \"imageio[ffmpeg]\"",
+                )
+                return
         self._set_log_running(True)
         self._log("")
         self._log("=" * 70)
@@ -3873,6 +4797,54 @@ class DeconvolveCIWindow(QMainWindow):
             self._log(f"Save failed: {exc}")
             QMessageBox.critical(self, "Save Error", str(exc))
 
+    def _on_save_view(self):
+        current_t = self._viewer.current_timepoint()
+        if current_t not in self._preview_outputs_by_t:
+            QMessageBox.information(
+                self,
+                "No deconvolved view",
+                "Run deconvolution for the current timepoint before saving both viewer panes.",
+            )
+            return
+
+        stem = _safe_filename_stem(self._input_path.stem if self._input_path else self._file_label.text())
+        if self._viewer.has_time_axis():
+            stem = f"{stem}_T{current_t:03d}"
+        suggested = f"{stem}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Original View PNG",
+            str(Path(self._last_save_dir) / suggested),
+            "PNG files (*.png);;All files (*)",
+        )
+        if not path:
+            return
+
+        original_path = Path(path)
+        if original_path.suffix.lower() != ".png":
+            original_path = original_path.with_suffix(".png")
+        decon_path = original_path.with_name(f"{original_path.stem}_decon.png")
+        self._last_save_dir = str(original_path.parent)
+
+        try:
+            QApplication.processEvents()
+            images = self._viewer.current_view_images()
+            original = images.get("original")
+            deconvolved = images.get("deconvolved")
+            if original is None or original.isNull():
+                raise RuntimeError("Could not render the current original viewer pane.")
+            if deconvolved is None or deconvolved.isNull():
+                raise RuntimeError("Could not render the current deconvolved viewer pane.")
+            if not original.save(str(original_path), "PNG"):
+                raise RuntimeError(f"Could not write {original_path}")
+            if not deconvolved.save(str(decon_path), "PNG"):
+                raise RuntimeError(f"Could not write {decon_path}")
+            self._log(f"Saved view PNGs: {original_path} and {decon_path}")
+            self._status.showMessage(f"Saved view PNGs → {original_path.name}, {decon_path.name}", 5000)
+        except Exception as exc:
+            self._log(f"Save view failed: {exc}")
+            QMessageBox.critical(self, "Save View Error", str(exc))
+
     def _on_save_t_series(self):
         if not self._input_channels:
             return
@@ -3904,6 +4876,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._begin_busy_progress("Saving full T-series …")
         self._btn_run.setEnabled(False)
         self._btn_save.setEnabled(False)
+        self._btn_save_view.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._monitor_bar.set_active(True)
         self._set_log_running(True)
@@ -4019,6 +4992,15 @@ class DeconvolveCIWindow(QMainWindow):
             "n_pupil": self._sp_n_pupil.value(),
             "pct_lo": self._viewer.lo_percentile(),
             "pct_hi": self._viewer.hi_percentile(),
+            "movie_enabled": self._cb_movie.isChecked() if self._movie_available else False,
+            "movie_path": self._le_movie_path.text() if self._movie_available else "",
+            "movie_fps": self._sp_movie_fps.value() if self._movie_available else 10,
+            "movie_hold_endpoints": self._cb_movie_hold.isChecked() if self._movie_available else False,
+            "movie_layout_mode": self._movie_layout_combo.currentText() if self._movie_available else "Standard",
+            "movie_difference_inset": self._movie_inset_combo.currentText() if self._movie_available else "None",
+            "movie_title_text": self._le_movie_title.text() if self._movie_available else "",
+            "movie_info_overlay": self._cb_movie_info.isChecked() if self._movie_available else False,
+            "movie_log_convergence": self._cb_movie_log_convergence.isChecked() if self._movie_available else False,
         }
 
     def _apply_settings(self, data: dict):
@@ -4134,6 +5116,20 @@ class DeconvolveCIWindow(QMainWindow):
             self._viewer.set_lo_percentile(float(data["pct_lo"]))
         if data.get("pct_hi") is not None:
             self._viewer.set_hi_percentile(float(data["pct_hi"]))
+        if self._movie_available:
+            if data.get("movie_enabled") is not None:
+                self._cb_movie.setChecked(bool(data["movie_enabled"]))
+            _line(self._le_movie_path, "movie_path")
+            _spin(self._sp_movie_fps, "movie_fps")
+            if data.get("movie_hold_endpoints") is not None:
+                self._cb_movie_hold.setChecked(bool(data["movie_hold_endpoints"]))
+            _combo(self._movie_layout_combo, "movie_layout_mode")
+            _combo(self._movie_inset_combo, "movie_difference_inset")
+            _line(self._le_movie_title, "movie_title_text")
+            if data.get("movie_info_overlay") is not None:
+                self._cb_movie_info.setChecked(bool(data["movie_info_overlay"]))
+            if data.get("movie_log_convergence") is not None:
+                self._cb_movie_log_convergence.setChecked(bool(data["movie_log_convergence"]))
 
         # integrate_pixels checkbox
         val = data.get("integrate_pixels")
@@ -4246,7 +5242,9 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _sync_preview_buttons(self) -> None:
         current_t = self._viewer.current_timepoint()
-        self._btn_save.setEnabled(current_t in self._preview_outputs_by_t)
+        has_preview = current_t in self._preview_outputs_by_t
+        self._btn_save.setEnabled(has_preview)
+        self._btn_save_view.setEnabled(has_preview)
 
     def _on_viewer_time_changed(self, timepoint: int) -> None:
         previous_t = self._loaded_timepoint
@@ -4261,6 +5259,23 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _update_viewer(self):
         self._viewer.refresh_view()
+
+    def _on_browse_movie_path(self) -> None:
+        stem = self._input_path.stem if self._input_path else "deconvolution_iterations"
+        current = self._le_movie_path.text().strip()
+        suggested = current or str(_default_downloads_dir() / f"{_safe_filename_stem(stem)}_iterations.mp4")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Iteration Movie",
+            suggested,
+            "MP4 movie (*.mp4);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".mp4"):
+            path += ".mp4"
+        self._last_save_dir = str(Path(path).parent)
+        self._le_movie_path.setText(path)
 
     def closeEvent(self, event):
         """Ensure background threads are stopped before the window closes."""
@@ -4303,13 +5318,21 @@ def _excepthook(exc_type, exc_value, exc_tb):
 def main():
     sys.excepthook = _excepthook
 
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--movie",
+        action="store_true",
+        help="Expose advanced MP4 iteration movie export controls.",
+    )
+    args, qt_args = parser.parse_known_args(sys.argv[1:])
+
+    app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName("CI Deconvolve")
     app_icon = _load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    window = DeconvolveCIWindow()
+    window = DeconvolveCIWindow(movie_available=args.movie)
     window.show()
     sys.exit(app.exec())
 

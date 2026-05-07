@@ -988,7 +988,7 @@ def deconvolve(
     damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
-    start: str = "flat",
+    start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
@@ -1027,6 +1027,10 @@ def deconvolve(
         Background subtraction (default: 'auto').
     damping : str or float
         Noise-gated damping for RL-family methods (default: 0 / disabled).
+    start : str
+        Initial estimate for iterative solvers: ``"auto"``, ``"flat"``,
+        ``"percentile_flat"``, ``"observed"``, ``"observed_bgsub"``,
+        ``"lowpass"``, ``"lowpass_bgsub"``, or ``"hybrid"``.
     microscope_type : str
         Microscope mode. ``"widefield"`` enables the enhanced 2-D path when
         *image* is single-plane and *two_d_mode* is ``"auto"``.
@@ -1109,7 +1113,7 @@ def _deconvolve_ci_method(
     background: Union[int, str] = "auto",
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
-    start: str = "flat",
+    start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
@@ -1200,7 +1204,7 @@ def deconvolve_image(
     damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
-    start: str = "flat",
+    start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,

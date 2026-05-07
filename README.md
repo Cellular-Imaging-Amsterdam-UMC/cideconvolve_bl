@@ -51,7 +51,7 @@ A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.  Combi
 - **Noise-gated damping** (`--damping`) — per-voxel correction attenuation in low-signal regions
 - **Positive offsetting** (`--offset`) — pre-shift before iteration to prevent division by zero
 - **Anscombe prefiltering** (`--prefilter_sigma`) — variance-stabilised Gaussian smoothing before deconvolution
-- **Initial estimate** (`--start flat|observed|lowpass`)
+- **Initial estimate** (`--start auto|flat|percentile_flat|observed|observed_bgsub|lowpass|lowpass_bgsub|hybrid`)
 - **Auto early stopping** (`--convergence auto`) — halts when relative I-divergence change < `--rel_threshold`
 - **Enhanced 2D widefield mode** (`--two_d_mode auto`) — collapses a full 3D Gibson-Lanni PSF to 2D for single-plane widefield data with aggressiveness and background controls
 - **Physically accurate PSF** — vectorial Richards-Wolf model (NA ≥ 0.9) or scalar Kirchhoff (NA < 0.9), Gibson-Lanni OPD aberration correction, sub-pixel integration, finite confocal pinhole convolution
@@ -121,7 +121,7 @@ Image metadata (NA, pixel sizes, wavelengths, acquisition mode, confocal pinhole
 - **Background** (`auto` / numeric / `0`) — background subtraction floor
 - **Offset** (`auto` / `none` / numeric) — positive processing shift
 - **Prefilter sigma** — Anscombe-domain Gaussian prefilter
-- **Start** (`flat` / `observed` / `lowpass`) — initial estimate
+- **Start** (`auto` / `flat` / `percentile_flat` / `observed` / `observed_bgsub` / `lowpass` / `lowpass_bgsub` / `hybrid`) — initial estimate
 - **Device** (`auto` / `cpu` / `cuda`)
 - **2D Widefield Expert** sub-panel — aggressiveness (Very Conservative → Very Strong), background radius (µm), background scale
 
@@ -261,7 +261,7 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 | `--damping` | `none` | Noise-gated damping: `none`, `auto`, or numeric |
 | `--offset` | `auto` | Positive processing offset: `auto`, `none`, or numeric |
 | `--prefilter_sigma` | `0.0` | Anscombe-domain Gaussian prefilter sigma in pixels |
-| `--start` | `flat` | Initial estimate: `flat`, `observed`, or `lowpass` |
+| `--start` | `auto` | Initial estimate: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, or `hybrid` |
 | `--background` | `auto` | Background subtraction: `auto`, numeric, or `0` to disable |
 | `--two_d_mode` | `auto` | 2D widefield mode: `auto` (widefield-aware PSF) or `legacy_2d` |
 | `--two_d_wf_aggressiveness` | `0.6` | PSF collapse aggressiveness for 2D widefield auto mode |
