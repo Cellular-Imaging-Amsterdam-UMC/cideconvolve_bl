@@ -1,20 +1,20 @@
 ﻿# CIDeconvolve
 
-**GPU-accelerated 3-D / 2-D fluorescence microscopy deconvolution — SHB Richardson-Lucy, TV regularisation, and sparse-Hessian variational solver, all via PyTorch.**
+**GPU-accelerated 3-D / 2-D fluorescence microscopy deconvolution — SHB Richardson-Lucy, experimental 2.5D DL refinement, TV regularisation, and sparse-Hessian variational solver, all via PyTorch.**
 
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v1.5.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
+| **Methods** | `ci_rl` · `ci_rl_dl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
 
 ---
 
 ## Overview
 
-CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images.  It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies one of three native GPU-capable deconvolution methods.
+CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images.  It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies native GPU-capable deconvolution methods. The optional `ci_rl_dl` path is experimental and refines the physics-based `ci_rl` result with a trained residual model.
 
 **Three user-facing entry points:**
 
@@ -45,6 +45,139 @@ Same SHB-RL engine with an additional **Total Variation (TV) penalty** after eac
 A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.  Combines the same FFT-based forward model and preprocessing stack with a sparse-Hessian prior that favours thin, high-contrast structures while suppressing noise.  Controlled by `--sparse_hessian_weight` (0–1) and `--sparse_hessian_reg` (0–1).
 
 **Best for:** Filaments, membranes, and synapses; sparse structures that need to stand out against diffuse background.
+
+### `ci_rl_dl` — Experimental 2.5D DL Refinement
+
+`ci_rl_dl` is an experimental research pipeline in `deconvolve_ci_dl.py`. It runs the existing `ci_rl` deconvolution first, then optionally applies a small 2.5D residual U-Net that predicts a correction to the central plane. New V2 training runs use a gated, bounded residual model by default so the correction is constrained relative to the local `ci_rl` signal:
+
+```text
+raw image -> ci_rl -> gated residual U-Net -> clamp(result >= 0)
+```
+
+This is not a replacement for physics-based deconvolution. Treat trained models as sample- and microscope-specific refiners, and validate carefully before using results for quantitative microscopy. The first model family is deliberately small: a 2.5D residual U-Net inspired by U-Net image-to-image architectures and residual learning, trained on synthetic microscopy-like volumes generated from the same PSF/RL stack.
+
+Quick training smoke test:
+
+```bash
+python train.py --quick-test --output-dir training_runs/quick_test
+```
+
+Full synthetic experiment preset:
+
+```bash
+python train.py \
+    --full-experiment \
+    --output-dir training_runs/full_ci_rl_dl \
+    --device cuda \
+    --mixed-precision \
+    --rl-iteration-pool 15,25,35,50,80 \
+    --psf-mismatch mild \
+    --psf-mismatch-moderate-fraction 0.2 \
+    --model-type GatedResidualUNet25D \
+    --use-conditioning \
+    --reconvolution-weight 0.02
+```
+
+The full preset uses 1000 synthetic volumes by default, richer synthetic structures, whole-volume train/validation/test splits, randomized `ci_rl` iteration counts, mild PSF mismatch, scalar conditioning channels, and the gated residual model. You can still override `--num-volumes`, `--volume-shape`, `--patch-size`, `--epochs`, and `--steps`.
+
+V2 checkpoints store their conditioning and recommended inference settings in the sidecar JSON next to the model. The conditioning channels are compact metadata planes, not full PSF images: RL iteration count, PSF width summaries, pixel sizes, NA, wavelength, and microscope type for mixed models. Old `ResidualUNet25D` checkpoints remain loadable.
+
+For faster GPU training, use multiple DataLoader workers and the per-worker
+volume cache:
+
+```bash
+python train.py --full-experiment --device cuda \
+    --batch-size 16 \
+    --data-loader-workers 8 \
+    --volume-cache-size 8
+```
+
+Increasing `--batch-size` improves GPU occupancy but reduces optimizer updates
+per epoch if `--train-samples-per-epoch` is unchanged. Increase
+`--train-samples-per-epoch` proportionally when you want the same number of
+gradient updates per epoch.
+
+The residual correction can be constrained with `--residual-scale`. The default
+`1.0` preserves the current inference strength. For new gated checkpoints, the
+network also predicts a gate and bounds the residual with
+`--residual-bound-fraction` and `--residual-bound-scale`:
+
+```text
+refined = clamp(ci_rl + residual_scale * gate * bounded_residual, min=0)
+```
+
+Training logs include global train/validation losses plus validation losses by
+morphology bucket (`generic`, `dna`, `mitotic`, `membrane`, `actin`,
+`dendrite`, and `puncta`) where those structures are present. Per-bucket
+example montages are written under the run's `examples/buckets/` folder.
+
+The full synthetic generator includes sparse spots and vesicles as well as
+DAPI/chromatin-like nuclei, mitotic spindle/fiber fields, membrane/cytoplasm
+signal, sheets, and diffuse biological background. Training also includes a
+negative-residual guard by default:
+
+```bash
+--negative-residual-weight 0.05
+--max-negative-residual-fraction 0.25
+```
+
+This discourages the model from subtracting too much `ci_rl` signal in likely
+biological structures, which is useful when a first model darkens DAPI, actin,
+spindle, membrane, or dense cytoplasmic regions.
+
+Small first experiment:
+
+```bash
+python train.py \
+    --num-volumes 24 \
+    --volume-shape 16,96,96 \
+    --patch-size 64 \
+    --z-context 2 \
+    --batch-size 4 \
+    --epochs 2 \
+    --output-dir training_runs/small_ci_rl_dl
+```
+
+Use a trained model from Python:
+
+```python
+from deconvolve_ci_dl import deconvolve_ci_rl_dl
+
+out = deconvolve_ci_rl_dl(
+    raw_volume,
+    psf,
+    model_path="training_runs/quick_test/checkpoints/final_model.pt",
+    rl_kwargs={"niter": 20},
+    return_diagnostics=True,
+)
+refined = out["result"]
+```
+
+Use the method through the main deconvolution API:
+
+```python
+from deconvolve import deconvolve
+
+refined = deconvolve(
+    raw_volume,
+    psf,
+    method="ci_rl_dl",
+    niter=20,
+    dl_model_path="training_runs/quick_test/checkpoints/final_model.pt",
+    dl_z_context=1,
+)
+```
+
+The training GUI can be launched with:
+
+```bash
+python gui_train.py
+```
+
+The GUI includes separate `Medium widefield`, `Medium confocal`, `Large
+widefield quality`, `Large confocal quality`, and `Large mixed quality` V2
+presets. The microscope-specific presets are the recommended first serious
+runs; the mixed preset is useful for comparison and robustness checks.
 
 ### Stabilisation and PSF options
 
@@ -90,7 +223,7 @@ Image metadata (NA, pixel sizes, wavelengths, acquisition mode, confocal pinhole
 #### Method
 | Control | Default | Options |
 |---|---|---|
-| Method | `ci_rl` | `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian` |
+| Method | `ci_rl` | `ci_rl`, `ci_rl_dl`, `ci_rl_tv`, `ci_sparse_hessian` |
 | Iterations | `50` | comma-separated per-channel |
 | Convergence | `auto` | `auto`, `fixed` |
 | Rel. threshold | `0.001` | 1×10⁻⁸ – 1.0 |
@@ -118,6 +251,7 @@ Image metadata (NA, pixel sizes, wavelengths, acquisition mode, confocal pinhole
 - **Damping** (`none` / `auto` / numeric) — noise-gated correction attenuation
 - **2D WF model** (Auto / Legacy) — widefield-aware 2D PSF collapse mode
 - **Sparse weight / reg** — `ci_sparse_hessian` tuning
+- **DL model path / z-context / batch size** — experimental `ci_rl_dl` refinement controls
 - **Background** (`auto` / numeric / `0`) — background subtraction floor
 - **Offset** (`auto` / `none` / numeric) — positive processing shift
 - **Prefilter sigma** — Anscombe-domain Gaussian prefilter
@@ -218,7 +352,7 @@ python wrapper.py \
     --benchmark True --bench_crop True --compute_metrics True
 ```
 
-Runs all three methods, writes `benchmark_metrics_*.csv` with per-method timing and quality metrics, and generates MIP montage comparison images.
+Runs the three classical benchmark methods (`ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`), writes `benchmark_metrics_*.csv` with per-method timing and quality metrics, and generates MIP montage comparison images. `ci_rl_dl` is not included by default because it depends on a trained checkpoint.
 See [metrics.md](metrics.md) for metric formulas and interpretation.
 
 ### Parameters
@@ -229,7 +363,7 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--method` | `ci_rl` | `ci_rl`, `ci_rl_tv`, or `ci_sparse_hessian` |
+| `--method` | `ci_rl` | `ci_rl`, `ci_rl_dl`, `ci_rl_tv`, or `ci_sparse_hessian` |
 | `--iterations` | `150` | RL iterations; comma-separated for per-channel |
 | `--convergence` | `auto` | Early stopping: `auto` or `none` |
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
@@ -274,12 +408,16 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 |-----------|---------|-------------|
 | `--sparse_hessian_weight` | `0.6` | Hessian-vs-sparsity balance (0–1) |
 | `--sparse_hessian_reg` | `0.98` | Data-vs-regulariser balance (0–1) |
+| `--dl_model_path` | empty | Optional trained `final_model.pt` checkpoint for `ci_rl_dl`; empty returns plain `ci_rl` |
+| `--dl_z_context` | `2` | Number of neighbouring planes on each side used by the 2.5D model |
+| `--dl_batch_size` | `8` | Number of planes refined per DL inference batch |
+| `--dl_mixed_precision` | `true` | Use CUDA mixed precision for DL refinement when available |
 
 #### Benchmark
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--benchmark` | `false` | Run all three methods and write timing CSV + MIP montages |
+| `--benchmark` | `false` | Run the three classical benchmark methods and write timing CSV + MIP montages |
 | `--bench_crop` | `false` | Centre-crop to tile limits before benchmarking |
 | `--compute_metrics` | `false` | Compute optional FFT / gradient quality metrics |
 
@@ -420,6 +558,9 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 | `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint, benchmark runner, metrics |
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
+| `deconvolve_ci_dl.py` | Experimental `ci_rl_dl` wrapper and 2.5D residual U-Net inference |
+| `train.py` | Synthetic-data generation and training loop for `ci_rl_dl` checkpoints |
+| `gui_train.py` | Simple PyQt6 launcher for `ci_rl_dl` training presets |
 | `descriptor.json` | BIAFLOWS / BIOMERO parameter descriptor (single source of truth) |
 | `bioflows_local.py` | Local BIAFLOWS compatibility shim |
 | `Dockerfile` | Docker build (NVIDIA CUDA 12.6 runtime + Python 3.11) |
@@ -434,6 +575,9 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 - **SHB Acceleration:** Wang, Y. & Miller, E. L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* **23**(12), 5284–5297.
 - **TV Regularisation:** Dey, N. et al. (2006). "Richardson-Lucy Algorithm With Total Variation Regularization for 3D Confocal Microscope Deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266.
+- **U-Net Architecture:** Ronneberger, O., Fischer, P. & Brox, T. (2015). "U-Net: Convolutional Networks for Biomedical Image Segmentation." *MICCAI*, 234–241. [doi:10.1007/978-3-319-24574-4_28](https://doi.org/10.1007/978-3-319-24574-4_28)
+- **Residual Learning:** He, K., Zhang, X., Ren, S. & Sun, J. (2016). "Deep Residual Learning for Image Recognition." *CVPR*, 770–778. [doi:10.1109/CVPR.2016.90](https://doi.org/10.1109/CVPR.2016.90)
+- **Content-Aware Image Restoration:** Weigert, M. et al. (2018). "Content-aware image restoration: pushing the limits of fluorescence microscopy." *Nat Methods* **15**, 1090–1097. [doi:10.1038/s41592-018-0216-7](https://doi.org/10.1038/s41592-018-0216-7)
 - **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
 - **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
 - **Gibson-Lanni model:** Gibson, S. F. & Lanni, F. (1992). [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
@@ -444,7 +588,7 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 ## Further Reading
 
-- [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
+- [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, experimental `ci_rl_dl` refinement, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
 - [metrics.md](metrics.md) — benchmark metric formulas and interpretation: timing CSV columns, FFT detail energy, edge strength, signal sparsity, and robust range.
 
 ---

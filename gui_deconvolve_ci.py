@@ -2117,6 +2117,14 @@ def _movie_project_stack(stack_zyx: np.ndarray, projection: str, z_index: int) -
     raise ValueError(f"Unsupported movie projection mode: {projection}")
 
 
+def _movie_project_background(stack_zyx: np.ndarray, projection: str, background: float) -> float:
+    stack = _movie_normalize_zyx(stack_zyx)
+    bg = max(float(background), 0.0)
+    if projection == "SUM":
+        return bg * float(stack.shape[0])
+    return bg
+
+
 def _movie_percentile_levels(arr: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[float, float, float]:
     flat = np.asarray(arr).ravel()
     if flat.size == 0:
@@ -2439,6 +2447,73 @@ def _movie_difference_inset_rgb(
     return np.ascontiguousarray(np.asarray(Image.alpha_composite(base, overlay).convert("RGB"), dtype=np.uint8))
 
 
+def _movie_raw_estimated_ratio_inset_rgb(
+    rgb: np.ndarray,
+    observed_plane: np.ndarray,
+    estimated_plane: np.ndarray,
+    background: float,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    observed = np.asarray(observed_plane, dtype=np.float32)
+    estimated = np.asarray(estimated_plane, dtype=np.float32)
+    if observed.shape != estimated.shape:
+        est_image = Image.fromarray(estimated, mode="F")
+        est_image = est_image.resize((observed.shape[1], observed.shape[0]), Image.Resampling.BILINEAR)
+        estimated = np.asarray(est_image, dtype=np.float32)
+
+    bg = max(float(background), 0.0)
+    observed_signal = np.clip(observed - bg, 0.0, None)
+    estimated_signal = np.clip(estimated - bg, 0.0, None)
+    signal = np.maximum(observed_signal, estimated_signal)
+    finite_signal = signal[np.isfinite(signal)]
+    if finite_signal.size:
+        signal_floor = max(float(np.percentile(finite_signal, 35.0)), 1e-6)
+        eps = max(float(np.percentile(finite_signal, 99.0)) * 0.01, 1e-6)
+    else:
+        signal_floor = 1e-6
+        eps = 1e-6
+    signal_mask = signal > signal_floor
+    ratio_log2 = np.log2((observed_signal + eps) / (estimated_signal + eps))
+    finite_ratio = ratio_log2[signal_mask & np.isfinite(ratio_log2)]
+    if finite_ratio.size:
+        center = float(np.median(finite_ratio))
+        spread = max(float(np.percentile(np.abs(finite_ratio - center), 98.0)), 1e-6)
+    else:
+        center = 0.0
+        spread = 1.0
+    norm = np.clip((ratio_log2 - center) / spread, -1.0, 1.0)
+    norm[~signal_mask] = 0.0
+
+    inset_rgb = np.zeros((*observed.shape, 3), dtype=np.uint8)
+    pos = np.clip(norm, 0.0, 1.0)
+    neg = np.clip(-norm, 0.0, 1.0)
+    inset_rgb[..., 0] = np.clip(pos * 255.0, 0, 255).astype(np.uint8)
+    inset_rgb[..., 1] = np.clip(neg * 180.0, 0, 255).astype(np.uint8)
+    inset_rgb[..., 2] = np.clip(neg * 255.0, 0, 255).astype(np.uint8)
+
+    base = Image.fromarray(rgb, mode="RGB").convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    width, height = base.size
+    pad = max(8, min(width, height) // 80)
+    inset_w = min(max(220, width // 5), width - 2 * pad)
+    inset_h = max(80, int(inset_w * observed.shape[0] / max(observed.shape[1], 1)))
+    inset_h = min(inset_h, max(80, height // 5))
+    x0 = width - inset_w - pad
+    y0 = pad
+    inset = Image.fromarray(inset_rgb, mode="RGB").resize((inset_w, inset_h), Image.Resampling.BILINEAR)
+    draw.rounded_rectangle(
+        (x0 - pad // 2, y0 - pad // 2, x0 + inset_w + pad // 2, y0 + inset_h + pad * 2),
+        radius=max(4, pad // 2),
+        fill=(0, 0, 0, 155),
+    )
+    overlay.alpha_composite(inset.convert("RGBA"), (x0, y0))
+    font = _movie_font(max(11, min(width, height) // 62), bold=False)
+    draw.text((x0, y0 + inset_h + max(2, pad // 4)), "Raw / estimated", font=font, fill=(255, 255, 255, 220))
+    return np.ascontiguousarray(np.asarray(Image.alpha_composite(base, overlay).convert("RGB"), dtype=np.uint8))
+
+
 def _movie_metrics_line(channels: list[np.ndarray]) -> str:
     metrics = _quality_metrics(channels)
     return (
@@ -2496,9 +2571,11 @@ class _IterationMovieRecorder:
         self.initial_planes: dict[int, np.ndarray] = {}
         self.initial_levels: dict[int, tuple[float, float, float]] = {}
         self.memmaps: dict[int, np.memmap] = {}
+        self.estimated_memmaps: dict[int, np.memmap] = {}
         self.iter_counts: dict[int, int] = {}
         self.frame_levels: dict[tuple[int, int], tuple[float, float, float]] = {}
         self.frame_convergence: dict[tuple[int, int], Optional[float]] = {}
+        self.frame_background: dict[tuple[int, int], float] = {}
         self._closed = False
 
         if not self.active_channels:
@@ -2515,6 +2592,13 @@ class _IterationMovieRecorder:
             stage_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}.dat"
             self.memmaps[ch_idx] = np.memmap(
                 stage_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(max(int(niter), 1), initial_plane.shape[0], initial_plane.shape[1]),
+            )
+            estimated_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}_estimated.dat"
+            self.estimated_memmaps[ch_idx] = np.memmap(
+                estimated_path,
                 dtype=np.float32,
                 mode="w+",
                 shape=(max(int(niter), 1), initial_plane.shape[0], initial_plane.shape[1]),
@@ -2558,6 +2642,18 @@ class _IterationMovieRecorder:
             _movie_project_stack(stack, self.projection, self.z_index)
         )
         mm[iteration - 1, :, :] = plane
+        if ch_idx in self.estimated_memmaps and "estimated" in payload:
+            estimated_stack = _movie_normalize_zyx(payload["estimated"])
+            estimated_plane = np.ascontiguousarray(
+                _movie_project_stack(estimated_stack, self.projection, self.z_index)
+            )
+            self.estimated_memmaps[ch_idx][iteration - 1, :, :] = estimated_plane
+            bg = _movie_project_background(
+                estimated_stack,
+                self.projection,
+                float(payload.get("background", 0.0)),
+            )
+            self.frame_background[(ch_idx, iteration - 1)] = bg
         self.iter_counts[ch_idx] = max(self.iter_counts.get(ch_idx, 0), iteration)
         self.frame_levels[(ch_idx, iteration - 1)] = self._levels_for(ch_idx, plane, "deconvolved", stack)
         convergence = payload.get("convergence")
@@ -2664,11 +2760,33 @@ class _IterationMovieRecorder:
 
     def _difference_reference_rgb(self, frame_count: int) -> Optional[np.ndarray]:
         mode = self.difference_inset.strip().lower()
-        if mode == "none":
+        if mode == "none" or "estimated" in mode:
             return None
         if "final" in mode:
             return self._standard_rgb_for_frame(self._final_frame_index(frame_count))[0]
         return self._standard_rgb_for_frame(-1)[0]
+
+    def _raw_estimated_ratio_payload(self, frame_idx: int) -> Optional[tuple[np.ndarray, np.ndarray, float]]:
+        observed_planes: list[np.ndarray] = []
+        estimated_planes: list[np.ndarray] = []
+        backgrounds: list[float] = []
+        for ch_idx in self.active_channels:
+            count = self.iter_counts.get(ch_idx, 0)
+            if count <= 0 or ch_idx not in self.estimated_memmaps:
+                continue
+            idx = min(max(frame_idx, 0), count - 1)
+            key = (ch_idx, idx)
+            if key not in self.frame_background:
+                continue
+            observed_planes.append(np.asarray(self.initial_planes[ch_idx], dtype=np.float32))
+            estimated_planes.append(np.asarray(self.estimated_memmaps[ch_idx][idx], dtype=np.float32))
+            backgrounds.append(float(self.frame_background[key]))
+        if not observed_planes or not estimated_planes:
+            return None
+        observed = np.mean(np.stack(observed_planes, axis=0), axis=0)
+        estimated = np.mean(np.stack(estimated_planes, axis=0), axis=0)
+        background = float(np.mean(backgrounds)) if backgrounds else 0.0
+        return observed, estimated, background
 
     def _render_frame(
         self,
@@ -2693,6 +2811,17 @@ class _IterationMovieRecorder:
             rgb = current_rgb
 
         rgb = _movie_resize_rgb(rgb)
+        physical_ratio_mode = "estimated" in self.difference_inset.strip().lower()
+        if physical_ratio_mode and frame_idx >= 0:
+            ratio_payload = self._raw_estimated_ratio_payload(frame_idx)
+            if ratio_payload is not None:
+                observed_plane, estimated_plane, background = ratio_payload
+                rgb = _movie_raw_estimated_ratio_inset_rgb(
+                    rgb,
+                    observed_plane,
+                    estimated_plane,
+                    background,
+                )
         if reference_rgb is not None and frame_idx >= 0:
             rgb = _movie_difference_inset_rgb(
                 rgb,
@@ -2808,6 +2937,7 @@ def _deconvolve_channel_stacks(
             ci_rl_deconvolve,
             ci_sparse_hessian_deconvolve,
         )
+        from deconvolve_ci_dl import deconvolve_ci_rl_dl
     except OSError as exc:
         raise RuntimeError(
             f"Failed to load deconvolve_ci (torch DLL error).\n\n"
@@ -2865,7 +2995,7 @@ def _deconvolve_channel_stacks(
             use_2d_wf_auto = (
                 ch_data.ndim == 2
                 and params["microscope_type"] == "widefield"
-                and params["method"] in ("ci_rl", "ci_rl_tv")
+                and params["method"] in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
                 and params["two_d_mode"] == "auto"
             )
 
@@ -2977,6 +3107,30 @@ def _deconvolve_channel_stacks(
                     sparse_hessian_reg=params["sparse_hessian_reg"],
                     **common,
                 )
+            elif params["method"] == "ci_rl_dl":
+                out = deconvolve_ci_rl_dl(
+                    ch_data,
+                    psf,
+                    model_path=params.get("dl_model_path") or None,
+                    device=params["device"],
+                    rl_kwargs={
+                        **common,
+                        "tv_lambda": 0.0,
+                        "damping": params["damping"],
+                        "microscope_type": params["microscope_type"],
+                        "two_d_mode": params["two_d_mode"],
+                        "two_d_wf_aggressiveness": params["two_d_wf_aggressiveness"],
+                        "two_d_wf_bg_radius_um": params["two_d_wf_bg_radius_um"],
+                        "two_d_wf_bg_scale": params["two_d_wf_bg_scale"],
+                    },
+                    dl_kwargs={
+                        "z_radius": params["dl_z_context"],
+                        "batch_size": params["dl_batch_size"],
+                        "mixed_precision": params["dl_mixed_precision"],
+                        "residual_strength": params["dl_residual_strength"],
+                    },
+                    return_diagnostics=True,
+                )
             else:
                 out = ci_rl_deconvolve(
                     ch_data,
@@ -3085,7 +3239,7 @@ class _DeconvolveWorker(QThread):
             )
             if self.params["method"] == "ci_rl_tv":
                 self.progress.emit(f"  TV lambda   : {self.params['tv_lambda']}")
-            if self.params["method"] in ("ci_rl", "ci_rl_tv"):
+            if self.params["method"] in ("ci_rl", "ci_rl_tv", "ci_rl_dl"):
                 self.progress.emit(f"  Damping     : {self.params['damping']}")
                 if self.params["microscope_type"] == "confocal":
                     self.progress.emit(
@@ -3096,6 +3250,16 @@ class _DeconvolveWorker(QThread):
                     f"(aggr={self.params['two_d_wf_aggressiveness']}, "
                     f"bg radius={self.params['two_d_wf_bg_radius_um']} um, "
                     f"bg scale={self.params['two_d_wf_bg_scale']})"
+                )
+            if self.params["method"] == "ci_rl_dl":
+                self.progress.emit(
+                    f"  DL model    : {self.params.get('dl_model_path') or '(none; ci_rl unchanged)'}"
+                )
+                self.progress.emit(
+                    f"  DL params   : z-context={self.params['dl_z_context']}, "
+                    f"batch={self.params['dl_batch_size']}, "
+                    f"mixed_precision={self.params['dl_mixed_precision']}, "
+                    f"residual_strength={self.params['dl_residual_strength']}"
                 )
             if self.params["method"] == "ci_sparse_hessian":
                 self.progress.emit(
@@ -3333,7 +3497,7 @@ class DeconvolveCIWindow(QMainWindow):
         method_group.setLayout(ml)
 
         self._method_combo = NoWheelComboBox()
-        self._method_combo.addItems(["ci_rl", "ci_rl_tv", "ci_sparse_hessian"])
+        self._method_combo.addItems(["ci_rl", "ci_rl_dl", "ci_rl_tv", "ci_sparse_hessian"])
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
@@ -3409,6 +3573,47 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_sparse_reg.setValue(0.98)
         aml.addRow("Sparse reg:", self._sp_sparse_reg)
         self._sparse_reg_label = aml.labelForField(self._sp_sparse_reg)  # type: ignore
+
+        dl_model_widget = QWidget()
+        self._dl_model_widget = dl_model_widget
+        dl_model_row = QHBoxLayout(dl_model_widget)
+        dl_model_row.setContentsMargins(0, 0, 0, 0)
+        self._le_dl_model = QLineEdit("")
+        self._le_dl_model.setPlaceholderText("optional final_model.pt")
+        self._btn_dl_model = QPushButton("Browse")
+        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
+        dl_model_row.addWidget(self._le_dl_model)
+        dl_model_row.addWidget(self._btn_dl_model)
+        aml.addRow("DL model:", dl_model_widget)
+        self._dl_model_label = aml.labelForField(dl_model_widget)  # type: ignore
+
+        self._sp_dl_z_context = NoWheelSpinBox()
+        self._sp_dl_z_context.setRange(0, 8)
+        self._sp_dl_z_context.setValue(2)
+        aml.addRow("DL z-context:", self._sp_dl_z_context)
+        self._dl_z_context_label = aml.labelForField(self._sp_dl_z_context)  # type: ignore
+
+        self._sp_dl_batch_size = NoWheelSpinBox()
+        self._sp_dl_batch_size.setRange(1, 128)
+        self._sp_dl_batch_size.setValue(8)
+        aml.addRow("DL batch size:", self._sp_dl_batch_size)
+        self._dl_batch_size_label = aml.labelForField(self._sp_dl_batch_size)  # type: ignore
+
+        self._cb_dl_mixed_precision = QCheckBox()
+        self._cb_dl_mixed_precision.setChecked(True)
+        aml.addRow("DL mixed precision:", self._cb_dl_mixed_precision)
+        self._dl_mixed_precision_label = aml.labelForField(self._cb_dl_mixed_precision)  # type: ignore
+
+        self._sp_dl_residual_strength = QDoubleSpinBox()
+        self._sp_dl_residual_strength.setRange(0.0, 2.0)
+        self._sp_dl_residual_strength.setDecimals(2)
+        self._sp_dl_residual_strength.setSingleStep(0.05)
+        self._sp_dl_residual_strength.setValue(1.0)
+        self._sp_dl_residual_strength.setToolTip(
+            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
+        )
+        aml.addRow("DL residual strength:", self._sp_dl_residual_strength)
+        self._dl_residual_strength_label = aml.labelForField(self._sp_dl_residual_strength)  # type: ignore
 
         self._bg_combo = NoWheelComboBox()
         self._bg_combo.addItems(["auto", "manual"])
@@ -3701,9 +3906,13 @@ class DeconvolveCIWindow(QMainWindow):
             "Difference vs final",
             "Ratio vs original",
             "Ratio vs final",
+            "Raw / estimated (PSF*deconv)",
         ])
         self._movie_inset_combo.setCurrentText("None")
-        self._movie_inset_combo.setToolTip("Add a small top-right panel showing current-frame change.")
+        self._movie_inset_combo.setToolTip(
+            "Add a small top-right panel showing current-frame change. "
+            "Raw / estimated compares background-subtracted raw data with PSF * current deconvolution."
+        )
         movie_layout.addRow("Mini-panel:", self._movie_inset_combo)
 
         self._le_movie_title = QLineEdit()
@@ -3734,7 +3943,8 @@ class DeconvolveCIWindow(QMainWindow):
             ml,
             self._method_combo,
             "Choose the deconvolution algorithm. `ci_rl` is the standard Richardson-Lucy "
-            "workflow, `ci_rl_tv` adds edge-preserving TV regularization, and "
+            "workflow, `ci_rl_dl` adds an experimental trained 2.5D residual refinement, "
+            "`ci_rl_tv` adds edge-preserving TV regularization, and "
             "`ci_sparse_hessian` favors sparse filament-like structure with a different prior.",
         )
         _set_field_tooltip(
@@ -4153,8 +4363,9 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_method_changed(self, text: str):
-        is_rl_family = text in ("ci_rl", "ci_rl_tv")
+        is_rl_family = text in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
         is_tv = text == "ci_rl_tv"
+        is_dl = text == "ci_rl_dl"
         is_sparse = text == "ci_sparse_hessian"
         self._sp_tv_lambda.setEnabled(is_tv)
         if not is_tv:
@@ -4169,6 +4380,11 @@ class DeconvolveCIWindow(QMainWindow):
             (self._two_d_mode_label, self._two_d_mode_combo),
             (self._sparse_weight_label, self._sp_sparse_weight),
             (self._sparse_reg_label, self._sp_sparse_reg),
+            (self._dl_model_label, self._dl_model_widget),
+            (self._dl_z_context_label, self._sp_dl_z_context),
+            (self._dl_batch_size_label, self._sp_dl_batch_size),
+            (self._dl_mixed_precision_label, self._cb_dl_mixed_precision),
+            (self._dl_residual_strength_label, self._sp_dl_residual_strength),
         ):
             if label is not None:
                 label.setVisible(False)
@@ -4196,6 +4412,17 @@ class DeconvolveCIWindow(QMainWindow):
             self._sparse_reg_label.setVisible(is_sparse)
         self._sp_sparse_reg.setVisible(is_sparse)
 
+        for label, widget in (
+            (self._dl_model_label, self._dl_model_widget),
+            (self._dl_z_context_label, self._sp_dl_z_context),
+            (self._dl_batch_size_label, self._sp_dl_batch_size),
+            (self._dl_mixed_precision_label, self._cb_dl_mixed_precision),
+            (self._dl_residual_strength_label, self._sp_dl_residual_strength),
+        ):
+            if label is not None:
+                label.setVisible(is_dl)
+            widget.setVisible(is_dl)
+
         self._on_damping_changed(self._damping_combo.currentText())
         self._refresh_two_d_wf_expert_state()
 
@@ -4206,7 +4433,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_offset.setEnabled(text == "manual")
 
     def _on_damping_changed(self, text: str):
-        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
         self._sp_damping.setEnabled(rl_family and text == "manual")
 
     def _on_conv_changed(self, text: str):
@@ -4233,7 +4460,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._refresh_two_d_wf_expert_state()
 
     def _refresh_two_d_wf_expert_state(self, _text: str = ""):
-        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
         widefield = self._micro_combo.currentText() == "widefield"
         auto_mode = self._two_d_mode_combo.currentText() == "Auto"
         enabled = rl_family and widefield and auto_mode
@@ -4247,6 +4474,63 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_proj_changed(self, text: str):
         del text
+
+    def _on_browse_dl_model(self):
+        start_dir = str(Path(self._le_dl_model.text()).parent) if self._le_dl_model.text().strip() else str(Path.cwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open ci_rl_dl Model",
+            start_dir,
+            "PyTorch checkpoints (*.pt *.pth);;All Files (*)",
+        )
+        if path:
+            self._le_dl_model.setText(path)
+            self._apply_dl_model_metadata(Path(path))
+
+    def _apply_dl_model_metadata(self, model_path: Path):
+        meta_path = model_path.with_suffix(".json")
+        if not meta_path.exists():
+            self._log(f"No ci_rl_dl metadata JSON found next to model: {meta_path.name}")
+            return
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._log(f"Could not read ci_rl_dl metadata JSON: {exc}")
+            return
+
+        recommended = metadata.get("recommended_inference") or {}
+        rl_kwargs = recommended.get("rl_kwargs") or {}
+        dl_kwargs = recommended.get("dl_kwargs") or {}
+
+        niter = recommended.get("iterations", rl_kwargs.get("niter"))
+        if niter is not None:
+            self._le_niter.setText(str(int(niter)))
+        z_context = recommended.get("dl_z_context", dl_kwargs.get("z_radius"))
+        if z_context is not None:
+            self._sp_dl_z_context.setValue(int(z_context))
+        batch_size = recommended.get("dl_batch_size", dl_kwargs.get("batch_size"))
+        if batch_size is not None:
+            self._sp_dl_batch_size.setValue(int(batch_size))
+        mixed_precision = recommended.get("dl_mixed_precision", dl_kwargs.get("mixed_precision"))
+        if mixed_precision is not None:
+            self._cb_dl_mixed_precision.setChecked(bool(mixed_precision))
+        start = rl_kwargs.get("start")
+        if start:
+            self._start_combo.setCurrentText(str(start))
+        convergence = rl_kwargs.get("convergence")
+        if convergence:
+            self._conv_combo.setCurrentText(str(convergence))
+        two_d_mode = rl_kwargs.get("two_d_mode")
+        if str(two_d_mode).lower() == "legacy_2d":
+            self._two_d_mode_combo.setCurrentText("Legacy 2D")
+        elif str(two_d_mode).lower() == "auto":
+            self._two_d_mode_combo.setCurrentText("Auto")
+
+        best = metadata.get("best_epoch") or {}
+        best_text = ""
+        if best:
+            best_text = f", best epoch={int(best.get('epoch', 0))}, val={float(best.get('val_loss', 0.0)):.5g}"
+        self._log(f"Loaded ci_rl_dl model metadata from {meta_path.name}{best_text}")
 
     def _begin_progress(self, total: int, text: str) -> None:
         self._progress.setRange(0, max(int(total), 1))
@@ -4606,6 +4890,11 @@ class DeconvolveCIWindow(QMainWindow):
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText().strip().lower(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
+            "dl_model_path": self._le_dl_model.text().strip(),
+            "dl_z_context": self._sp_dl_z_context.value(),
+            "dl_batch_size": self._sp_dl_batch_size.value(),
+            "dl_mixed_precision": self._cb_dl_mixed_precision.isChecked(),
+            "dl_residual_strength": self._sp_dl_residual_strength.value(),
             "offset": offset,
             "prefilter_sigma": self._sp_prefilter.value(),
             "start": self._start_combo.currentText(),
@@ -4961,6 +5250,11 @@ class DeconvolveCIWindow(QMainWindow):
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
+            "dl_model_path": self._le_dl_model.text(),
+            "dl_z_context": self._sp_dl_z_context.value(),
+            "dl_batch_size": self._sp_dl_batch_size.value(),
+            "dl_mixed_precision": self._cb_dl_mixed_precision.isChecked(),
+            "dl_residual_strength": self._sp_dl_residual_strength.value(),
             "background": self._bg_combo.currentText(),
             "background_value": self._sp_bg_value.value(),
             "offset": self._offset_combo.currentText(),
@@ -5045,6 +5339,12 @@ class DeconvolveCIWindow(QMainWindow):
             self._two_d_wf_aggr_combo.setCurrentText(lookup.get(str(aggr).strip().lower(), str(aggr)))
         _spin(self._sp_two_d_wf_bg_radius, "two_d_wf_bg_radius_um")
         _spin(self._sp_two_d_wf_bg_scale, "two_d_wf_bg_scale")
+        _line(self._le_dl_model, "dl_model_path")
+        _spin(self._sp_dl_z_context, "dl_z_context")
+        _spin(self._sp_dl_batch_size, "dl_batch_size")
+        _spin(self._sp_dl_residual_strength, "dl_residual_strength")
+        if "dl_mixed_precision" in data:
+            self._cb_dl_mixed_precision.setChecked(bool(data.get("dl_mixed_precision")))
         _combo(self._bg_combo, "background")
         _spin(self._sp_bg_value, "background_value")
         _combo(self._offset_combo, "offset")

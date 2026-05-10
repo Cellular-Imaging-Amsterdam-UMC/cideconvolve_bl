@@ -970,6 +970,10 @@ def generate_psf(
 METHODS = {
     "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
     "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
+    "ci_rl_dl": {
+        "memory_factor": 10,
+        "description": "CI RL + experimental 2.5D residual U-Net refinement",
+    },
     "ci_sparse_hessian": {
         "memory_factor": 10,
         "description": "CI sparse-Hessian variational deconvolution (PyTorch GPU)",
@@ -1007,6 +1011,11 @@ def deconvolve(
     two_d_wf_aggressiveness: str = "balanced",
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_z_context: int = 2,
+    dl_batch_size: int = 8,
+    dl_mixed_precision: bool = True,
+    dl_residual_strength: float = 1.0,
 ) -> np.ndarray:
     """Deconvolve an image using the specified method and PSF.
 
@@ -1020,6 +1029,7 @@ def deconvolve(
         Deconvolution algorithm:
         - 'ci_rl' (default): CI SHB-accelerated Richardson-Lucy (PyTorch).
         - 'ci_rl_tv': CI SHB-accelerated RL + Total Variation.
+        - 'ci_rl_dl': ci_rl followed by experimental 2.5D residual U-Net refinement.
         - 'ci_sparse_hessian': CI sparse-Hessian variational deconvolution.
     niter : int
         Number of iterations / optimisation steps (default: 30).
@@ -1081,7 +1091,7 @@ def deconvolve(
         image, psf, niter=niter,
         method=method,
         tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
-        damping=damping if method in ("ci_rl", "ci_rl_tv") else 0.0,
+        damping=damping if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl") else 0.0,
         sparse_hessian_weight=sparse_hessian_weight,
         sparse_hessian_reg=sparse_hessian_reg,
         background=background, offset=offset,
@@ -1093,6 +1103,11 @@ def deconvolve(
         two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
         two_d_wf_bg_scale=two_d_wf_bg_scale,
         check_every=check_every, device=device,
+        dl_model_path=dl_model_path,
+        dl_z_context=dl_z_context,
+        dl_batch_size=dl_batch_size,
+        dl_mixed_precision=dl_mixed_precision,
+        dl_residual_strength=dl_residual_strength,
     )
 
 
@@ -1124,6 +1139,11 @@ def _deconvolve_ci_method(
     two_d_wf_aggressiveness: str = "balanced",
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_z_context: int = 2,
+    dl_batch_size: int = 8,
+    dl_mixed_precision: bool = True,
+    dl_residual_strength: float = 1.0,
     device: Optional[str] = None,
 ) -> np.ndarray:
     from deconvolve_ci import (
@@ -1153,6 +1173,48 @@ def _deconvolve_ci_method(
             sparse_hessian_reg=sparse_hessian_reg,
             **common,
         )
+    elif method == "ci_rl_dl":
+        from deconvolve_ci_dl import deconvolve_ci_rl_dl
+
+        result = deconvolve_ci_rl_dl(
+            image,
+            psf,
+            model_path=dl_model_path,
+            optical_params={
+                "pixel_size_xy_nm": pixel_size_xy,
+                "pixel_size_z_nm": pixel_size_z,
+                "microscope_type": microscope_type,
+            },
+            device=device or "auto",
+            rl_kwargs={
+                "niter": niter,
+                "tv_lambda": 0.0,
+                "damping": damping,
+                "background": background,
+                "offset": offset,
+                "prefilter_sigma": prefilter_sigma,
+                "start": start,
+                "convergence": convergence,
+                "rel_threshold": rel_threshold,
+                "check_every": check_every,
+                "pixel_size_xy": pixel_size_xy,
+                "pixel_size_z": pixel_size_z,
+                "microscope_type": microscope_type,
+                "two_d_mode": two_d_mode,
+                "two_d_wf_aggressiveness": two_d_wf_aggressiveness,
+                "two_d_wf_bg_radius_um": two_d_wf_bg_radius_um,
+                "two_d_wf_bg_scale": two_d_wf_bg_scale,
+                "device": device,
+            },
+            dl_kwargs={
+                "z_radius": dl_z_context,
+                "batch_size": dl_batch_size,
+                "mixed_precision": dl_mixed_precision,
+                "residual_strength": dl_residual_strength,
+            },
+            return_diagnostics=False,
+        )
+        return np.asarray(result, dtype=np.float32)
     else:
         result = ci_rl_deconvolve(
             tv_lambda=tv_lambda,
@@ -1212,6 +1274,11 @@ def deconvolve_image(
     two_d_wf_aggressiveness: str = "balanced",
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_z_context: int = 2,
+    dl_batch_size: int = 8,
+    dl_mixed_precision: bool = True,
+    dl_residual_strength: float = 1.0,
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
     sparse_hessian_weight: float = 0.6,
@@ -1284,7 +1351,7 @@ def deconvolve_image(
             ri_coverslip_design=ri_coverslip_design,
             ri_immersion_design=ri_immersion_design,
             t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
-            two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv") else "legacy_2d",
+            two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl") else "legacy_2d",
         )
         psfs.append(psf)
 
@@ -1294,7 +1361,7 @@ def deconvolve_image(
             img.ndim == 2
             and psf.ndim == 3
             and metadata.get("microscope_type", "widefield") == "widefield"
-            and method in ("ci_rl", "ci_rl_tv")
+            and method in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
             and str(two_d_mode).strip().lower() == "auto"
         )
         if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
@@ -1326,6 +1393,11 @@ def deconvolve_image(
             two_d_wf_aggressiveness=two_d_wf_aggressiveness,
             two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
             two_d_wf_bg_scale=two_d_wf_bg_scale,
+            dl_model_path=dl_model_path,
+            dl_z_context=dl_z_context,
+            dl_batch_size=dl_batch_size,
+            dl_mixed_precision=dl_mixed_precision,
+            dl_residual_strength=dl_residual_strength,
         )
         results.append(result)
 

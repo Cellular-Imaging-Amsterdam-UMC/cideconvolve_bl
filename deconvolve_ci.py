@@ -1385,14 +1385,18 @@ def ci_rl_deconvolve(
                 fwd = _irfft(fwd_fft, work_shape)
                 convergence_value = _i_divergence(img_t, fwd[slices].clamp(min=bg))
             frame = x_cur[slices]
+            estimated = fwd[slices]
             if offset_val > 0.0:
                 frame = (frame - offset_val).clamp(min=0.0)
+                estimated = (estimated - offset_val).clamp(min=0.0)
             iteration_callback({
                 "channel_index": int(channel_index),
                 "iteration": k,
                 "total_iterations": niter,
                 "convergence": convergence_value,
                 "image": _to_numpy(frame),
+                "estimated": _to_numpy(estimated),
+                "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
         if stop_after_callback:
@@ -1614,14 +1618,18 @@ def ci_sparse_hessian_deconvolve(
                 )
                 convergence_value = float(total_loss.detach())
             frame = x_cur[slices]
+            estimated = fwd
             if offset_val > 0.0:
                 frame = (frame - offset_val).clamp(min=0.0)
+                estimated = (estimated - offset_val).clamp(min=0.0)
             iteration_callback({
                 "channel_index": int(channel_index),
                 "iteration": k,
                 "total_iterations": niter,
                 "convergence": convergence_value,
                 "image": _to_numpy(frame),
+                "estimated": _to_numpy(estimated),
+                "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
         if stop_after_callback:
