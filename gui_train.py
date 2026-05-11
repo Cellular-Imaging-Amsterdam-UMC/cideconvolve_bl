@@ -25,6 +25,7 @@ try:
         QCheckBox,
         QFileDialog,
         QFormLayout,
+        QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -96,12 +97,19 @@ TRAINING_PRESETS = {
         "residual_scale": 1.0,
         "rl_iterations": 2,
         "rl_iteration_pool": "2",
+        "rl_iteration_weights": "",
         "train_samples_per_epoch": 4,
         "val_samples": 2,
         "reconvolution_weight": 0.0,
+        "gradient_weight": 0.05,
         "negative_residual_weight": 0.05,
         "max_negative_residual_fraction": 0.25,
+        "intensity_retention_weight": 0.0,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "standard",
+        "synthetic_artifact_level": "standard",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "widefield",
         "psf_mismatch": "none",
@@ -128,12 +136,19 @@ TRAINING_PRESETS = {
         "residual_scale": 1.0,
         "rl_iterations": 2,
         "rl_iteration_pool": "2",
+        "rl_iteration_weights": "",
         "train_samples_per_epoch": 4,
         "val_samples": 2,
         "reconvolution_weight": 0.0,
+        "gradient_weight": 0.05,
         "negative_residual_weight": 0.05,
         "max_negative_residual_fraction": 0.25,
+        "intensity_retention_weight": 0.0,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "standard",
+        "synthetic_artifact_level": "standard",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "widefield",
         "psf_mismatch": "none",
@@ -146,166 +161,241 @@ TRAINING_PRESETS = {
         "volume_cache_size": 2,
         "mixed_precision": True,
     },
-    "Medium widefield": {
-        "output_suffix": "gui_medium_widefield_v3",
+    "Medium widefield strong": {
+        "output_suffix": "gui_medium_widefield_strong_v4",
         "num_volumes": 250,
         "volume_shape": "24,128,128",
         "patch_size": 96,
         "z_context": 2,
         "batch_size": 6,
-        "epochs": 15,
+        "epochs": 50,
         "steps": 0,
         "learning_rate": 5e-4,
-        "base_channels": 24,
+        "base_channels": 32,
         "residual_scale": 1.0,
         "rl_iterations": 50,
-        "rl_iteration_pool": "15,25,35,50,80",
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
         "train_samples_per_epoch": 3000,
         "val_samples": 384,
-        "reconvolution_weight": 0.01,
-        "negative_residual_weight": 0.08,
-        "max_negative_residual_fraction": 0.20,
+        "reconvolution_weight": 0.02,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "widefield",
         "psf_mismatch": "mild",
-        "psf_mismatch_moderate_fraction": 0.0,
+        "psf_mismatch_moderate_fraction": 0.50,
         "model_type": "GatedResidualUNet25D",
         "use_conditioning": True,
-        "residual_bound_fraction": 0.35,
-        "residual_bound_scale": 0.05,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
         "num_workers": 0,
         "data_loader_workers": 4,
         "volume_cache_size": 8,
         "mixed_precision": True,
     },
-    "Medium confocal": {
-        "output_suffix": "gui_medium_confocal_v3",
+    "Medium confocal strong": {
+        "output_suffix": "gui_medium_confocal_strong_v4",
         "num_volumes": 250,
         "volume_shape": "24,128,128",
         "patch_size": 96,
         "z_context": 2,
         "batch_size": 6,
-        "epochs": 15,
+        "epochs": 50,
         "steps": 0,
         "learning_rate": 5e-4,
-        "base_channels": 24,
+        "base_channels": 32,
         "residual_scale": 1.0,
         "rl_iterations": 50,
-        "rl_iteration_pool": "15,25,35,50,80",
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
         "train_samples_per_epoch": 3000,
         "val_samples": 384,
-        "reconvolution_weight": 0.01,
-        "negative_residual_weight": 0.08,
-        "max_negative_residual_fraction": 0.20,
+        "reconvolution_weight": 0.02,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "confocal",
         "psf_mismatch": "mild",
-        "psf_mismatch_moderate_fraction": 0.0,
+        "psf_mismatch_moderate_fraction": 0.50,
         "model_type": "GatedResidualUNet25D",
         "use_conditioning": True,
-        "residual_bound_fraction": 0.35,
-        "residual_bound_scale": 0.05,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
         "num_workers": 0,
         "data_loader_workers": 4,
         "volume_cache_size": 8,
         "mixed_precision": True,
     },
-    "Large widefield quality": {
-        "output_suffix": "gui_large_widefield_quality_v3",
+    "Large widefield strong": {
+        "output_suffix": "gui_large_widefield_strong_v4",
         "num_volumes": 1000,
         "volume_shape": "32,256,256",
         "patch_size": 128,
         "z_context": 2,
         "batch_size": 16,
-        "epochs": 30,
+        "epochs": 50,
         "steps": 0,
         "learning_rate": 5e-4,
-        "base_channels": 32,
+        "base_channels": 48,
         "residual_scale": 1.0,
         "rl_iterations": 50,
-        "rl_iteration_pool": "15,25,35,50,80",
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
         "train_samples_per_epoch": 12000,
         "val_samples": 1000,
         "reconvolution_weight": 0.02,
-        "negative_residual_weight": 0.08,
-        "max_negative_residual_fraction": 0.20,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "widefield",
         "psf_mismatch": "mild",
-        "psf_mismatch_moderate_fraction": 0.2,
+        "psf_mismatch_moderate_fraction": 0.50,
         "model_type": "GatedResidualUNet25D",
         "use_conditioning": True,
-        "residual_bound_fraction": 0.35,
-        "residual_bound_scale": 0.05,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
         "num_workers": 0,
         "data_loader_workers": 8,
         "volume_cache_size": 8,
         "mixed_precision": True,
     },
-    "Large confocal quality": {
-        "output_suffix": "gui_large_confocal_quality_v3",
+    "Large widefield strong XY2": {
+        "output_suffix": "gui_large_widefield_strong_xy2_v1",
+        "num_volumes": 1000,
+        "volume_shape": "32,256,256",
+        "patch_size": 128,
+        "z_context": 2,
+        "batch_size": 12,
+        "epochs": 50,
+        "steps": 0,
+        "learning_rate": 5e-4,
+        "base_channels": 48,
+        "residual_scale": 1.0,
+        "rl_iterations": 50,
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
+        "train_samples_per_epoch": 12000,
+        "val_samples": 1000,
+        "reconvolution_weight": 0.02,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
+        "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 2,
+        "synthetic_morphology": "mixed",
+        "microscope_type": "widefield",
+        "psf_mismatch": "mild",
+        "psf_mismatch_moderate_fraction": 0.50,
+        "model_type": "GatedResidualUNet25D",
+        "use_conditioning": True,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
+        "num_workers": 0,
+        "data_loader_workers": 6,
+        "volume_cache_size": 4,
+        "mixed_precision": True,
+    },
+    "Large confocal strong": {
+        "output_suffix": "gui_large_confocal_strong_v4",
         "num_volumes": 1000,
         "volume_shape": "32,256,256",
         "patch_size": 128,
         "z_context": 2,
         "batch_size": 16,
-        "epochs": 30,
+        "epochs": 50,
         "steps": 0,
         "learning_rate": 5e-4,
-        "base_channels": 32,
+        "base_channels": 48,
         "residual_scale": 1.0,
         "rl_iterations": 50,
-        "rl_iteration_pool": "15,25,35,50,80",
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
         "train_samples_per_epoch": 12000,
         "val_samples": 1000,
         "reconvolution_weight": 0.02,
-        "negative_residual_weight": 0.08,
-        "max_negative_residual_fraction": 0.20,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "confocal",
         "psf_mismatch": "mild",
-        "psf_mismatch_moderate_fraction": 0.2,
+        "psf_mismatch_moderate_fraction": 0.50,
         "model_type": "GatedResidualUNet25D",
         "use_conditioning": True,
-        "residual_bound_fraction": 0.35,
-        "residual_bound_scale": 0.05,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
         "num_workers": 0,
         "data_loader_workers": 8,
         "volume_cache_size": 8,
         "mixed_precision": True,
     },
-    "Large mixed quality": {
-        "output_suffix": "gui_large_mixed_quality_v3",
+    "Large mixed strong": {
+        "output_suffix": "gui_large_mixed_strong_v4",
         "num_volumes": 1000,
         "volume_shape": "32,256,256",
         "patch_size": 128,
         "z_context": 2,
         "batch_size": 16,
-        "epochs": 30,
+        "epochs": 50,
         "steps": 0,
         "learning_rate": 5e-4,
-        "base_channels": 32,
+        "base_channels": 48,
         "residual_scale": 1.0,
         "rl_iterations": 50,
-        "rl_iteration_pool": "15,25,35,50,80",
+        "rl_iteration_pool": "50,80,100",
+        "rl_iteration_weights": "0.35,0.40,0.25",
         "train_samples_per_epoch": 12000,
         "val_samples": 1000,
         "reconvolution_weight": 0.02,
-        "negative_residual_weight": 0.08,
-        "max_negative_residual_fraction": 0.20,
+        "gradient_weight": 0.08,
+        "negative_residual_weight": 0.01,
+        "max_negative_residual_fraction": 0.50,
+        "intensity_retention_weight": 0.05,
+        "intensity_retention_min": 0.90,
+        "intensity_retention_max": 1.15,
         "synthetic_complexity": "full",
+        "synthetic_artifact_level": "strong",
+        "super_sample_xy": 1,
         "synthetic_morphology": "mixed",
         "microscope_type": "mixed",
         "psf_mismatch": "mild",
-        "psf_mismatch_moderate_fraction": 0.2,
+        "psf_mismatch_moderate_fraction": 0.50,
         "model_type": "GatedResidualUNet25D",
         "use_conditioning": True,
-        "residual_bound_fraction": 0.35,
-        "residual_bound_scale": 0.05,
+        "residual_bound_fraction": 0.75,
+        "residual_bound_scale": 0.10,
         "num_workers": 0,
         "data_loader_workers": 8,
         "volume_cache_size": 8,
@@ -332,10 +422,23 @@ class TrainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         top_form = QFormLayout()
         columns = QHBoxLayout()
+        columns.setSpacing(12)
         left_form = QFormLayout()
+        middle_form = QFormLayout()
         right_form = QFormLayout()
-        columns.addLayout(left_form, stretch=1)
-        columns.addLayout(right_form, stretch=1)
+        for form in (left_form, middle_form, right_form):
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+
+        data_group = QGroupBox("Data")
+        data_group.setLayout(left_form)
+        training_group = QGroupBox("Training")
+        training_group.setLayout(middle_form)
+        model_group = QGroupBox("Model and runtime")
+        model_group.setLayout(right_form)
+        columns.addWidget(data_group, stretch=1)
+        columns.addWidget(training_group, stretch=1)
+        columns.addWidget(model_group, stretch=1)
 
         self.preset = QComboBox()
         self.preset.addItems(list(TRAINING_PRESETS))
@@ -369,6 +472,7 @@ class TrainWindow(QMainWindow):
         self.residual_scale.setValue(1.0)
         self.rl_iterations = self.spin(1, 500, 8)
         self.rl_iteration_pool = QLineEdit("")
+        self.rl_iteration_weights = QLineEdit("")
         self.train_samples = self.spin(1, 1_000_000, 256)
         self.val_samples = self.spin(1, 100_000, 64)
         self.reconvolution_weight = QDoubleSpinBox()
@@ -376,6 +480,11 @@ class TrainWindow(QMainWindow):
         self.reconvolution_weight.setRange(0.0, 10.0)
         self.reconvolution_weight.setSingleStep(0.01)
         self.reconvolution_weight.setValue(0.0)
+        self.gradient_weight = QDoubleSpinBox()
+        self.gradient_weight.setDecimals(4)
+        self.gradient_weight.setRange(0.0, 10.0)
+        self.gradient_weight.setSingleStep(0.01)
+        self.gradient_weight.setValue(0.05)
         self.negative_residual_weight = QDoubleSpinBox()
         self.negative_residual_weight.setDecimals(4)
         self.negative_residual_weight.setRange(0.0, 10.0)
@@ -386,8 +495,26 @@ class TrainWindow(QMainWindow):
         self.max_negative_residual_fraction.setRange(0.0, 1.0)
         self.max_negative_residual_fraction.setSingleStep(0.05)
         self.max_negative_residual_fraction.setValue(0.25)
+        self.intensity_retention_weight = QDoubleSpinBox()
+        self.intensity_retention_weight.setDecimals(4)
+        self.intensity_retention_weight.setRange(0.0, 10.0)
+        self.intensity_retention_weight.setSingleStep(0.01)
+        self.intensity_retention_weight.setValue(0.0)
+        self.intensity_retention_min = QDoubleSpinBox()
+        self.intensity_retention_min.setDecimals(3)
+        self.intensity_retention_min.setRange(0.0, 2.0)
+        self.intensity_retention_min.setSingleStep(0.05)
+        self.intensity_retention_min.setValue(0.90)
+        self.intensity_retention_max = QDoubleSpinBox()
+        self.intensity_retention_max.setDecimals(3)
+        self.intensity_retention_max.setRange(0.0, 3.0)
+        self.intensity_retention_max.setSingleStep(0.05)
+        self.intensity_retention_max.setValue(1.15)
         self.synthetic_complexity = QComboBox()
         self.synthetic_complexity.addItems(["standard", "full"])
+        self.synthetic_artifact_level = QComboBox()
+        self.synthetic_artifact_level.addItems(["standard", "strong"])
+        self.super_sample_xy = self.spin(1, 2, 1)
         self.synthetic_morphology = QComboBox()
         self.synthetic_morphology.addItems(["mixed", "generic", "dna", "mitotic", "membrane", "actin", "dendrite", "puncta"])
         self.microscope_type = QComboBox()
@@ -425,30 +552,38 @@ class TrainWindow(QMainWindow):
         left_form.addRow("Volumes", self.num_volumes)
         left_form.addRow("Volume shape Z,Y,X", self.volume_shape)
         left_form.addRow("Synthetic complexity", self.synthetic_complexity)
+        left_form.addRow("Artifact level", self.synthetic_artifact_level)
+        left_form.addRow("XY supersampling", self.super_sample_xy)
         left_form.addRow("Synthetic morphology", self.synthetic_morphology)
         left_form.addRow("Microscope type", self.microscope_type)
+        left_form.addRow("PSF mismatch", self.psf_mismatch)
+        left_form.addRow("Moderate mismatch frac.", self.psf_mismatch_moderate_fraction)
+
+        middle_form.addRow("Epochs", self.epochs)
+        middle_form.addRow("Steps (0 = epoch)", self.steps)
+        middle_form.addRow("Train samples/epoch", self.train_samples)
+        middle_form.addRow("Validation samples", self.val_samples)
         left_form.addRow("Patch size", self.patch_size)
         left_form.addRow("Z context", self.z_context)
         left_form.addRow("Batch size", self.batch_size)
-        left_form.addRow("Epochs", self.epochs)
-        left_form.addRow("Steps (0 = epoch)", self.steps)
-        left_form.addRow("Train samples/epoch", self.train_samples)
-        left_form.addRow("Validation samples", self.val_samples)
+        middle_form.addRow("Learning rate", self.lr)
+        middle_form.addRow("RL iterations", self.rl_iterations)
+        middle_form.addRow("RL iteration pool", self.rl_iteration_pool)
+        middle_form.addRow("RL iteration weights", self.rl_iteration_weights)
+        middle_form.addRow("Reconvolution weight", self.reconvolution_weight)
+        middle_form.addRow("Gradient weight", self.gradient_weight)
+        middle_form.addRow("Neg. residual weight", self.negative_residual_weight)
+        middle_form.addRow("Max neg. residual frac.", self.max_negative_residual_fraction)
+        middle_form.addRow("Intensity retention", self.intensity_retention_weight)
+        middle_form.addRow("Retention min", self.intensity_retention_min)
+        middle_form.addRow("Retention max", self.intensity_retention_max)
 
-        right_form.addRow("Learning rate", self.lr)
-        right_form.addRow("Base channels", self.base_channels)
-        right_form.addRow("Residual scale", self.residual_scale)
-        right_form.addRow("RL iterations", self.rl_iterations)
-        right_form.addRow("RL iteration pool", self.rl_iteration_pool)
-        right_form.addRow("PSF mismatch", self.psf_mismatch)
-        right_form.addRow("Moderate mismatch frac.", self.psf_mismatch_moderate_fraction)
         right_form.addRow("Model type", self.model_type)
+        right_form.addRow("Base channels", self.base_channels)
         right_form.addRow("Conditioning", self.use_conditioning)
+        right_form.addRow("Residual scale", self.residual_scale)
         right_form.addRow("Residual bound frac.", self.residual_bound_fraction)
         right_form.addRow("Residual bound scale", self.residual_bound_scale)
-        right_form.addRow("Reconvolution weight", self.reconvolution_weight)
-        right_form.addRow("Neg. residual weight", self.negative_residual_weight)
-        right_form.addRow("Max neg. residual frac.", self.max_negative_residual_fraction)
         right_form.addRow("CPU workers (0 = auto)", self.num_workers)
         right_form.addRow("Loader workers (0 = auto)", self.data_loader_workers)
         right_form.addRow("Volume cache/worker", self.volume_cache_size)
@@ -572,12 +707,19 @@ class TrainWindow(QMainWindow):
         self.residual_scale.setValue(float(preset["residual_scale"]))
         self.rl_iterations.setValue(int(preset["rl_iterations"]))
         self.rl_iteration_pool.setText(str(preset.get("rl_iteration_pool", "")))
+        self.rl_iteration_weights.setText(str(preset.get("rl_iteration_weights", "")))
         self.train_samples.setValue(int(preset["train_samples_per_epoch"]))
         self.val_samples.setValue(int(preset["val_samples"]))
         self.reconvolution_weight.setValue(float(preset["reconvolution_weight"]))
+        self.gradient_weight.setValue(float(preset.get("gradient_weight", 0.05)))
         self.negative_residual_weight.setValue(float(preset["negative_residual_weight"]))
         self.max_negative_residual_fraction.setValue(float(preset["max_negative_residual_fraction"]))
+        self.intensity_retention_weight.setValue(float(preset.get("intensity_retention_weight", 0.0)))
+        self.intensity_retention_min.setValue(float(preset.get("intensity_retention_min", 0.90)))
+        self.intensity_retention_max.setValue(float(preset.get("intensity_retention_max", 1.15)))
         self.synthetic_complexity.setCurrentText(str(preset["synthetic_complexity"]))
+        self.synthetic_artifact_level.setCurrentText(str(preset.get("synthetic_artifact_level", "standard")))
+        self.super_sample_xy.setValue(int(preset.get("super_sample_xy", 1)))
         self.synthetic_morphology.setCurrentText(str(preset.get("synthetic_morphology", "mixed")))
         self.microscope_type.setCurrentText(str(preset["microscope_type"]))
         self.psf_mismatch.setCurrentText(str(preset.get("psf_mismatch", "none")))
@@ -642,12 +784,20 @@ class TrainWindow(QMainWindow):
                 residual_scale=self.residual_scale.value(),
                 rl_iterations=self.rl_iterations.value(),
                 rl_iteration_pool=tuple(int(part.strip()) for part in self.rl_iteration_pool.text().replace(";", ",").split(",") if part.strip()),
+                rl_iteration_weights=tuple(float(part.strip()) for part in self.rl_iteration_weights.text().replace(";", ",").split(",") if part.strip()),
                 reconvolution_weight=self.reconvolution_weight.value(),
+                gradient_weight=self.gradient_weight.value(),
                 negative_residual_weight=self.negative_residual_weight.value(),
                 max_negative_residual_fraction=self.max_negative_residual_fraction.value(),
+                intensity_retention_weight=self.intensity_retention_weight.value(),
+                intensity_retention_min=self.intensity_retention_min.value(),
+                intensity_retention_max=self.intensity_retention_max.value(),
                 train_samples_per_epoch=self.train_samples.value(),
                 val_samples=self.val_samples.value(),
                 synthetic_complexity=self.synthetic_complexity.currentText(),
+                synthetic_artifact_level=self.synthetic_artifact_level.currentText(),
+                super_sample_xy=self.super_sample_xy.value(),
+                super_sample_z=1,
                 synthetic_morphology=self.synthetic_morphology.currentText(),
                 microscope_type=self.microscope_type.currentText(),
                 psf_mismatch=self.psf_mismatch.currentText(),

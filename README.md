@@ -70,15 +70,24 @@ python train.py \
     --output-dir training_runs/full_ci_rl_dl \
     --device cuda \
     --mixed-precision \
-    --rl-iteration-pool 15,25,35,50,80 \
+    --rl-iteration-pool 50,80,100 \
+    --rl-iteration-weights 0.35,0.40,0.25 \
     --psf-mismatch mild \
-    --psf-mismatch-moderate-fraction 0.2 \
+    --psf-mismatch-moderate-fraction 0.5 \
+    --synthetic-artifact-level strong \
+    --base-channels 48 \
+    --residual-bound-fraction 0.75 \
+    --residual-bound-scale 0.10 \
+    --negative-residual-weight 0.01 \
+    --max-negative-residual-fraction 0.50 \
+    --intensity-retention-weight 0.05 \
+    --gradient-weight 0.08 \
     --model-type GatedResidualUNet25D \
     --use-conditioning \
     --reconvolution-weight 0.02
 ```
 
-The full preset uses 1000 synthetic volumes by default, richer synthetic structures, whole-volume train/validation/test splits, randomized `ci_rl` iteration counts, mild PSF mismatch, scalar conditioning channels, and the gated residual model. You can still override `--num-volumes`, `--volume-shape`, `--patch-size`, `--epochs`, and `--steps`.
+The full preset uses 1000 synthetic volumes by default, richer synthetic structures, whole-volume train/validation/test splits, high-iteration `ci_rl` preprocessing, mild/moderate PSF mismatch, scalar conditioning channels, and the gated residual model. The current strong-restoration settings intentionally train on harder post-RL failure modes: PSF error, coma/astigmatism-like aberration, uneven illumination, haze/background offsets, row/column banding, read-noise outliers, hot pixels, clipping, ringing-prone PSF mismatch, and noisy texture. You can still override `--num-volumes`, `--volume-shape`, `--patch-size`, `--epochs`, and `--steps`.
 
 V2 checkpoints store their conditioning and recommended inference settings in the sidecar JSON next to the model. The conditioning channels are compact metadata planes, not full PSF images: RL iteration count, PSF width summaries, pixel sizes, NA, wavelength, and microscope type for mixed models. Old `ResidualUNet25D` checkpoints remain loadable.
 
@@ -106,24 +115,36 @@ network also predicts a gate and bounds the residual with
 refined = clamp(ci_rl + residual_scale * gate * bounded_residual, min=0)
 ```
 
-Training logs include global train/validation losses plus validation losses by
+For the strong V4 presets, the gate is kept but the residual bound is looser
+than the original conservative model. This is meant to learn real restoration
+after strong `ci_rl`, not only a tiny polish. A foreground intensity-retention
+loss can be enabled to discourage the model from darkening biological signal
+too aggressively while still allowing artifact/background correction. Training
+logs include global train/validation losses plus validation losses by
 morphology bucket (`generic`, `dna`, `mitotic`, `membrane`, `actin`,
 `dendrite`, and `puncta`) where those structures are present. Per-bucket
 example montages are written under the run's `examples/buckets/` folder.
 
+Experimental XY supersampling is available with `--super-sample-xy 2`. In this
+mode the clean GT and PSFs are generated on a 2x finer XY grid, the blurred
+high-resolution image is averaged down to the simulated camera grid before
+noise and offset are added, and the noisy camera raw image is then upsampled
+before high-resolution `ci_rl` preprocessing and DL training. The GUI includes
+a `Large widefield strong XY2` preset for this first hires experiment.
+
 The full synthetic generator includes sparse spots and vesicles as well as
 DAPI/chromatin-like nuclei, mitotic spindle/fiber fields, membrane/cytoplasm
-signal, sheets, and diffuse biological background. Training also includes a
-negative-residual guard by default:
+signal, sheets, and diffuse biological background. Conservative training can
+include a stronger negative-residual guard:
 
 ```bash
 --negative-residual-weight 0.05
 --max-negative-residual-fraction 0.25
 ```
 
-This discourages the model from subtracting too much `ci_rl` signal in likely
-biological structures, which is useful when a first model darkens DAPI, actin,
-spindle, membrane, or dense cytoplasmic regions.
+The strong V4 presets reduce that brake to `0.01` and allow larger negative
+corrections, because the generator now has more realistic GT and artifact
+coverage.
 
 Small first experiment:
 
@@ -174,8 +195,8 @@ The training GUI can be launched with:
 python gui_train.py
 ```
 
-The GUI includes separate `Medium widefield`, `Medium confocal`, `Large
-widefield quality`, `Large confocal quality`, and `Large mixed quality` V2
+The GUI includes separate `Medium widefield strong`, `Medium confocal strong`,
+`Large widefield strong`, `Large confocal strong`, and `Large mixed strong`
 presets. The microscope-specific presets are the recommended first serious
 runs; the mixed preset is useful for comparison and robustness checks.
 

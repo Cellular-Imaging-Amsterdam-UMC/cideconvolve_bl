@@ -91,8 +91,10 @@ class CiRlDlSmokeTests(unittest.TestCase):
                 z_context=1,
                 rl_iterations=1,
                 rl_iteration_pool=(1, 2),
+                rl_iteration_weights=(0.0, 1.0),
                 output_dir=root,
                 quick_test=True,
+                synthetic_artifact_level="strong",
                 psf_mismatch="mild",
             )
             generate_training_data(config, root)
@@ -100,8 +102,11 @@ class CiRlDlSmokeTests(unittest.TestCase):
             self.assertTrue(sample_dirs)
             for sample_dir in sample_dirs:
                 meta = json.loads((sample_dir / "metadata.json").read_text())
-                self.assertIn(meta["rl_requested_iterations"], [1, 2])
+                self.assertEqual(meta["rl_requested_iterations"], 2)
                 self.assertEqual(meta["rl_iteration_pool"], [1, 2])
+                self.assertEqual(meta["rl_iteration_weights"], [0.0, 1.0])
+                self.assertEqual(meta["noise"]["synthetic_artifact_level"], "strong")
+                self.assertTrue(meta["psf_aberration"]["enabled"])
                 self.assertTrue((sample_dir / f"ci_rl_iter_{meta['rl_requested_iterations']:03d}.tif").exists())
                 self.assertTrue((sample_dir / "forward_psf.tif").exists())
                 self.assertTrue((sample_dir / "deconv_psf.tif").exists())
@@ -109,6 +114,30 @@ class CiRlDlSmokeTests(unittest.TestCase):
                 dec = tifffile.imread(sample_dir / "deconv_psf.tif")
                 self.assertEqual(fwd.shape, dec.shape)
                 self.assertGreater(float(np.mean(np.abs(fwd - dec))), 0.0)
+
+    def test_xy_supersampling_saves_highres_training_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = TrainConfig(
+                num_volumes=3,
+                volume_shape=(5, 12, 14),
+                patch_size=16,
+                z_context=1,
+                rl_iterations=1,
+                output_dir=root,
+                quick_test=True,
+                super_sample_xy=2,
+            )
+            generate_training_data(config, root)
+            sample_dir = sorted((root / "data").glob("*/*"))[0]
+            meta = json.loads((sample_dir / "metadata.json").read_text())
+            gt = tifffile.imread(sample_dir / "gt.tif")
+            raw = tifffile.imread(sample_dir / "raw.tif")
+            raw_observed = tifffile.imread(sample_dir / "raw_observed.tif")
+            self.assertEqual(meta["super_sample_xy"], 2)
+            self.assertEqual(tuple(gt.shape), (5, 24, 28))
+            self.assertEqual(tuple(raw.shape), (5, 24, 28))
+            self.assertEqual(tuple(raw_observed.shape), (5, 12, 14))
 
     def test_legacy_checkpoint_loading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

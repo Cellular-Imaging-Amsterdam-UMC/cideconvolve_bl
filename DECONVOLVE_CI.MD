@@ -122,8 +122,11 @@ volume before patch extraction, so validation and test patches are not sampled
 from training volumes.
 
 V2 training can randomize the RL preprocessing strength per synthetic volume
-with `--rl-iteration-pool`, for example `15,25,35,50,80`. Each sample stores
-`rl_requested_iterations`, `rl_iterations_used`, and the full pool in metadata.
+with `--rl-iteration-pool`. The strong-restoration presets bias this toward
+already-good physics results, for example `50,80,100` with
+`--rl-iteration-weights 0.35,0.40,0.25`. Each sample stores
+`rl_requested_iterations`, `rl_iterations_used`, the pool, and optional weights
+in metadata.
 The run caches `ci_rl` outputs by iteration count (`ci_rl_iter_XXX.tif`), so
 changing the pool only computes missing deconvolutions for already generated
 raw/GT volumes.
@@ -131,9 +134,33 @@ raw/GT volumes.
 V2 training can also create a deliberate PSF mismatch. The `forward_psf` blurs
 the ground truth into raw synthetic data, while the `deconv_psf` is used by RL
 preprocessing and optional reconvolution consistency. `--psf-mismatch none`
-uses the same PSF, `mild` applies small optical perturbations, and `moderate`
-applies stronger perturbations. Both PSFs and both parameter dictionaries are
-saved with each sample.
+uses the same PSF, `mild` applies optical perturbations, and `moderate`
+applies stronger perturbations. Strong artifact training also adds lightweight
+coma/astigmatism-like PSF asymmetry to the forward PSF, while the deconvolution
+PSF remains generated from the perturbed optical parameters. Both PSFs, both
+parameter dictionaries, and the aberration summary are saved with each sample.
+
+`--synthetic-artifact-level strong` targets real post-RL failure modes rather
+than only clean synthetic blur. It adds harder camera/background artifacts:
+lower/wider photon-count ranges, uneven illumination, haze/background offsets,
+row/column banding, read-noise outliers, stronger hot pixels, mild clipping,
+and PSF mismatch likely to produce residual ringing or halo errors.
+
+Strong training can add an intensity-retention loss. This loss is computed in
+foreground-like regions and penalizes the refined plane when its summed signal
+falls below or rises above configured ratios relative to `ci_rl`. It is meant
+to prevent the stronger model from solving synthetic background mismatch by
+darkening real biological structures too aggressively.
+
+`--super-sample-xy 2` enables the first experimental high-resolution training
+path. The requested `volume_shape` is treated as the camera grid. Clean GT,
+forward PSF, deconvolution PSF, `ci_rl`, and DL targets are generated on a 2x
+finer XY grid. Image formation still happens correctly at the camera level:
+the high-resolution blurred image is averaged down to the camera grid, Poisson
+noise, offset, read noise, and artifacts are added there, and that noisy camera
+raw image is upsampled before high-resolution `ci_rl` preprocessing. The
+original camera raw is saved as `raw_observed.tif`; `raw.tif` is the
+upsampled training/deconvolution input.
 
 Validation is morphology-aware. Synthetic samples carry a bucket label such as
 `generic`, `dna`, `mitotic`, `membrane`, `actin`, `dendrite`, or `puncta`.
@@ -487,10 +514,16 @@ The high-level `deconvolve(..., method="ci_rl_dl")`, `wrapper.py`, and
 - `dl_mixed_precision`
 - `dl_residual_strength`
 
-`gui_train.py` provides V2 training presets for smoke tests, medium/large
-widefield, medium/large confocal, and a large mixed comparison run. New
-checkpoints write a JSON sidecar containing `model_type`, conditioning channel
-names, residual-bound settings, and recommended inference settings.
+`gui_train.py` provides V2/V4 training presets for smoke tests, medium/large
+widefield, medium/large confocal, and a large mixed comparison run. The current
+medium/large presets are strong-restoration presets: high-RL weighted sampling
+(`50,80,100`), strong artifacts, mild PSF mismatch with 50% moderate cases,
+larger model capacity, looser residual bounds, reduced negative-residual guard,
+foreground intensity-retention loss, gradient loss, and reconvolution
+consistency. The `Large widefield strong XY2` preset enables the first
+lateral 2x supersampled experiment. New checkpoints write a JSON
+sidecar containing `model_type`, conditioning channel names, residual-bound
+settings, and recommended inference settings.
 
 ### `ci_sparse_hessian_deconvolve(image, psf, **kwargs) → dict`
 

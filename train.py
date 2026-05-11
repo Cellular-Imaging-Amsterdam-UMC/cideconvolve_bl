@@ -45,6 +45,26 @@ from deconvolve_ci_dl import (
 
 log = logging.getLogger(__name__)
 
+PSF_GENERATION_KEYS = {
+    "na",
+    "wavelength_nm",
+    "pixel_size_xy_nm",
+    "pixel_size_z_nm",
+    "n_xy",
+    "n_z",
+    "ri_immersion",
+    "ri_sample",
+    "ri_coverslip",
+    "ri_coverslip_design",
+    "ri_immersion_design",
+    "microscope_type",
+    "excitation_nm",
+    "pinhole_airy_units",
+    "integrate_pixels",
+    "n_pupil",
+    "device",
+}
+
 
 def timestamp_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -85,14 +105,21 @@ class TrainConfig:
     residual_scale: float = 1.0
     rl_iterations: int = 8
     rl_iteration_pool: tuple[int, ...] = ()
+    rl_iteration_weights: tuple[float, ...] = ()
     quick_test: bool = False
     reconvolution_weight: float = 0.0
     gradient_weight: float = 0.05
     negative_residual_weight: float = 0.05
     max_negative_residual_fraction: float = 0.25
+    intensity_retention_weight: float = 0.0
+    intensity_retention_min: float = 0.90
+    intensity_retention_max: float = 1.15
     train_samples_per_epoch: int = 256
     val_samples: int = 64
     synthetic_complexity: str = "standard"
+    synthetic_artifact_level: str = "standard"
+    super_sample_xy: int = 1
+    super_sample_z: int = 1
     synthetic_morphology: str = "mixed"
     microscope_type: str = "widefield"
     psf_mismatch: str = "none"
@@ -121,6 +148,43 @@ def parse_int_pool(value: str | Sequence[int] | None) -> tuple[int, ...]:
     else:
         parts = [int(v) for v in value]
     return tuple(max(int(v), 1) for v in parts)
+
+
+def parse_float_pool(value: str | Sequence[float] | None) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts = [float(p.strip()) for p in value.replace(";", ",").split(",") if p.strip()]
+    else:
+        parts = [float(v) for v in value]
+    return tuple(max(float(v), 0.0) for v in parts)
+
+
+def downsample_xy_mean(volume: np.ndarray, factor: int) -> np.ndarray:
+    factor = max(int(factor), 1)
+    if factor == 1:
+        return np.asarray(volume)
+    z, y, x = volume.shape
+    y_trim = (y // factor) * factor
+    x_trim = (x // factor) * factor
+    trimmed = np.asarray(volume)[:, :y_trim, :x_trim]
+    return trimmed.reshape(z, y_trim // factor, factor, x_trim // factor, factor).mean(axis=(2, 4))
+
+
+def upsample_xy_torch(volume: np.ndarray, factor: int) -> np.ndarray:
+    factor = max(int(factor), 1)
+    arr = np.asarray(volume, dtype=np.float32)
+    if factor == 1:
+        return arr
+    with torch.no_grad():
+        tensor = torch.from_numpy(arr)[None, None]
+        up = torch.nn.functional.interpolate(
+            tensor,
+            scale_factor=(1, factor, factor),
+            mode="trilinear",
+            align_corners=False,
+        )
+    return up[0, 0].cpu().numpy().astype(np.float32)
 
 
 def set_seed(seed: int) -> None:
@@ -618,18 +682,28 @@ def make_small_psf(
     rng: np.random.Generator,
     device: str = "cpu",
     microscope_type: str = "widefield",
+    super_sample_xy: int = 1,
+    super_sample_z: int = 1,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     micro = str(microscope_type).strip().lower()
     if micro == "mixed":
         micro = "confocal" if rng.random() < 0.5 else "widefield"
+    ss_xy = max(int(super_sample_xy), 1)
+    ss_z = max(int(super_sample_z), 1)
     psf_z = min(max(5, shape[0] | 1), 15)
     psf_xy = 15
     emission = float(rng.uniform(500, 620))
+    camera_pixel_xy = float(rng.uniform(75, 130))
+    camera_pixel_z = float(rng.uniform(220, 380))
     params = {
         "na": float(rng.uniform(1.1, 1.4)),
         "wavelength_nm": emission,
-        "pixel_size_xy_nm": float(rng.uniform(75, 130)),
-        "pixel_size_z_nm": float(rng.uniform(220, 380)),
+        "pixel_size_xy_nm": camera_pixel_xy / ss_xy,
+        "pixel_size_z_nm": camera_pixel_z / ss_z,
+        "camera_pixel_size_xy_nm": camera_pixel_xy,
+        "camera_pixel_size_z_nm": camera_pixel_z,
+        "super_sample_xy": ss_xy,
+        "super_sample_z": ss_z,
         "n_xy": psf_xy,
         "n_z": psf_z,
         "ri_sample": float(rng.uniform(1.33, 1.47)),
@@ -640,12 +714,13 @@ def make_small_psf(
         "n_pupil": 33,
         "device": device,
     }
-    psf = ci_generate_psf(**params).astype(np.float32)
+    psf_kwargs = {key: value for key, value in params.items() if key in PSF_GENERATION_KEYS}
+    psf = ci_generate_psf(**psf_kwargs).astype(np.float32)
     return psf, params
 
 
 def generate_psf_from_params(params: dict[str, Any], device: str = "cpu") -> np.ndarray:
-    psf_params = dict(params)
+    psf_params = {key: value for key, value in dict(params).items() if key in PSF_GENERATION_KEYS}
     psf_params["device"] = device
     return ci_generate_psf(**psf_params).astype(np.float32)
 
@@ -654,14 +729,46 @@ def perturb_psf_params(params: dict[str, Any], rng: np.random.Generator, mode: s
     mode_l = str(mode).strip().lower()
     if mode_l == "none":
         return dict(params)
-    scale = 0.035 if mode_l == "mild" else 0.08
+    scale = 0.045 if mode_l == "mild" else 0.12
     out = dict(params)
     for key in ("na", "wavelength_nm", "pixel_size_xy_nm", "pixel_size_z_nm", "ri_sample"):
         if key in out and out[key] is not None:
-            out[key] = float(out[key]) * float(np.clip(1.0 + rng.normal(0.0, scale), 0.75, 1.25))
+            out[key] = float(out[key]) * float(np.clip(1.0 + rng.normal(0.0, scale), 0.65, 1.35))
     if out.get("pinhole_airy_units") is not None:
-        out["pinhole_airy_units"] = float(out["pinhole_airy_units"]) * float(np.clip(1.0 + rng.normal(0.0, scale), 0.75, 1.35))
+        out["pinhole_airy_units"] = float(out["pinhole_airy_units"]) * float(np.clip(1.0 + rng.normal(0.0, scale), 0.65, 1.50))
     return out
+
+
+def add_psf_aberration(psf: np.ndarray, rng: np.random.Generator, mode: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """Add lightweight coma/astigmatism-like PSF error for synthetic robustness."""
+    mode_l = str(mode).strip().lower()
+    if mode_l == "none":
+        return psf.astype(np.float32), {"enabled": False, "mode": "none"}
+    strength = 0.04 if mode_l == "mild" else 0.10
+    out = np.asarray(psf, dtype=np.float32)
+    shift_y = int(rng.choice([-2, -1, 1, 2]))
+    shift_x = int(rng.choice([-2, -1, 1, 2]))
+    if mode_l == "mild":
+        shift_y = int(np.sign(shift_y))
+        shift_x = int(np.sign(shift_x))
+    coma = np.roll(out, shift=(0, shift_y, shift_x), axis=(0, 1, 2))
+    astig = 0.5 * (
+        np.roll(out, shift=(0, shift_y, 0), axis=(0, 1, 2))
+        + np.roll(out, shift=(0, 0, shift_x), axis=(0, 1, 2))
+    )
+    out = (1.0 - strength) * out + strength * (0.65 * coma + 0.35 * astig)
+    axial_shift = int(rng.choice([-1, 1])) if out.shape[0] > 3 and rng.random() < (0.25 if mode_l == "mild" else 0.55) else 0
+    if axial_shift:
+        out = 0.92 * out + 0.08 * np.roll(out, shift=axial_shift, axis=0)
+    out = np.clip(out, 0, None)
+    out /= max(float(out.sum()), 1e-12)
+    return out.astype(np.float32), {
+        "enabled": True,
+        "mode": mode_l,
+        "strength": float(strength),
+        "coma_shift_yx": [int(shift_y), int(shift_x)],
+        "axial_shift": int(axial_shift),
+    }
 
 
 def choose_psf_mismatch_mode(config_mode: str, rng: np.random.Generator, moderate_fraction: float) -> str:
@@ -673,36 +780,75 @@ def choose_psf_mismatch_mode(config_mode: str, rng: np.random.Generator, moderat
     return mode
 
 
+def synthetic_illumination_field(shape: tuple[int, int, int], rng: np.random.Generator, strength: float) -> np.ndarray:
+    z, y, x = shape
+    zz, yy, xx = np.indices(shape, dtype=np.float32)
+    yy = (yy / max(y - 1, 1)) - 0.5
+    xx = (xx / max(x - 1, 1)) - 0.5
+    zz = (zz / max(z - 1, 1)) - 0.5
+    angle = rng.uniform(0, 2 * math.pi)
+    ramp = math.cos(angle) * xx + math.sin(angle) * yy + rng.normal(0, 0.25) * zz
+    field = 1.0 + strength * ramp
+    for _ in range(2):
+        cy = rng.uniform(-0.45, 0.45)
+        cx = rng.uniform(-0.45, 0.45)
+        sigma = rng.uniform(0.18, 0.45)
+        amp = rng.uniform(-0.8, 1.0) * strength
+        field += amp * np.exp(-0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2))
+    return np.clip(field, 0.35, 1.9).astype(np.float32)
+
+
 def add_microscopy_noise(
     blurred: np.ndarray,
     rng: np.random.Generator,
     *,
     microscope_type: str,
+    artifact_level: str = "standard",
 ) -> tuple[np.ndarray, dict[str, float | str | bool]]:
     micro = str(microscope_type).strip().lower()
+    artifacts = str(artifact_level).strip().lower()
+    strong = artifacts in {"strong", "restoration", "aggressive"}
     if micro == "confocal":
-        signal_scale = float(rng.uniform(50, 450))
-        optical_background = float(rng.uniform(0.5, 8.0))
+        signal_scale = float(rng.uniform(20, 300) if strong else rng.uniform(50, 450))
+        optical_background = float(rng.uniform(1.0, 20.0) if strong else rng.uniform(0.5, 8.0))
         camera_offset = float(rng.uniform(0.0, 8.0))
-        read_sigma = float(rng.uniform(0.4, 2.0))
-        hot_probability = 0.15
-        hot_fraction = (2e-6, 2e-5)
-        hot_amplitude = (30, 300)
-        clip_probability = 0.05
+        read_sigma = float(rng.uniform(0.8, 5.0) if strong else rng.uniform(0.4, 2.0))
+        hot_probability = 0.30 if strong else 0.15
+        hot_fraction = (5e-6, 8e-5) if strong else (2e-6, 2e-5)
+        hot_amplitude = (50, 1_000) if strong else (30, 300)
+        clip_probability = 0.12 if strong else 0.05
     else:
-        signal_scale = float(rng.uniform(15_000, 60_000))
-        optical_background = float(rng.uniform(250, 1_500))
-        camera_offset = 100.0
-        read_sigma = float(rng.uniform(1.0, 4.0))
-        hot_probability = 0.35
-        hot_fraction = (5e-6, 8e-5)
-        hot_amplitude = (500, 6_000)
-        clip_probability = 0.20
+        signal_scale = float(rng.uniform(500, 20_000) if strong else rng.uniform(15_000, 60_000))
+        optical_background = float(rng.uniform(100, 2_500) if strong else rng.uniform(250, 1_500))
+        camera_offset = float(rng.uniform(85, 125)) if strong else 100.0
+        read_sigma = float(rng.uniform(1.5, 9.0) if strong else rng.uniform(1.0, 4.0))
+        hot_probability = 0.55 if strong else 0.35
+        hot_fraction = (1e-5, 2.5e-4) if strong else (5e-6, 8e-5)
+        hot_amplitude = (300, 12_000) if strong else (500, 6_000)
+        clip_probability = 0.35 if strong else 0.20
 
-    photons = np.clip(blurred, 0, None) * signal_scale + optical_background
+    illumination_strength = float(rng.uniform(0.08, 0.32) if strong else rng.uniform(0.0, 0.08))
+    illumination = synthetic_illumination_field(blurred.shape, rng, illumination_strength)
+    haze_strength = float(rng.uniform(0.01, 0.10) if strong else rng.uniform(0.0, 0.025))
+    haze = synthetic_illumination_field(blurred.shape, rng, haze_strength) - 1.0
+    photons = np.clip(blurred, 0, None) * signal_scale * illumination + optical_background * (1.0 + haze)
     raw = rng.poisson(photons).astype(np.float32)
     raw += camera_offset
     raw += rng.normal(0, read_sigma, size=raw.shape).astype(np.float32)
+    row_banding = False
+    if strong and rng.random() < 0.60:
+        row_banding = True
+        rows = rng.normal(0, read_sigma * rng.uniform(0.25, 1.1), size=(1, raw.shape[1], 1)).astype(np.float32)
+        cols = rng.normal(0, read_sigma * rng.uniform(0.08, 0.45), size=(1, 1, raw.shape[2])).astype(np.float32)
+        phase = rng.uniform(0, 2 * math.pi)
+        yy = np.arange(raw.shape[1], dtype=np.float32)[None, :, None]
+        periodic = np.sin(yy / rng.uniform(6.0, 24.0) + phase) * read_sigma * rng.uniform(0.2, 1.0)
+        raw += rows + cols + periodic
+    outlier_noise = False
+    if strong and rng.random() < 0.45:
+        outlier_noise = True
+        mask = rng.random(raw.shape) < rng.uniform(1e-5, 2e-4)
+        raw[mask] += rng.normal(0, read_sigma * rng.uniform(8.0, 30.0), size=int(mask.sum())).astype(np.float32)
     hot_pixels = False
     if rng.random() < hot_probability:
         hot_pixels = True
@@ -723,7 +869,12 @@ def add_microscopy_noise(
         "camera_offset": camera_offset,
         "read_sigma": read_sigma,
         "hot_pixels": hot_pixels,
+        "row_banding": row_banding,
+        "outlier_noise": outlier_noise,
         "clipped": clipped,
+        "synthetic_artifact_level": artifacts,
+        "illumination_strength": illumination_strength,
+        "haze_strength": haze_strength,
         "raw_dtype": "uint16",
         "raw_min": float(raw_u16.min()),
         "raw_max": float(raw_u16.max()),
@@ -788,8 +939,11 @@ def raw_data_signature(payload: dict[str, Any], split: str) -> dict[str, Any]:
         "num_volumes": int(payload["num_volumes"]),
         "volume_shape": [int(v) for v in payload["volume_shape"]],
         "synthetic_complexity": str(payload["synthetic_complexity"]),
-        "synthetic_generator_version": 7,
+        "synthetic_generator_version": 8,
         "synthetic_morphology": str(payload.get("synthetic_morphology", "mixed")).strip().lower(),
+        "synthetic_artifact_level": str(payload.get("synthetic_artifact_level", "standard")).strip().lower(),
+        "super_sample_xy": int(payload.get("super_sample_xy", 1)),
+        "super_sample_z": int(payload.get("super_sample_z", 1)),
         "microscope_type": str(payload["microscope_type"]).strip().lower(),
         "psf_mismatch": str(payload.get("psf_mismatch", "none")).strip().lower(),
         "psf_mismatch_moderate_fraction": float(payload.get("psf_mismatch_moderate_fraction", 0.0)),
@@ -872,7 +1026,12 @@ def select_rl_iterations(sample_dir: Path, config: TrainConfig) -> int:
     metadata = read_sample_metadata(sample_dir)
     idx = int(metadata.get("index", 0))
     rng = np.random.default_rng(int(config.seed) + idx * 8191 + 17)
-    return int(pool[int(rng.integers(0, len(pool)))])
+    weights = parse_float_pool(config.rl_iteration_weights)
+    probabilities = None
+    if weights and len(weights) == len(pool) and sum(weights) > 0:
+        probabilities = np.asarray(weights, dtype=np.float64)
+        probabilities = probabilities / probabilities.sum()
+    return int(rng.choice(np.asarray(pool, dtype=np.int32), p=probabilities))
 
 
 def _generate_raw_sample_worker(payload: dict[str, Any]) -> str:
@@ -885,7 +1044,12 @@ def _generate_raw_sample_worker(payload: dict[str, Any]) -> str:
     idx = int(payload["index"])
     num_volumes = int(payload["num_volumes"])
     run_dir = Path(payload["run_dir"])
-    shape = tuple(int(v) for v in payload["volume_shape"])
+    camera_shape = tuple(int(v) for v in payload["volume_shape"])
+    ss_xy = max(int(payload.get("super_sample_xy", 1)), 1)
+    ss_z = max(int(payload.get("super_sample_z", 1)), 1)
+    if ss_z != 1:
+        raise ValueError("Only XY supersampling is currently implemented; keep super_sample_z=1")
+    shape = (camera_shape[0] * ss_z, camera_shape[1] * ss_xy, camera_shape[2] * ss_xy)
     seed = int(payload["seed"])
     rng = np.random.default_rng(seed + idx * 104729)
     split = split_name(idx, num_volumes)
@@ -907,20 +1071,32 @@ def _generate_raw_sample_worker(payload: dict[str, Any]) -> str:
         rng,
         device="cpu",
         microscope_type=str(payload["microscope_type"]),
+        super_sample_xy=ss_xy,
+        super_sample_z=ss_z,
     )
     mismatch_mode = choose_psf_mismatch_mode(
         str(payload.get("psf_mismatch", "none")),
         rng,
         float(payload.get("psf_mismatch_moderate_fraction", 0.0)),
     )
+    forward_psf, aberration_meta = add_psf_aberration(psf, rng, mismatch_mode)
     deconv_psf_params = perturb_psf_params(psf_params, rng, mismatch_mode)
     deconv_psf = psf.copy() if mismatch_mode == "none" else generate_psf_from_params(deconv_psf_params, device="cpu")
-    blurred = reconvolve_same(gt, psf, device="cpu")
+    blurred = reconvolve_same(gt, forward_psf, device="cpu")
+    blurred_for_camera = downsample_xy_mean(blurred, ss_xy)
     raw, noise_meta = add_microscopy_noise(
-        blurred,
+        blurred_for_camera,
         rng,
         microscope_type=str(psf_params.get("microscope_type", payload["microscope_type"])),
+        artifact_level=str(payload.get("synthetic_artifact_level", "standard")),
     )
+    raw_observed = raw
+    raw_for_deconv = upsample_xy_torch(raw_observed, ss_xy)
+    noise_meta["raw_observed_shape"] = [int(v) for v in raw_observed.shape]
+    noise_meta["raw_deconvolution_shape"] = [int(v) for v in raw_for_deconv.shape]
+    noise_meta["raw_deconvolution_dtype"] = "float32" if ss_xy > 1 or ss_z > 1 else "uint16"
+    noise_meta["super_sample_xy"] = int(ss_xy)
+    noise_meta["super_sample_z"] = int(ss_z)
     metadata = {
         "index": idx,
         "split": split,
@@ -929,12 +1105,19 @@ def _generate_raw_sample_worker(payload: dict[str, Any]) -> str:
         "forward_psf_params": psf_params,
         "deconv_psf_params": deconv_psf_params,
         "psf_mismatch_mode": mismatch_mode,
+        "psf_aberration": aberration_meta,
         "noise": noise_meta,
+        "camera_volume_shape": [int(v) for v in camera_shape],
+        "training_volume_shape": [int(v) for v in shape],
+        "super_sample_xy": int(ss_xy),
+        "super_sample_z": int(ss_z),
         "synthetic_morphology": morphology,
         "raw_generation_seed": seed + idx * 104729,
     }
-    save_raw_sample(sample_dir, gt, raw, deconv_psf, metadata)
-    tifffile.imwrite(sample_dir / "forward_psf.tif", psf.astype(np.float32))
+    save_raw_sample(sample_dir, gt, raw_for_deconv, deconv_psf, metadata)
+    if ss_xy > 1 or ss_z > 1:
+        tifffile.imwrite(sample_dir / "raw_observed.tif", raw_observed.astype(np.uint16))
+    tifffile.imwrite(sample_dir / "forward_psf.tif", forward_psf.astype(np.float32))
     tifffile.imwrite(sample_dir / "deconv_psf.tif", deconv_psf.astype(np.float32))
     return str(sample_dir)
 
@@ -950,11 +1133,15 @@ def generate_training_data(config: TrainConfig, run_dir: Path, progress: Optiona
             "volume_shape": list(config.volume_shape),
             "seed": config.seed,
             "synthetic_complexity": config.synthetic_complexity,
+            "synthetic_artifact_level": config.synthetic_artifact_level,
+            "super_sample_xy": int(config.super_sample_xy),
+            "super_sample_z": int(config.super_sample_z),
             "synthetic_morphology": config.synthetic_morphology,
             "microscope_type": config.microscope_type,
             "psf_mismatch": config.psf_mismatch,
             "psf_mismatch_moderate_fraction": config.psf_mismatch_moderate_fraction,
             "rl_iteration_pool": list(effective_rl_iteration_pool(config)),
+            "rl_iteration_weights": list(parse_float_pool(config.rl_iteration_weights)),
         }
         for idx in range(config.num_volumes)
     ]
@@ -1013,6 +1200,7 @@ def generate_training_data(config: TrainConfig, run_dir: Path, progress: Optiona
         update_sample_metadata(sample_dir, {
             "rl_requested_iterations": int(selected_iterations),
             "rl_iteration_pool": list(effective_rl_iteration_pool(config)),
+            "rl_iteration_weights": list(parse_float_pool(config.rl_iteration_weights)),
             "rl_iterations_used": rl_out.get("iterations_used"),
             "rl_convergence": rl_out.get("convergence", []),
         })
@@ -1025,11 +1213,21 @@ def generate_training_data(config: TrainConfig, run_dir: Path, progress: Optiona
         "num_volumes": config.num_volumes,
         "volume_shape": list(config.volume_shape),
         "synthetic_complexity": config.synthetic_complexity,
+        "synthetic_artifact_level": config.synthetic_artifact_level,
+        "super_sample_xy": int(config.super_sample_xy),
+        "super_sample_z": int(config.super_sample_z),
+        "camera_volume_shape": list(config.volume_shape),
+        "training_volume_shape": [
+            int(config.volume_shape[0]) * max(int(config.super_sample_z), 1),
+            int(config.volume_shape[1]) * max(int(config.super_sample_xy), 1),
+            int(config.volume_shape[2]) * max(int(config.super_sample_xy), 1),
+        ],
         "synthetic_morphology": config.synthetic_morphology,
         "microscope_type": config.microscope_type,
         "psf_mismatch": config.psf_mismatch,
         "psf_mismatch_moderate_fraction": float(config.psf_mismatch_moderate_fraction),
         "rl_iteration_pool": list(effective_rl_iteration_pool(config)),
+        "rl_iteration_weights": list(parse_float_pool(config.rl_iteration_weights)),
         "rl_iteration_counts": {
             str(iteration): sum(1 for sample_dir in sample_dirs if read_sample_metadata(sample_dir).get("rl_requested_iterations") == iteration)
             for iteration in effective_rl_iteration_pool(config)
@@ -1045,6 +1243,8 @@ def generate_training_data(config: TrainConfig, run_dir: Path, progress: Optiona
         },
         "notes": [
             "Synthetic structures include spots, blobs, filaments, rings/vesicles, sheets, DAPI-like nuclei/chromatin, spindle/actin-like fibers, membranes/cytoplasm, diffuse background, Poisson noise, read noise, hot pixels, and optional clipping.",
+            "Strong artifact training adds PSF coma/astigmatism-like mismatch, uneven illumination, haze, row/column banding, read-noise outliers, stronger hot pixels, and mild clipping so DL learns real post-RL failure modes.",
+            "XY supersampling generates clean GT and PSFs on a finer grid, forms the camera raw image by downsampling the blurred high-resolution volume, then upsamples the noisy camera raw before high-resolution ci_rl preprocessing.",
             "Filament-like structures are generated as curved 3-D soft tubes rather than straight 2-D line segments.",
             "Synthetic morphology modes include DNA/chromatin, mitotic, membrane, actin, dendrite/branching neurites, puncta, and generic mixed organelle-like structures.",
             "GT files store normalized object density; training rescales GT by the stored synthetic signal_scale so residual targets are in the same photon/count domain as ci_rl.",
@@ -1174,6 +1374,30 @@ def negative_residual_guard_loss(
     allowed_negative = max(float(max_fraction), 0.0) * ci
     excess_negative = torch.relu(-pred - allowed_negative)
     return torch.mean(excess_negative * signal_mask)
+
+
+def intensity_retention_loss(
+    pred: torch.Tensor,
+    ci_plane: torch.Tensor,
+    gt_plane: torch.Tensor,
+    *,
+    min_ratio: float = 0.90,
+    max_ratio: float = 1.15,
+) -> torch.Tensor:
+    """Limit strong DL corrections from removing or adding too much foreground signal."""
+    ci = ci_plane.clamp(min=0)
+    gt = gt_plane.clamp(min=0)
+    signal = torch.maximum(ci.detach(), gt.detach())
+    threshold = torch.quantile(signal.flatten(start_dim=1), 0.50, dim=1).view(-1, 1, 1, 1)
+    mask = (signal > threshold).to(ci.dtype)
+    final = (ci + pred).clamp(min=0)
+    eps = torch.as_tensor(1e-6, dtype=ci.dtype, device=ci.device)
+    ci_sum = torch.sum(ci * mask, dim=(1, 2, 3)) + eps
+    final_sum = torch.sum(final * mask, dim=(1, 2, 3))
+    ratio = final_sum / ci_sum
+    low = torch.relu(float(min_ratio) - ratio)
+    high = torch.relu(ratio - float(max_ratio))
+    return torch.mean(low * low + high * high)
 
 
 def central_plane_reconvolution_loss(
@@ -1361,6 +1585,9 @@ def checkpoint_metadata(
             "microscope_type": config.microscope_type,
             "synthetic_complexity": config.synthetic_complexity,
             "synthetic_morphology": config.synthetic_morphology,
+            "synthetic_artifact_level": config.synthetic_artifact_level,
+            "super_sample_xy": int(config.super_sample_xy),
+            "super_sample_z": int(config.super_sample_z),
         },
         "best_epoch": best,
     }
@@ -1480,6 +1707,14 @@ def train(
                         batch["ci"].to(device, non_blocking=pin_memory),
                         batch["gt"].to(device, non_blocking=pin_memory),
                         max_fraction=config.max_negative_residual_fraction,
+                    )
+                if config.intensity_retention_weight > 0:
+                    loss = loss + config.intensity_retention_weight * intensity_retention_loss(
+                        pred,
+                        batch["ci"].to(device, non_blocking=pin_memory),
+                        batch["gt"].to(device, non_blocking=pin_memory),
+                        min_ratio=config.intensity_retention_min,
+                        max_ratio=config.intensity_retention_max,
                     )
                 if config.reconvolution_weight > 0:
                     final_plane = (batch["ci"].to(device, non_blocking=pin_memory) + pred).clamp(min=0)
@@ -1627,34 +1862,42 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
             patch_size=args.patch_size if args.patch_size != 64 else 128,
             z_context=args.z_context,
             batch_size=args.batch_size,
-            epochs=args.epochs if args.epochs != 2 else 20,
+            epochs=args.epochs if args.epochs != 2 else 50,
             steps=args.steps,
             learning_rate=args.learning_rate,
             output_dir=Path(args.output_dir),
             device=args.device,
             mixed_precision=args.mixed_precision,
             seed=args.seed,
-            base_channels=args.base_channels if args.base_channels != 16 else 24,
+            base_channels=args.base_channels if args.base_channels != 16 else 48,
             residual_scale=args.residual_scale,
-            rl_iterations=args.rl_iterations if args.rl_iterations != 8 else 20,
-            rl_iteration_pool=parse_int_pool(args.rl_iteration_pool) or (15, 25, 35, 50, 80),
-            reconvolution_weight=args.reconvolution_weight,
+            rl_iterations=args.rl_iterations if args.rl_iterations != 8 else 50,
+            rl_iteration_pool=parse_int_pool(args.rl_iteration_pool) or (50, 80, 100),
+            rl_iteration_weights=parse_float_pool(args.rl_iteration_weights) or (0.35, 0.40, 0.25),
+            reconvolution_weight=args.reconvolution_weight if args.reconvolution_weight != 0.0 else 0.02,
+            gradient_weight=args.gradient_weight if args.gradient_weight != 0.05 else 0.08,
             train_samples_per_epoch=args.train_samples_per_epoch,
             val_samples=args.val_samples,
             synthetic_complexity="full",
+            synthetic_artifact_level=args.synthetic_artifact_level if args.synthetic_artifact_level != "standard" else "strong",
             synthetic_morphology=args.synthetic_morphology,
             microscope_type=args.microscope_type,
             psf_mismatch=args.psf_mismatch if args.psf_mismatch != "none" else "mild",
-            psf_mismatch_moderate_fraction=args.psf_mismatch_moderate_fraction if args.psf_mismatch_moderate_fraction != 0.0 else 0.2,
+            psf_mismatch_moderate_fraction=args.psf_mismatch_moderate_fraction if args.psf_mismatch_moderate_fraction != 0.0 else 0.5,
             model_type=args.model_type,
             use_conditioning=args.use_conditioning,
-            residual_bound_fraction=args.residual_bound_fraction,
-            residual_bound_scale=args.residual_bound_scale,
+            residual_bound_fraction=args.residual_bound_fraction if args.residual_bound_fraction != 0.35 else 0.75,
+            residual_bound_scale=args.residual_bound_scale if args.residual_bound_scale != 0.05 else 0.10,
             num_workers=args.num_workers,
             data_loader_workers=args.data_loader_workers,
             volume_cache_size=args.volume_cache_size,
-            negative_residual_weight=args.negative_residual_weight,
-            max_negative_residual_fraction=args.max_negative_residual_fraction,
+            negative_residual_weight=args.negative_residual_weight if args.negative_residual_weight != 0.05 else 0.01,
+            max_negative_residual_fraction=args.max_negative_residual_fraction if args.max_negative_residual_fraction != 0.25 else 0.50,
+            intensity_retention_weight=args.intensity_retention_weight if args.intensity_retention_weight != 0.0 else 0.05,
+            intensity_retention_min=args.intensity_retention_min,
+            intensity_retention_max=args.intensity_retention_max,
+            super_sample_xy=args.super_sample_xy,
+            super_sample_z=args.super_sample_z,
         )
     if args.quick_test:
         return TrainConfig(
@@ -1674,11 +1917,14 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
             residual_scale=args.residual_scale,
             rl_iterations=2,
             rl_iteration_pool=(2,),
+            rl_iteration_weights=(),
             quick_test=True,
             train_samples_per_epoch=4,
             val_samples=2,
             reconvolution_weight=args.reconvolution_weight,
+            gradient_weight=args.gradient_weight,
             synthetic_complexity=args.synthetic_complexity,
+            synthetic_artifact_level="standard",
             microscope_type=args.microscope_type,
             synthetic_morphology=args.synthetic_morphology,
             psf_mismatch="none",
@@ -1691,6 +1937,11 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
             volume_cache_size=2,
             negative_residual_weight=args.negative_residual_weight,
             max_negative_residual_fraction=args.max_negative_residual_fraction,
+            intensity_retention_weight=args.intensity_retention_weight,
+            intensity_retention_min=args.intensity_retention_min,
+            intensity_retention_max=args.intensity_retention_max,
+            super_sample_xy=1,
+            super_sample_z=1,
         )
     return TrainConfig(
         num_volumes=args.num_volumes,
@@ -1709,10 +1960,13 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         residual_scale=args.residual_scale,
         rl_iterations=args.rl_iterations,
         rl_iteration_pool=parse_int_pool(args.rl_iteration_pool),
+        rl_iteration_weights=parse_float_pool(args.rl_iteration_weights),
         reconvolution_weight=args.reconvolution_weight,
+        gradient_weight=args.gradient_weight,
         train_samples_per_epoch=args.train_samples_per_epoch,
         val_samples=args.val_samples,
         synthetic_complexity=args.synthetic_complexity,
+        synthetic_artifact_level=args.synthetic_artifact_level,
         synthetic_morphology=args.synthetic_morphology,
         microscope_type=args.microscope_type,
         psf_mismatch=args.psf_mismatch,
@@ -1726,6 +1980,11 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         volume_cache_size=args.volume_cache_size,
         negative_residual_weight=args.negative_residual_weight,
         max_negative_residual_fraction=args.max_negative_residual_fraction,
+        intensity_retention_weight=args.intensity_retention_weight,
+        intensity_retention_min=args.intensity_retention_min,
+        intensity_retention_max=args.intensity_retention_max,
+        super_sample_xy=args.super_sample_xy,
+        super_sample_z=args.super_sample_z,
     )
 
 
@@ -1749,12 +2008,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--residual-scale", type=float, default=1.0, help="Fixed multiplier applied to the U-Net residual output; 1.0 preserves the current behavior")
     parser.add_argument("--rl-iterations", type=int, default=8)
     parser.add_argument("--rl-iteration-pool", type=str, default="", help="Comma-separated RL iterations sampled per synthetic volume, e.g. 15,25,35,50,80")
+    parser.add_argument("--rl-iteration-weights", type=str, default="", help="Optional comma-separated sampling weights matching --rl-iteration-pool, e.g. 0.35,0.40,0.25")
     parser.add_argument("--reconvolution-weight", type=float, default=0.0)
+    parser.add_argument("--gradient-weight", type=float, default=0.05)
     parser.add_argument("--negative-residual-weight", type=float, default=0.05, help="Penalty weight for excessive negative DL residuals in signal regions")
     parser.add_argument("--max-negative-residual-fraction", type=float, default=0.25, help="Allowed negative residual as a fraction of normalized ci_rl signal before penalty")
+    parser.add_argument("--intensity-retention-weight", type=float, default=0.0, help="Penalty weight for foreground intensity changes outside the configured ratio range")
+    parser.add_argument("--intensity-retention-min", type=float, default=0.90)
+    parser.add_argument("--intensity-retention-max", type=float, default=1.15)
     parser.add_argument("--train-samples-per-epoch", type=int, default=256)
     parser.add_argument("--val-samples", type=int, default=64)
     parser.add_argument("--synthetic-complexity", choices=["standard", "full"], default="standard")
+    parser.add_argument("--synthetic-artifact-level", choices=["standard", "strong"], default="standard")
+    parser.add_argument("--super-sample-xy", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--super-sample-z", type=int, choices=[1], default=1)
     parser.add_argument("--synthetic-morphology", choices=list(SYNTHETIC_MORPHOLOGIES), default="mixed")
     parser.add_argument("--microscope-type", choices=["widefield", "confocal", "mixed"], default="widefield")
     parser.add_argument("--psf-mismatch", choices=["none", "mild", "moderate"], default="none")

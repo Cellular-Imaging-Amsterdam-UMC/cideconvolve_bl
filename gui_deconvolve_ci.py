@@ -2573,6 +2573,7 @@ class _IterationMovieRecorder:
         self.memmaps: dict[int, np.memmap] = {}
         self.estimated_memmaps: dict[int, np.memmap] = {}
         self.iter_counts: dict[int, int] = {}
+        self.frame_labels: dict[tuple[int, int], str] = {}
         self.frame_levels: dict[tuple[int, int], tuple[float, float, float]] = {}
         self.frame_convergence: dict[tuple[int, int], Optional[float]] = {}
         self.frame_background: dict[tuple[int, int], float] = {}
@@ -2589,19 +2590,20 @@ class _IterationMovieRecorder:
             self.initial_planes[ch_idx] = initial_plane.astype(np.float32, copy=False)
             self.initial_levels[ch_idx] = self._levels_for(ch_idx, self.initial_planes[ch_idx], "original", initial)
             niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
+            staged_frames = max(int(niter), 1) + (1 if self.method == "ci_rl_dl" else 0)
             stage_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}.dat"
             self.memmaps[ch_idx] = np.memmap(
                 stage_path,
                 dtype=np.float32,
                 mode="w+",
-                shape=(max(int(niter), 1), initial_plane.shape[0], initial_plane.shape[1]),
+                shape=(staged_frames, initial_plane.shape[0], initial_plane.shape[1]),
             )
             estimated_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}_estimated.dat"
             self.estimated_memmaps[ch_idx] = np.memmap(
                 estimated_path,
                 dtype=np.float32,
                 mode="w+",
-                shape=(max(int(niter), 1), initial_plane.shape[0], initial_plane.shape[1]),
+                shape=(staged_frames, initial_plane.shape[0], initial_plane.shape[1]),
             )
             self.iter_counts[ch_idx] = 0
 
@@ -2659,8 +2661,14 @@ class _IterationMovieRecorder:
         convergence = payload.get("convergence")
         if convergence is not None:
             self.frame_convergence[(ch_idx, iteration - 1)] = float(convergence)
+        label = str(payload.get("stage_label") or "").strip()
+        if label:
+            self.frame_labels[(ch_idx, iteration - 1)] = label
         if iteration == 1 or iteration % 10 == 0 or bool(payload.get("is_final", False)):
-            self.progress_cb(f"  Movie staged Ch{ch_idx + 1} iteration {iteration}")
+            if label:
+                self.progress_cb(f"  Movie staged Ch{ch_idx + 1} {label}")
+            else:
+                self.progress_cb(f"  Movie staged Ch{ch_idx + 1} iteration {iteration}")
 
     def _latest_convergence_for_channel(self, ch_idx: int, frame_idx: int) -> Optional[float]:
         count = self.iter_counts.get(ch_idx, 0)
@@ -2689,6 +2697,19 @@ class _IterationMovieRecorder:
         return series
 
     def _bottom_lines_for(self, frame_idx: int, frame_count: int, channels: list[np.ndarray]) -> list[str]:
+        labels = [
+            self.frame_labels.get((ch_idx, frame_idx))
+            for ch_idx in self.active_channels
+            if self.frame_labels.get((ch_idx, frame_idx))
+        ] if frame_idx >= 0 else []
+        if labels:
+            label = labels[0]
+            if self.show_info_metrics:
+                return [
+                    f"{self.method}  {label}  frame {frame_idx + 1}/{frame_count}",
+                    _movie_metrics_line(channels),
+                ]
+            return [f"{self.method}  {label}"]
         if not self.show_info_metrics:
             return []
         if frame_idx < 0:
@@ -2829,7 +2850,11 @@ class _IterationMovieRecorder:
                 reference_rgb,
                 self.difference_inset,
             )
-        if self.title_text or self.show_info_metrics:
+        has_stage_label = frame_idx >= 0 and any(
+            self.frame_labels.get((ch_idx, frame_idx))
+            for ch_idx in self.active_channels
+        )
+        if self.title_text or self.show_info_metrics or has_stage_label:
             rgb = _movie_overlay_rgb(
                 rgb,
                 title=self.title_text,
@@ -2890,6 +2915,41 @@ class _IterationMovieRecorder:
                     if movie_frame_idx % 25 == 0 or movie_frame_idx == total_frames:
                         self.progress_cb(f"  Movie encoded frame {movie_frame_idx}/{total_frames}")
         self.progress_cb(f"Movie saved: {output}")
+
+    def encode_downsized_gif(self, *, scale: float = 0.5) -> Optional[Path]:
+        try:
+            import imageio.v2 as imageio
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "GIF export requires imageio and Pillow. Install the GUI requirements again."
+            ) from exc
+
+        output = Path(self.output_path)
+        if not output.exists():
+            return None
+        gif_path = output.with_suffix(".gif")
+        self.progress_cb(f"Creating half-size GIF from MP4: {gif_path}")
+        reader = imageio.get_reader(str(output))
+        meta = reader.get_meta_data() or {}
+        fps = float(meta.get("fps") or self.fps or 10)
+        duration = 1.0 / max(fps, 1e-6)
+        frame_idx = 0
+        try:
+            with imageio.get_writer(str(gif_path), mode="I", duration=duration, loop=0) as writer:
+                for frame in reader:
+                    frame_idx += 1
+                    rgb = np.asarray(frame[:, :, :3], dtype=np.uint8)
+                    h, w = rgb.shape[:2]
+                    new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+                    resized = Image.fromarray(rgb).resize(new_size, Image.Resampling.LANCZOS)
+                    writer.append_data(np.asarray(resized, dtype=np.uint8))
+                    if frame_idx % 25 == 0:
+                        self.progress_cb(f"  GIF converted frame {frame_idx}")
+        finally:
+            reader.close()
+        self.progress_cb(f"GIF saved: {gif_path}")
+        return gif_path
 
     def close(self, *, remove_output: bool = False) -> None:
         if self._closed:
@@ -2972,6 +3032,8 @@ def _deconvolve_channel_stacks(
             f"Movie export enabled: {movie_recorder.output_path} "
             f"({movie_recorder.projection}, {movie_recorder.fps} fps)"
         )
+        if movie_params.get("create_gif"):
+            _progress("Movie GIF export enabled: half-size animated GIF will be created after MP4")
 
     try:
         for ci, channel_zyx in enumerate(channels_zyx):
@@ -3131,6 +3193,20 @@ def _deconvolve_channel_stacks(
                     },
                     return_diagnostics=True,
                 )
+                if movie_recorder is not None and params.get("dl_model_path"):
+                    dl_frame_idx = int(niter) + 1
+                    movie_payload: dict[str, Any] = {
+                        "channel_index": int(ci),
+                        "iteration": dl_frame_idx,
+                        "total_iterations": dl_frame_idx,
+                        "image": out["result"],
+                        "stage_label": "DL refinement",
+                        "is_final": True,
+                    }
+                    if out.get("reconvolved_prediction") is not None:
+                        movie_payload["estimated"] = out["reconvolved_prediction"]
+                        movie_payload["background"] = 0.0
+                    movie_recorder.capture(movie_payload)
             else:
                 out = ci_rl_deconvolve(
                     ch_data,
@@ -3167,6 +3243,8 @@ def _deconvolve_channel_stacks(
             if _stopped():
                 raise RuntimeError("Stopped by user")
             movie_recorder.encode()
+            if movie_params.get("create_gif"):
+                movie_recorder.encode_downsized_gif(scale=0.5)
     except Exception:
         if movie_recorder is not None:
             movie_recorder.close(remove_output=True)
@@ -3273,6 +3351,7 @@ class _DeconvolveWorker(QThread):
             if movie_params.get("enabled"):
                 self.progress.emit(
                     f"  Movie       : {movie_params.get('path')} at {movie_params.get('fps', 10)} fps"
+                    f"{' + GIF' if movie_params.get('create_gif') else ''}"
                 )
 
             monitor = _RunMetricsMonitor()
@@ -3890,6 +3969,11 @@ class DeconvolveCIWindow(QMainWindow):
         self._cb_movie_hold.setChecked(False)
         self._cb_movie_hold.setToolTip("Hold the original and final frames for one second each.")
         movie_layout.addRow("Hold endpoints:", self._cb_movie_hold)
+
+        self._cb_movie_gif = QCheckBox()
+        self._cb_movie_gif.setChecked(False)
+        self._cb_movie_gif.setToolTip("After the MP4 is written, also create a half-size animated GIF next to it.")
+        movie_layout.addRow("Also GIF 1/2 size:", self._cb_movie_gif)
 
         self._movie_layout_combo = NoWheelComboBox()
         self._movie_layout_combo.addItems(["Standard", "Split-screen", "Standard + split-screen"])
@@ -4871,6 +4955,7 @@ class DeconvolveCIWindow(QMainWindow):
                 "path": self._le_movie_path.text().strip(),
                 "fps": self._sp_movie_fps.value(),
                 "hold_endpoints": self._cb_movie_hold.isChecked(),
+                "create_gif": self._cb_movie_gif.isChecked(),
                 "layout_mode": self._movie_layout_combo.currentText(),
                 "difference_inset": self._movie_inset_combo.currentText(),
                 "title_text": self._le_movie_title.text().strip(),
@@ -5290,6 +5375,7 @@ class DeconvolveCIWindow(QMainWindow):
             "movie_path": self._le_movie_path.text() if self._movie_available else "",
             "movie_fps": self._sp_movie_fps.value() if self._movie_available else 10,
             "movie_hold_endpoints": self._cb_movie_hold.isChecked() if self._movie_available else False,
+            "movie_create_gif": self._cb_movie_gif.isChecked() if self._movie_available else False,
             "movie_layout_mode": self._movie_layout_combo.currentText() if self._movie_available else "Standard",
             "movie_difference_inset": self._movie_inset_combo.currentText() if self._movie_available else "None",
             "movie_title_text": self._le_movie_title.text() if self._movie_available else "",
@@ -5423,6 +5509,8 @@ class DeconvolveCIWindow(QMainWindow):
             _spin(self._sp_movie_fps, "movie_fps")
             if data.get("movie_hold_endpoints") is not None:
                 self._cb_movie_hold.setChecked(bool(data["movie_hold_endpoints"]))
+            if data.get("movie_create_gif") is not None:
+                self._cb_movie_gif.setChecked(bool(data["movie_create_gif"]))
             _combo(self._movie_layout_combo, "movie_layout_mode")
             _combo(self._movie_inset_combo, "movie_difference_inset")
             _line(self._le_movie_title, "movie_title_text")
