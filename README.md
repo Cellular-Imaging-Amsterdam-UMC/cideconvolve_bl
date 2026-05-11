@@ -207,6 +207,25 @@ For GUI and OMERO features:
 pip install -r requirements_gui.txt
 ```
 
+The **Open OMERO…** button requires `omero-browser-qt`, which depends on **ZeroC ICE**.  ZeroC ICE is not on PyPI and must be installed from a pre-built wheel matching your Python version and platform before running `pip install -r requirements_gui.txt`.
+
+**Option 1 — conda (recommended):**
+
+```bash
+conda install -c conda-forge zeroc-ice
+pip install -r requirements_gui.txt
+```
+
+**Option 2 — pre-built wheel:** Download from the [zeroc-ice releases](https://github.com/zeroc-ice/ice/releases) or the [zeroc-ice PyPI mirror](https://zeroc.com/downloads/ice).  For the supported environment (Python 3.11, Windows x86-64):
+
+```bash
+# Example — adjust the filename to the exact release
+pip install zeroc_ice-3.7.10-cp311-cp311-win_amd64.whl
+pip install -r requirements_gui.txt
+```
+
+> **Note:** When using a wheel, use the `cp311` build — the `cp312` wheel is not compatible with Python 3.11.  If ZeroC ICE is not installed, all GUI features work normally except the OMERO browser.
+
 ### Basic usage
 
 ```bash
