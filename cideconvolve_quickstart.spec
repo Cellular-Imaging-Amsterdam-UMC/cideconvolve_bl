@@ -68,6 +68,13 @@ bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_n
 # ── Collect imagecodecs (TIFF/OME-TIFF codec extensions required by tifffile) ─
 imc_datas, imc_binaries, imc_hiddenimports = collect_all('imagecodecs')
 
+# ── Collect imageio + imageio-ffmpeg (movie / MP4 export) ────────────────────
+imgio_datas,  imgio_binaries,  imgio_hiddenimports  = collect_all('imageio')
+imgff_datas,  imgff_binaries,  imgff_hiddenimports  = collect_all('imageio_ffmpeg')
+
+# ── Collect matplotlib (colormaps + PSF fit chart) ───────────────────────────
+mpl_datas, mpl_binaries, mpl_hiddenimports = collect_all('matplotlib')
+
 # ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
@@ -86,6 +93,8 @@ a = Analysis(
         + xsdata_binaries + xspb_binaries
         + pyd_binaries + pyde_binaries + dask_binaries
         + imc_binaries
+        + imgio_binaries + imgff_binaries
+        + mpl_binaries
         + bioio_binaries + bioio_b_binaries
         + bioio_ot_binaries + bioio_oz_binaries
         + bioio_cz_binaries + bioio_nd_binaries
@@ -98,6 +107,8 @@ a = Analysis(
       + ome_datas + omero_datas + obqt_datas
       + xsdata_datas + xspb_datas
       + pyd_datas + pyde_datas + dask_datas
+      + imgio_datas + imgff_datas
+      + mpl_datas
       + imc_datas
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
@@ -106,6 +117,7 @@ a = Analysis(
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
         'deconvolve_ci',
+        'deconvolve_ci_dl',
         'deconvolve',
         'wrapper',
         # ── numeric / array ─────────────────────────────────────────────────
@@ -196,6 +208,8 @@ a = Analysis(
       + xsdata_hiddenimports + xspb_hiddenimports
       + pyd_hiddenimports + pyde_hiddenimports + dask_hiddenimports
       + imc_hiddenimports
+      + imgio_hiddenimports + imgff_hiddenimports
+      + mpl_hiddenimports
       + bioio_hiddenimports + bioio_b_hiddenimports
       + bioio_ot_hiddenimports + bioio_oz_hiddenimports
       + bioio_cz_hiddenimports + bioio_nd_hiddenimports,
@@ -205,7 +219,7 @@ a = Analysis(
     excludes=[
         'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets',
         'tkinter', '_tkinter',
-        'scipy', 'sklearn', 'IPython', 'matplotlib',
+        'scipy', 'sklearn', 'IPython',
         'pytest',
         'notebook', 'nbformat', 'jupyter',
         'zmq', 'jedi', 'parso',

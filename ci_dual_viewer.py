@@ -875,6 +875,20 @@ class _HistogramWidget(QWidget):
         return axis_min + pct * (axis_max - axis_min)
 
 
+class _ChannelButton(QPushButton):
+    """Channel toggle button that opens a colour picker on double-click."""
+
+    colorPickRequested = pyqtSignal(int)   # emits the channel index
+
+    def __init__(self, label: str, channel_index: int, parent=None):
+        super().__init__(label, parent)
+        self._channel_index = channel_index
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        self.colorPickRequested.emit(self._channel_index)
+        # Don't call super() — suppress the toggle that a double-click would cause.
+
+
 class _AdvancedScalingWindow(QWidget):
     closed = pyqtSignal()
     channelVisibilityChanged = pyqtSignal(int, bool)
@@ -2026,10 +2040,11 @@ class DualViewerWidget(QWidget):
         self._channel_buttons.clear()
         for i, channel in enumerate(channels):
             name = channel.get("name", f"Ch {i}")
-            btn = QPushButton(name)
+            btn = _ChannelButton(name, i)
             btn.setCheckable(True)
             btn.setChecked(bool(channel.get("active", True)))
             btn.toggled.connect(lambda checked, idx=i: self._on_channel_button_toggled(idx, checked))
+            btn.colorPickRequested.connect(self._on_channel_button_color_pick)
             self._channel_bar.insertWidget(self._channel_bar.count() - 1, btn)
             self._channel_buttons.append(btn)
             self._apply_channel_button_style(i)
@@ -2048,6 +2063,16 @@ class DualViewerWidget(QWidget):
         if window is not None:
             window.set_channel_visibility(index, checked)
         self._refresh_view()
+
+    def _on_channel_button_color_pick(self, index: int) -> None:
+        """Open a colour dialog to change the channel colour (double-click on the button)."""
+        if index < 0 or index >= len(self._channel_colors):
+            return
+        current = QColor(*self._channel_colors[index])
+        color = QColorDialog.getColor(current, self, "Select channel colour")
+        if not color.isValid():
+            return
+        self._on_advanced_channel_color_changed(index, (color.red(), color.green(), color.blue()))
 
     def _set_channel_button_checked(self, index: int, checked: bool) -> None:
         if index < 0 or index >= len(self._channel_buttons):

@@ -1842,13 +1842,65 @@ class _LogDialog(QDialog):
     """Detached live log window."""
 
     metricsToggled = pyqtSignal(bool)
+    chartsToggled = pyqtSignal(bool)
+
+    # Default chart height when no image has been seen yet (assumes square image).
+    _DEFAULT_PANEL_H = 230
+    # Width used for convergence and sharpness charts
+    _CHART_W = 260
+    # max_image_w passed to _render_residual_pixmap — determines residual image pixel width
+    _RESID_IMAGE_W = 230
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
+        self._convergence_series: list[Optional[float]] = []
+        self._convergence_total: int = 0
+        self._sharpness_series: list[Optional[float]] = []
+        # Per-channel offset so multi-channel runs don't overwrite each other's data
+        self._channel_offset: int = 0
+        self._last_channel_index: int = -1
+        # Chart height — updated after push_final_residual reveals the true aspect ratio
+        self._panel_height: int = self._DEFAULT_PANEL_H
         self.setWindowTitle("CIDeconvolve Log")
         self.resize(900, 560)
         layout = QVBoxLayout(self)
+
+        # --- Live chart panel (sits above the log text) ---
+        self._chart_panel = QWidget()
+        chart_row = QHBoxLayout(self._chart_panel)
+        chart_row.setContentsMargins(4, 4, 4, 4)
+        chart_row.setSpacing(8)
+
+        self._conv_label = QLabel("Waiting for data\u2026")
+        self._conv_label.setFixedSize(self._CHART_W, self._DEFAULT_PANEL_H)
+        self._conv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._conv_label.setStyleSheet(
+            "background: #16161E; color: #888; border-radius: 4px; font-size: 9px;"
+        )
+
+        self._resid_label = QLabel("|raw \u2212 est| (final frame)")
+        # Width = image area + colorbar; height = default (square assumption)
+        _resid_default_w = self._RESID_IMAGE_W + 5 + 12 + 38   # gap+bar+labels
+        self._resid_label.setFixedSize(_resid_default_w, self._DEFAULT_PANEL_H)
+        self._resid_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._resid_label.setStyleSheet(
+            "background: #16161E; color: #888; border-radius: 4px; font-size: 9px;"
+        )
+
+        self._sharp_label = QLabel("Waiting for data\u2026")
+        self._sharp_label.setFixedSize(self._CHART_W, self._DEFAULT_PANEL_H)
+        self._sharp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sharp_label.setStyleSheet(
+            "background: #16161E; color: #888; border-radius: 4px; font-size: 9px;"
+        )
+
+        chart_row.addWidget(self._conv_label)
+        chart_row.addWidget(self._resid_label)
+        chart_row.addWidget(self._sharp_label)
+        chart_row.addStretch()
+        self._chart_panel.setVisible(False)
+        layout.addWidget(self._chart_panel)
 
         self._text = QPlainTextEdit()
         self._text.setReadOnly(True)
@@ -1870,14 +1922,163 @@ class _LogDialog(QDialog):
         )
         self._metrics_check.toggled.connect(self.metricsToggled.emit)
         buttons.addWidget(self._metrics_check)
+
+        self._charts_check = QCheckBox("Live charts")
+        self._charts_check.setToolTip(
+            "Show live convergence graph and final residual image above the log text.\n"
+            "Updates during deconvolution; residual only rendered at the end."
+        )
+        self._charts_check.toggled.connect(self._on_charts_toggled)
+        self._charts_check.toggled.connect(self.chartsToggled.emit)
+        buttons.addWidget(self._charts_check)
+
+        self._conv_log_check = QCheckBox("Log scale")
+        self._conv_log_check.setToolTip(
+            "Display the convergence chart Y-axis on a logarithmic scale."
+        )
+        buttons.addWidget(self._conv_log_check)
+
         buttons.addStretch()
-        self._save_button = QPushButton("Save…")
+        self._save_button = QPushButton("Save\u2026")
         self._save_button.clicked.connect(self._save_log)
         buttons.addWidget(self._save_button)
         self._close_button = QPushButton("Close")
         self._close_button.clicked.connect(self.close)
         buttons.addWidget(self._close_button)
         layout.addLayout(buttons)
+
+    def _on_charts_toggled(self, enabled: bool) -> None:
+        self._chart_panel.setVisible(bool(enabled))
+
+    def is_charts_enabled(self) -> bool:
+        return self._charts_check.isChecked()
+
+    def set_charts_enabled(self, enabled: bool) -> None:
+        self._charts_check.setChecked(bool(enabled))
+
+    def set_conv_log_scale(self, enabled: bool) -> None:
+        self._conv_log_check.setChecked(bool(enabled))
+
+    def push_iteration(self, payload: dict) -> None:
+        """Update the live convergence and sharpness charts from an iteration callback payload."""
+        if not self._charts_check.isChecked():
+            return
+        iteration = int(payload.get("iteration", 1))
+        total = int(payload.get("total_iterations", iteration))
+        channel_index = int(payload.get("channel_index", 0))
+
+        # When the channel changes, start fresh so each channel's curve
+        # is shown on its own scale (no dips from channel-to-channel jumps).
+        if channel_index != self._last_channel_index:
+            self._convergence_series = []
+            self._convergence_total = 0
+            self._sharpness_series = []
+            self._channel_offset = 0
+            self._last_channel_index = channel_index
+
+        abs_idx = iteration - 1
+        abs_total = total
+
+        # For ci_sparse_hessian, prefer the raw data-fidelity loss (Poisson NLL,
+        # analogous to I-div) over the combined normalised objective.
+        convergence = payload.get("data_loss") if "data_loss" in payload else payload.get("convergence")
+        while len(self._convergence_series) <= abs_idx:
+            self._convergence_series.append(None)
+        if convergence is not None:
+            try:
+                v = float(convergence)
+                if np.isfinite(v):
+                    self._convergence_series[abs_idx] = v
+            except (TypeError, ValueError):
+                pass
+        self._convergence_total = max(self._convergence_total, abs_total)
+        h = self._panel_height
+        try:
+            pix = _render_convergence_chart_pixmap(
+                self._convergence_series, self._convergence_total,
+                self._conv_log_check.isChecked(),
+                width=self._CHART_W, height=h,
+            )
+            self._conv_label.setFixedSize(self._CHART_W, h)
+            self._conv_label.setPixmap(pix)
+            self._conv_label.setText("")
+        except Exception:
+            pass
+        # Per-iteration sharpness trend
+        image_arr = payload.get("image")
+        if image_arr is not None:
+            sharpness = _compute_sharpness(image_arr)
+            if sharpness is not None:
+                while len(self._sharpness_series) <= abs_idx:
+                    self._sharpness_series.append(None)
+                self._sharpness_series[abs_idx] = sharpness
+                try:
+                    spix = _render_sharpness_chart_pixmap(
+                        self._sharpness_series, self._convergence_total,
+                        width=self._CHART_W, height=h,
+                    )
+                    self._sharp_label.setFixedSize(self._CHART_W, h)
+                    self._sharp_label.setPixmap(spix)
+                    self._sharp_label.setText("")
+                except Exception:
+                    pass
+
+    def push_final_residual(self, raw_plane: np.ndarray, est_plane: np.ndarray) -> None:
+        """Render and display the |raw − est| residual for the final frame."""
+        if not self._charts_check.isChecked():
+            return
+        try:
+            pix, pw, ph = _render_residual_pixmap(
+                raw_plane, est_plane, max_image_w=self._RESID_IMAGE_W
+            )
+            self._panel_height = ph
+            self._resid_label.setFixedSize(pw, ph)
+            self._resid_label.setPixmap(pix)
+            self._resid_label.setText("")
+            # Resize the other two charts to match the heatmap height
+            if self._convergence_series:
+                try:
+                    p2 = _render_convergence_chart_pixmap(
+                        self._convergence_series, self._convergence_total,
+                        self._conv_log_check.isChecked(),
+                        width=self._CHART_W, height=ph,
+                    )
+                    self._conv_label.setFixedSize(self._CHART_W, ph)
+                    self._conv_label.setPixmap(p2)
+                except Exception:
+                    pass
+            if self._sharpness_series:
+                try:
+                    p3 = _render_sharpness_chart_pixmap(
+                        self._sharpness_series, self._convergence_total,
+                        width=self._CHART_W, height=ph,
+                    )
+                    self._sharp_label.setFixedSize(self._CHART_W, ph)
+                    self._sharp_label.setPixmap(p3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def clear_charts(self) -> None:
+        """Reset chart state for a new deconvolution run."""
+        self._convergence_series = []
+        self._convergence_total = 0
+        self._sharpness_series = []
+        self._channel_offset = 0
+        self._last_channel_index = -1
+        self._panel_height = self._DEFAULT_PANEL_H
+        h = self._DEFAULT_PANEL_H
+        _resid_default_w = self._RESID_IMAGE_W + 5 + 12 + 38
+        self._conv_label.setFixedSize(self._CHART_W, h)
+        self._conv_label.setPixmap(QPixmap())
+        self._conv_label.setText("Waiting for data\u2026")
+        self._resid_label.setFixedSize(_resid_default_w, h)
+        self._resid_label.setPixmap(QPixmap())
+        self._resid_label.setText("|raw \u2212 est| (final frame)")
+        self._sharp_label.setFixedSize(self._CHART_W, h)
+        self._sharp_label.setPixmap(QPixmap())
+        self._sharp_label.setText("Waiting for data\u2026")
 
     def set_text(self, text: str) -> None:
         self._text.setPlainText(text)
@@ -2452,8 +2653,21 @@ def _movie_raw_estimated_ratio_inset_rgb(
     observed_plane: np.ndarray,
     estimated_plane: np.ndarray,
     background: float,
+    mode: str = "ratio",
 ) -> np.ndarray:
+    """Overlay a mini-panel comparing raw vs PSF*deconvolved using a glow colormap.
+
+    Both modes render the *magnitude* of the mismatch with the 'inferno' glow
+    colormap (black = perfect match / zero error, bright = large error).  A
+    colorbar strip on the right shows the absolute scale so the panel naturally
+    fades toward black as the algorithm converges.
+
+    mode="ratio"      — |log2(observed/estimated)|, auto-normalised per frame.
+    mode="difference" — |observed − estimated| / p99(raw).  Fixed scale so
+                        brightness genuinely decreases toward zero at convergence.
+    """
     from PIL import Image, ImageDraw
+    import matplotlib
 
     observed = np.asarray(observed_plane, dtype=np.float32)
     estimated = np.asarray(estimated_plane, dtype=np.float32)
@@ -2465,53 +2679,120 @@ def _movie_raw_estimated_ratio_inset_rgb(
     bg = max(float(background), 0.0)
     observed_signal = np.clip(observed - bg, 0.0, None)
     estimated_signal = np.clip(estimated - bg, 0.0, None)
-    signal = np.maximum(observed_signal, estimated_signal)
-    finite_signal = signal[np.isfinite(signal)]
-    if finite_signal.size:
-        signal_floor = max(float(np.percentile(finite_signal, 35.0)), 1e-6)
-        eps = max(float(np.percentile(finite_signal, 99.0)) * 0.01, 1e-6)
-    else:
-        signal_floor = 1e-6
-        eps = 1e-6
-    signal_mask = signal > signal_floor
-    ratio_log2 = np.log2((observed_signal + eps) / (estimated_signal + eps))
-    finite_ratio = ratio_log2[signal_mask & np.isfinite(ratio_log2)]
-    if finite_ratio.size:
-        center = float(np.median(finite_ratio))
-        spread = max(float(np.percentile(np.abs(finite_ratio - center), 98.0)), 1e-6)
-    else:
-        center = 0.0
-        spread = 1.0
-    norm = np.clip((ratio_log2 - center) / spread, -1.0, 1.0)
-    norm[~signal_mask] = 0.0
+    # Base signal mask and scale exclusively on the *observed* (raw) signal so
+    # that border artefacts produced by the DL model (high estimated values
+    # outside the real sample) do not inflate the normalisation scale.
+    obs_finite = observed_signal[np.isfinite(observed_signal)]
+    signal_floor = max(float(np.percentile(obs_finite, 35.0)), 1e-6) if obs_finite.size else 1e-6
+    signal_mask = observed_signal > signal_floor
 
-    inset_rgb = np.zeros((*observed.shape, 3), dtype=np.uint8)
-    pos = np.clip(norm, 0.0, 1.0)
-    neg = np.clip(-norm, 0.0, 1.0)
-    inset_rgb[..., 0] = np.clip(pos * 255.0, 0, 255).astype(np.uint8)
-    inset_rgb[..., 1] = np.clip(neg * 180.0, 0, 255).astype(np.uint8)
-    inset_rgb[..., 2] = np.clip(neg * 255.0, 0, 255).astype(np.uint8)
+    cmap = matplotlib.colormaps["inferno"]
+
+    if mode == "difference":
+        raw_scale = max(float(np.percentile(obs_finite, 99.0)), 1e-6) if obs_finite.size else 1.0
+        abs_diff = np.abs(observed_signal - estimated_signal)
+        mag = np.clip(abs_diff / raw_scale, 0.0, 1.0)
+        mag[~signal_mask] = 0.0
+        label = "Raw \u2212 est  (abs)"
+        cbar_top_str = f"{raw_scale:.0f}"
+        cbar_mid_str = f"{raw_scale / 2.0:.0f}"
+    else:
+        eps = max(float(np.percentile(obs_finite, 99.0)) * 0.01, 1e-6) if obs_finite.size else 1e-6
+        ratio_log2 = np.log2((observed_signal + eps) / (estimated_signal + eps))
+        finite_ratio = ratio_log2[signal_mask & np.isfinite(ratio_log2)]
+        if finite_ratio.size:
+            spread = max(float(np.percentile(np.abs(finite_ratio), 98.0)), 1e-6)
+        else:
+            spread = 1.0
+        mag = np.clip(np.abs(ratio_log2) / spread, 0.0, 1.0)
+        mag[~signal_mask] = 0.0
+        label = "Raw / est  (log2)"
+        cbar_top_str = f"{spread:.2f}"
+        cbar_mid_str = f"{spread / 2.0:.2f}"
+
+    # Apply inferno glow: black=0 (no error), yellow/white=1 (max error)
+    rgba_mapped = cmap(mag)  # (H, W, 4) float 0–1
+    inset_rgb = (rgba_mapped[..., :3] * 255.0).astype(np.uint8)
+    inset_rgb[~signal_mask] = 0
 
     base = Image.fromarray(rgb, mode="RGB").convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     width, height = base.size
     pad = max(8, min(width, height) // 80)
-    inset_w = min(max(220, width // 5), width - 2 * pad)
+
+    font = _movie_font(max(11, min(width, height) // 62), bold=False)
+    font_small = _movie_font(max(9, min(width, height) // 75), bold=False)
+    font_sz = max(9, min(width, height) // 75)
+
+    cbar_w = max(12, pad + 4)
+    cbar_gap = max(3, pad // 3)
+    cbar_label_w = max(40, pad * 5)
+
+    inset_w = min(
+        max(180, width // 5),
+        max(60, width - 2 * pad - cbar_gap - cbar_w - cbar_label_w),
+    )
     inset_h = max(80, int(inset_w * observed.shape[0] / max(observed.shape[1], 1)))
     inset_h = min(inset_h, max(80, height // 5))
-    x0 = width - inset_w - pad
+
+    total_w = inset_w + cbar_gap + cbar_w + cbar_label_w
+    x0 = width - total_w - pad
     y0 = pad
-    inset = Image.fromarray(inset_rgb, mode="RGB").resize((inset_w, inset_h), Image.Resampling.BILINEAR)
+    label_row_h = max(16, font_sz + 6)
+
+    # Dark background rectangle covering inset + colorbar + labels
     draw.rounded_rectangle(
-        (x0 - pad // 2, y0 - pad // 2, x0 + inset_w + pad // 2, y0 + inset_h + pad * 2),
+        (x0 - pad // 2, y0 - pad // 2,
+         x0 + total_w + pad // 2, y0 + inset_h + label_row_h + pad),
         radius=max(4, pad // 2),
         fill=(0, 0, 0, 155),
     )
+
+    # Inset glow image
+    inset = Image.fromarray(inset_rgb, mode="RGB").resize((inset_w, inset_h), Image.Resampling.BILINEAR)
     overlay.alpha_composite(inset.convert("RGBA"), (x0, y0))
-    font = _movie_font(max(11, min(width, height) // 62), bold=False)
-    draw.text((x0, y0 + inset_h + max(2, pad // 4)), "Raw / estimated", font=font, fill=(255, 255, 255, 220))
-    return np.ascontiguousarray(np.asarray(Image.alpha_composite(base, overlay).convert("RGB"), dtype=np.uint8))
+
+    # Colorbar gradient strip: top = max (bright), bottom = 0 (black)
+    cbar_x = x0 + inset_w + cbar_gap
+    cbar_vals = np.linspace(1.0, 0.0, inset_h).reshape(-1, 1)
+    cbar_rgba = cmap(cbar_vals)
+    cbar_strip = (cbar_rgba[..., :3] * 255.0).astype(np.uint8)
+    cbar_strip = np.repeat(cbar_strip, cbar_w, axis=1)
+    overlay.alpha_composite(
+        Image.fromarray(cbar_strip, mode="RGB").convert("RGBA"),
+        (cbar_x, y0),
+    )
+
+    # Colorbar border
+    draw.rectangle(
+        (cbar_x, y0, cbar_x + cbar_w - 1, y0 + inset_h - 1),
+        outline=(200, 200, 200, 180),
+        width=1,
+    )
+
+    # Tick marks and labels: top, mid, bottom
+    txt_x = cbar_x + cbar_w + max(2, pad // 4)
+    tick_col = (220, 220, 220, 200)
+    lbl_col = (255, 240, 200, 220)
+    # Top tick
+    draw.line([(cbar_x - 3, y0 + 1), (cbar_x, y0 + 1)], fill=tick_col, width=1)
+    draw.text((txt_x, y0), cbar_top_str, font=font_small, fill=lbl_col)
+    # Mid tick
+    mid_y = y0 + inset_h // 2
+    draw.line([(cbar_x - 3, mid_y), (cbar_x, mid_y)], fill=tick_col, width=1)
+    draw.text((txt_x, mid_y - font_sz // 2), cbar_mid_str, font=font_small, fill=(220, 220, 200, 200))
+    # Bottom tick
+    bot_y = y0 + inset_h - 1
+    draw.line([(cbar_x - 3, bot_y), (cbar_x, bot_y)], fill=tick_col, width=1)
+    draw.text((txt_x, bot_y - font_sz), "0", font=font_small, fill=lbl_col)
+
+    # Label below inset
+    draw.text((x0, y0 + inset_h + max(2, pad // 4)), label, font=font, fill=(255, 255, 255, 220))
+
+    return np.ascontiguousarray(
+        np.asarray(Image.alpha_composite(base, overlay).convert("RGB"), dtype=np.uint8)
+    )
 
 
 def _movie_metrics_line(channels: list[np.ndarray]) -> str:
@@ -2523,6 +2804,239 @@ def _movie_metrics_line(channels: list[np.ndarray]) -> str:
         f"sparse={metrics['signal_sparsity_mean']:.3f}  "
         f"range={metrics['robust_range_mean']:.3f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Live log-panel chart renderers (standalone QPixmap helpers)
+# ---------------------------------------------------------------------------
+
+def _render_convergence_chart_pixmap(
+    series: list[Optional[float]],
+    total_points: int,
+    log_scale: bool,
+    width: int = 260,
+    height: int = 130,
+) -> QPixmap:
+    """Render a convergence line chart as a QPixmap for the live log panel."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (width, height), (22, 22, 28))
+    draw = ImageDraw.Draw(img)
+    pad = max(6, min(width, height) // 20)
+    font = _movie_font(max(7, min(width, height) // 20), bold=False)
+
+    values = [float(v) for v in series if v is not None and np.isfinite(float(v))]
+    # Log scale only makes sense for strictly positive values; fall back to
+    # linear when any value is ≤ 0 (e.g. negative Poisson NLL from sparse hessian).
+    use_log = log_scale and bool(values) and all(v > 0 for v in values)
+    label = "log convergence" if use_log else "convergence"
+    draw.text((pad, pad // 2), label, font=font, fill=(170, 170, 185))
+
+    if not values:
+        draw.text((pad, height // 2 - 6), "Waiting for data\u2026", font=font, fill=(110, 110, 130))
+    else:
+        plotted = [np.log10(v) for v in values] if use_log else values
+        px0, py0 = pad, pad + 18
+        px1, py1 = width - pad, height - pad
+        draw.line([(px0, py1), (px1, py1)], fill=(70, 70, 90), width=1)
+        draw.line([(px0, py0), (px0, py1)], fill=(70, 70, 90), width=1)
+        vmin, vmax_v = min(plotted), max(plotted)
+        if vmax_v <= vmin:
+            vmax_v = vmin + 1.0
+        denom_x = max(int(total_points or len(series)) - 1, 1)
+        points: list[tuple[float, float]] = []
+        for idx, sv in enumerate(series):
+            if sv is None or not np.isfinite(float(sv)):
+                continue
+            pv = np.log10(float(sv)) if use_log else float(sv)
+            norm = (pv - vmin) / (vmax_v - vmin)
+            px = px0 + (px1 - px0) * (idx / denom_x)
+            py = py1 - (py1 - py0) * norm
+            points.append((px, py))
+        if len(points) >= 2:
+            draw.line(points, fill=(117, 211, 255), width=max(2, pad // 3), joint="curve")
+        if points:
+            r = max(3, pad // 3)
+            lx, ly = points[-1]
+            draw.ellipse((lx - r, ly - r, lx + r, ly + r), fill=(255, 255, 255))
+        latest = f"{values[-1]:.3g}"
+        lw, _ = _movie_text_size(draw, latest, font)
+        draw.text((px1 - lw, pad // 2), latest, font=font, fill=(255, 255, 200))
+
+    raw = img.tobytes("raw", "RGB")
+    qimg = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+def _render_residual_pixmap(
+    raw_plane: np.ndarray,
+    est_plane: np.ndarray,
+    max_image_w: int = 230,
+) -> tuple["QPixmap", int, int]:
+    """Render |raw − est| as an inferno-coloured QPixmap with a colorbar.
+
+    Height is derived from the actual image aspect ratio so the heatmap
+    matches the data geometry.  Returns ``(pixmap, total_width, total_height)``.
+    """
+    from PIL import Image, ImageDraw
+
+    diff = np.abs(
+        np.asarray(raw_plane, dtype=np.float32) - np.asarray(est_plane, dtype=np.float32)
+    )
+    finite = diff[np.isfinite(diff)]
+    vmax = float(np.percentile(finite, 99.5)) if finite.size else 1.0
+    if vmax <= 0:
+        vmax = 1.0
+    norm = np.clip(diff / vmax, 0.0, 1.0)
+
+    try:
+        import matplotlib as _mpl
+        _cmap = _mpl.colormaps["inferno"]
+        rgba = _cmap(norm)
+        rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+        _use_mpl = True
+    except Exception:
+        _use_mpl = False
+        r = np.clip(norm * 220 + norm ** 2 * 35, 0, 255).astype(np.uint8)
+        g = np.clip(norm ** 2 * 110, 0, 255).astype(np.uint8)
+        b = np.clip(norm * 200 * (1.0 - norm * 0.5), 0, 255).astype(np.uint8)
+        rgb = np.stack([r, g, b], axis=-1)
+
+    # Preserve image aspect ratio
+    h_img, w_img = diff.shape[:2]
+    aspect = w_img / max(h_img, 1)
+    content_h = int(round(max_image_w / aspect))
+    content_h = max(60, min(content_h, 280))
+
+    # Colorbar layout: gap | bar | gap | labels
+    CBAR_GAP = 5
+    CBAR_W   = 12
+    LABEL_W  = 38
+    total_w  = max_image_w + CBAR_GAP + CBAR_W + LABEL_W
+    total_h  = content_h
+
+    content_img = Image.fromarray(rgb, "RGB").resize(
+        (max_image_w, content_h), Image.Resampling.BILINEAR
+    )
+    canvas = Image.new("RGB", (total_w, total_h), (22, 22, 28))
+    canvas.paste(content_img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    font_sm = _movie_font(max(6, content_h // 23), bold=False)
+
+    # Draw colorbar gradient strip
+    bar_x0 = max_image_w + CBAR_GAP
+    bar_x1 = bar_x0 + CBAR_W
+    for row in range(total_h):
+        t = 1.0 - row / max(total_h - 1, 1)   # 1 → vmax (top), 0 → 0 (bottom)
+        if _use_mpl:
+            cr, cg, cb, _ = _cmap(t)
+            cr, cg, cb = int(cr * 255), int(cg * 255), int(cb * 255)
+        else:
+            cr = int(min(t * 220 + t ** 2 * 35, 255))
+            cg = int(min(t ** 2 * 110, 255))
+            cb = int(min(t * 200 * (1.0 - t * 0.5), 255))
+        draw.line([(bar_x0, row), (bar_x1, row)], fill=(cr, cg, cb))
+    draw.rectangle([bar_x0, 0, bar_x1 - 1, total_h - 1], outline=(80, 80, 95))
+
+    # Scale labels
+    def _fmt_val(v: float) -> str:
+        if v == 0.0:
+            return "0"
+        if abs(v) >= 1e4 or abs(v) < 0.01:
+            return f"{v:.1e}"
+        if abs(v) >= 100:
+            return f"{v:.0f}"
+        return f"{v:.2g}"
+
+    label_x = bar_x1 + 2
+    _, lh = _movie_text_size(draw, "0", font_sm)
+    draw.text((label_x, 0),                            _fmt_val(vmax),       font=font_sm, fill=(220, 220, 200))
+    draw.text((label_x, total_h // 2 - lh // 2),      _fmt_val(vmax * 0.5), font=font_sm, fill=(180, 180, 165))
+    draw.text((label_x, max(total_h - lh - 1, 0)),    "0",                  font=font_sm, fill=(130, 130, 115))
+
+    # Title overlay
+    draw.text((3, 1), "|raw\u2212est|", font=font_sm, fill=(200, 200, 200))
+
+    raw_bytes = canvas.tobytes("raw", "RGB")
+    qimg = QImage(raw_bytes, total_w, total_h, total_w * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg), total_w, total_h
+
+
+def _compute_sharpness(image_arr: np.ndarray) -> Optional[float]:
+    """Return the Laplacian-variance of the central Z-plane — a lightweight sharpness proxy.
+
+    Downsamples to ≤ 512 px per axis before computing so the overhead per
+    iteration is well under 5 ms even on large 3-D stacks.
+    """
+    arr = np.asarray(image_arr, dtype=np.float32)
+    if arr.ndim == 4:
+        arr = arr[0]                       # CZYX → ZYX
+    if arr.ndim == 3:
+        plane = arr[arr.shape[0] // 2]
+    elif arr.ndim == 2:
+        plane = arr
+    else:
+        return None
+    if plane.shape[0] > 512 or plane.shape[1] > 512:
+        plane = plane[::2, ::2]            # 2× downsample
+    # Discrete 5-point Laplacian
+    lap = (
+        plane[:-2, 1:-1] + plane[2:, 1:-1]
+        + plane[1:-1, :-2] + plane[1:-1, 2:]
+        - 4.0 * plane[1:-1, 1:-1]
+    )
+    return float(np.var(lap))
+
+
+def _render_sharpness_chart_pixmap(
+    series: list[Optional[float]],
+    total_points: int,
+    width: int = 260,
+    height: int = 130,
+) -> QPixmap:
+    """Render a per-iteration Laplacian-variance sharpness trend as a QPixmap."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (width, height), (22, 22, 28))
+    draw = ImageDraw.Draw(img)
+    pad = max(6, min(width, height) // 20)
+    font = _movie_font(max(7, min(width, height) // 20), bold=False)
+    draw.text((pad, pad // 2), "sharpness (Laplacian var)", font=font, fill=(155, 220, 155))
+
+    values = [float(v) for v in series if v is not None and np.isfinite(float(v))]
+    if not values:
+        draw.text((pad, height // 2 - 6), "Waiting for data\u2026", font=font, fill=(100, 140, 100))
+    else:
+        px0, py0 = pad, pad + 18
+        px1, py1 = width - pad, height - pad
+        draw.line([(px0, py1), (px1, py1)], fill=(70, 70, 90), width=1)
+        draw.line([(px0, py0), (px0, py1)], fill=(70, 70, 90), width=1)
+        vmin, vmax_v = min(values), max(values)
+        if vmax_v <= vmin:
+            vmax_v = vmin + 1.0
+        denom_x = max(int(total_points or len(series)) - 1, 1)
+        points: list[tuple[float, float]] = []
+        for idx, sv in enumerate(series):
+            if sv is None or not np.isfinite(float(sv)):
+                continue
+            norm = (float(sv) - vmin) / (vmax_v - vmin)
+            px = px0 + (px1 - px0) * (idx / denom_x)
+            py = py1 - (py1 - py0) * norm
+            points.append((px, py))
+        if len(points) >= 2:
+            draw.line(points, fill=(100, 220, 130), width=max(2, pad // 3), joint="curve")
+        if points:
+            r = max(3, pad // 3)
+            lx, ly = points[-1]
+            draw.ellipse((lx - r, ly - r, lx + r, ly + r), fill=(255, 255, 255))
+        latest = f"{values[-1]:.3g}"
+        lw, _ = _movie_text_size(draw, latest, font)
+        draw.text((px1 - lw, pad // 2), latest, font=font, fill=(200, 255, 200))
+
+    raw = img.tobytes("raw", "RGB")
+    qimg = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
 
 
 class _IterationMovieRecorder:
@@ -2837,18 +3351,36 @@ class _IterationMovieRecorder:
             ratio_payload = self._raw_estimated_ratio_payload(frame_idx)
             if ratio_payload is not None:
                 observed_plane, estimated_plane, background = ratio_payload
+                inset_mode = "difference" if "\u2212" in self.difference_inset or "raw -" in self.difference_inset.lower() else "ratio"
                 rgb = _movie_raw_estimated_ratio_inset_rgb(
                     rgb,
                     observed_plane,
                     estimated_plane,
                     background,
+                    mode=inset_mode,
                 )
         if reference_rgb is not None and frame_idx >= 0:
+            # For the DL refinement frame with a "vs final" inset, compare against
+            # the last RL iteration (frame_idx - 1) instead of the DL result itself
+            # (which would produce an all-black difference).
+            is_dl_frame = (
+                "final" in self.difference_inset.lower()
+                and frame_idx > 0
+                and any(
+                    "dl" in (self.frame_labels.get((ch_idx, frame_idx)) or "").lower()
+                    for ch_idx in self.active_channels
+                )
+            )
+            eff_reference = (
+                self._standard_rgb_for_frame(frame_idx - 1)[0]
+                if is_dl_frame
+                else reference_rgb
+            )
             rgb = _movie_difference_inset_rgb(
                 rgb,
                 current_rgb,
-                reference_rgb,
-                self.difference_inset,
+                eff_reference,
+                self.difference_inset if not is_dl_frame else self.difference_inset.replace("vs final", "DL vs last RL"),
             )
         has_stage_label = frame_idx >= 0 and any(
             self.frame_labels.get((ch_idx, frame_idx))
@@ -2916,7 +3448,19 @@ class _IterationMovieRecorder:
                         self.progress_cb(f"  Movie encoded frame {movie_frame_idx}/{total_frames}")
         self.progress_cb(f"Movie saved: {output}")
 
-    def encode_downsized_gif(self, *, scale: float = 0.5) -> Optional[Path]:
+    def encode_downsized_gif(self, *, scale: float = 0.5, colors: int = 128) -> Optional[Path]:
+        """Convert the recorded MP4 to an optimised animated GIF.
+
+        Parameters
+        ----------
+        scale:
+            Spatial scale factor applied to each frame (default 0.5 = half size).
+        colors:
+            Palette size for colour quantisation (2–256).  Fewer colours compress
+            better; 128 is a good balance for microscopy images.  The palette is
+            derived from the first frame and reused for all subsequent frames so
+            that LZW can exploit inter-frame similarity.
+        """
         try:
             import imageio.v2 as imageio
             from PIL import Image
@@ -2933,21 +3477,41 @@ class _IterationMovieRecorder:
         reader = imageio.get_reader(str(output))
         meta = reader.get_meta_data() or {}
         fps = float(meta.get("fps") or self.fps or 10)
-        duration = 1.0 / max(fps, 1e-6)
+        # GIF duration is in milliseconds per frame
+        duration_ms = int(round(1000.0 / max(fps, 1e-6)))
+        frames: list = []
+        palette_image: Optional[Image.Image] = None
         frame_idx = 0
         try:
-            with imageio.get_writer(str(gif_path), mode="I", duration=duration, loop=0) as writer:
-                for frame in reader:
-                    frame_idx += 1
-                    rgb = np.asarray(frame[:, :, :3], dtype=np.uint8)
-                    h, w = rgb.shape[:2]
-                    new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-                    resized = Image.fromarray(rgb).resize(new_size, Image.Resampling.LANCZOS)
-                    writer.append_data(np.asarray(resized, dtype=np.uint8))
-                    if frame_idx % 25 == 0:
-                        self.progress_cb(f"  GIF converted frame {frame_idx}")
+            for frame in reader:
+                frame_idx += 1
+                rgb = np.asarray(frame[:, :, :3], dtype=np.uint8)
+                h, w = rgb.shape[:2]
+                new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+                resized = Image.fromarray(rgb).resize(new_size, Image.Resampling.LANCZOS)
+                if palette_image is None:
+                    # Derive palette from first frame; reuse for all frames so
+                    # the LZW stream can compress repeated colour indices well.
+                    palette_image = resized.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=0)
+                    frames.append(palette_image)
+                else:
+                    frames.append(resized.quantize(palette=palette_image, dither=0))
+                if frame_idx % 25 == 0:
+                    self.progress_cb(f"  GIF converted frame {frame_idx}")
         finally:
             reader.close()
+
+        if not frames:
+            return None
+
+        frames[0].save(
+            str(gif_path),
+            save_all=True,
+            append_images=frames[1:],
+            loop=0,
+            duration=duration_ms,
+            optimize=True,
+        )
         self.progress_cb(f"GIF saved: {gif_path}")
         return gif_path
 
@@ -3034,6 +3598,19 @@ def _deconvolve_channel_stacks(
         )
         if movie_params.get("create_gif"):
             _progress("Movie GIF export enabled: half-size animated GIF will be created after MP4")
+
+        # Check whether the image will be tiled — movie is incompatible with tiling.
+        # Do this early so the user gets a clear error before any computation starts.
+        if channels_zyx:
+            from deconvolve_ci import _auto_n_tiles
+            _sample = _channel_stack_to_solver_input(channels_zyx[0])
+            _n_tiles_check = _auto_n_tiles(_sample.shape, device=params.get("device"), psf_xy_est=65)
+            if _n_tiles_check > 1:
+                raise RuntimeError(
+                    f"Movie export is not supported for large images that require tiling "
+                    f"(image is {_sample.shape[1]}×{_sample.shape[2]} px and would be split into "
+                    f"{_n_tiles_check} tiles). Please uncheck 'Record movie' and try again."
+                )
 
     try:
         for ci, channel_zyx in enumerate(channels_zyx):
@@ -3144,6 +3721,20 @@ def _deconvolve_channel_stacks(
                 f"(image={ch_data.shape}, psf={psf.shape}, {niter} iter)…"
             )
             t_deconv = time.time()
+            _live_cb = params.get("live_callback")
+
+            def _make_iter_cb(
+                _movie_rec=movie_recorder, _live=_live_cb
+            ):
+                if _movie_rec is None and _live is None:
+                    return None
+                def _cb(payload: dict) -> None:
+                    if _movie_rec is not None:
+                        _movie_rec.capture(payload)
+                    if _live is not None:
+                        _live(payload)
+                return _cb
+
             common = dict(
                 niter=niter,
                 offset=params["offset"],
@@ -3156,11 +3747,9 @@ def _deconvolve_channel_stacks(
                 pixel_size_xy=params["pixel_size_xy_nm"],
                 pixel_size_z=psf_pixel_size_z_nm if use_2d_wf_auto else params["pixel_size_z_nm"],
                 device=params["device"],
-                iteration_callback=movie_recorder.capture if movie_recorder is not None else None,
+                iteration_callback=_make_iter_cb(),
                 channel_index=ci,
             )
-            if movie_recorder is not None:
-                common["tiling"] = "none"
             if params["method"] == "ci_sparse_hessian":
                 out = ci_sparse_hessian_deconvolve(
                     ch_data,
@@ -3193,7 +3782,7 @@ def _deconvolve_channel_stacks(
                     },
                     return_diagnostics=True,
                 )
-                if movie_recorder is not None and params.get("dl_model_path"):
+                if (movie_recorder is not None or _live_cb is not None) and params.get("dl_model_path"):
                     dl_frame_idx = int(niter) + 1
                     movie_payload: dict[str, Any] = {
                         "channel_index": int(ci),
@@ -3206,7 +3795,10 @@ def _deconvolve_channel_stacks(
                     if out.get("reconvolved_prediction") is not None:
                         movie_payload["estimated"] = out["reconvolved_prediction"]
                         movie_payload["background"] = 0.0
-                    movie_recorder.capture(movie_payload)
+                    if movie_recorder is not None:
+                        movie_recorder.capture(movie_payload)
+                    if _live_cb is not None:
+                        _live_cb(movie_payload)
             else:
                 out = ci_rl_deconvolve(
                     ch_data,
@@ -3284,6 +3876,7 @@ class _DeconvolveWorker(QThread):
 
     finished = pyqtSignal(object)
     progress = pyqtSignal(str)
+    liveUpdate = pyqtSignal(dict)
 
     def __init__(
         self,
@@ -3354,6 +3947,10 @@ class _DeconvolveWorker(QThread):
                     f"{' + GIF' if movie_params.get('create_gif') else ''}"
                 )
 
+            # Expose live iteration payloads to the main thread via signal.
+            # The signal connection (queued by default across threads) ensures
+            # the chart update runs on the main thread without any extra locking.
+            self.params["live_callback"] = self.liveUpdate.emit
             monitor = _RunMetricsMonitor()
             monitor.start()
             results = _deconvolve_channel_stacks(
@@ -3392,6 +3989,243 @@ class _DeconvolveWorker(QThread):
                     pass
             traceback.print_exc()
             self.finished.emit(exc)
+
+
+class _FitPsfWorker(QThread):
+    """Search for best PSF parameters via short RL trials."""
+
+    # (trial_idx, total_trials, trial_params, i_div)
+    progress = pyqtSignal(int, int, object, float)
+    finished = pyqtSignal(object)  # dict result or Exception
+
+    def __init__(
+        self,
+        channels: list[np.ndarray],
+        base_params: dict,
+        niter_fit: int = 40,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.channels = channels
+        self.base_params = dict(base_params)
+        self.niter_fit = int(niter_fit)
+
+    def run(self):
+        try:
+            from deconvolve_ci import ci_fit_psf_params
+
+            n_channels = len(self.channels)
+            if n_channels == 0:
+                raise ValueError("No channels provided for PSF fitting.")
+
+            em_wl_list = self.base_params.get("emission_wavelengths", [520])
+            if not isinstance(em_wl_list, (list, tuple)):
+                em_wl_list = [em_wl_list]
+            ex_wl_list = self.base_params.get("excitation_wavelengths", [488])
+            if not isinstance(ex_wl_list, (list, tuple)):
+                ex_wl_list = [ex_wl_list]
+            pinhole_list = self.base_params.get("pinhole_airy_units", [1.0])
+            if not isinstance(pinhole_list, (list, tuple)):
+                pinhole_list = [pinhole_list]
+            coarse_ri_grid = [1.330, 1.358, 1.385, 1.410, 1.435, 1.460, 1.480, 1.500, 1.515]
+            fine_grid_count = 9
+            fine_half_width = 0.015
+            total_trials = n_channels * (len(coarse_ri_grid) + fine_grid_count)
+            score_label = "normalized residual + normalized roughness (coarse-to-fine RI scan)"
+
+            def _merge_logs(logs_per_channel: list[list[dict]]) -> list[dict]:
+                merged_by_key: dict[tuple[float, float], dict] = {}
+                for log_entries in logs_per_channel:
+                    for entry in log_entries:
+                        params = entry.get("params", {})
+                        ph = float(params.get("pinhole_airy_units", 1.0))
+                        ri = float(params.get("ri_sample", 1.33))
+                        key = (round(ph, 6), round(ri, 6))
+                        bucket = merged_by_key.setdefault(
+                            key,
+                            {
+                                "params": {
+                                    "pinhole_airy_units": ph,
+                                    "ri_sample": ri,
+                                },
+                                "residual": [],
+                                "roughness": [],
+                                "score": [],
+                                "i_div": [],
+                            },
+                        )
+                        for metric_key in ("residual", "roughness", "score", "i_div"):
+                            if metric_key in entry:
+                                bucket[metric_key].append(float(entry[metric_key]))
+
+                merged_log = []
+                for key in sorted(merged_by_key.keys(), key=lambda item: (item[0], item[1])):
+                    bucket = merged_by_key[key]
+                    merged_entry = {"params": bucket["params"]}
+                    for metric_key in ("residual", "roughness", "score", "i_div"):
+                        values = bucket.get(metric_key, [])
+                        if values:
+                            merged_entry[metric_key] = float(np.mean(values))
+                    merged_log.append(merged_entry)
+                return merged_log
+
+            def _run_stage(
+                ri_grid: list[float],
+                *,
+                trial_offset: int,
+                emit_progress: bool = True,
+            ) -> tuple[list[list[dict]], list[float], dict, str]:
+                stage_logs: list[list[dict]] = []
+                stage_baselines: list[float] = []
+                stage_grid_info: dict = {}
+                stage_score_label = score_label
+                stage_total = len(ri_grid)
+
+                for ci, ch_data in enumerate(self.channels):
+                    if self.isInterruptionRequested():
+                        raise RuntimeError("Stopped by user")
+                    em_wl = float(em_wl_list[ci] if ci < len(em_wl_list) else em_wl_list[-1])
+                    ex_wl = float(ex_wl_list[ci] if ci < len(ex_wl_list) else ex_wl_list[-1])
+                    ph = float(pinhole_list[ci] if ci < len(pinhole_list) else pinhole_list[-1])
+
+                    ch_base = dict(self.base_params)
+                    ch_base["emission_nm"] = em_wl
+                    ch_base["excitation_nm"] = ex_wl
+                    ch_base["pinhole_airy_units"] = ph
+
+                    def _cb(idx: int, total: int, params: dict, i_div: float,
+                            ci_=ci, offset_=trial_offset, stage_len=stage_total):
+                        global_idx = offset_ + ci_ * stage_len + idx
+                        self.progress.emit(global_idx, total_trials, params, i_div)
+
+                    result = ci_fit_psf_params(
+                        ch_data,
+                        ch_base,
+                        pinhole_grid=[ph],
+                        ri_sample_grid=list(ri_grid),
+                        niter_fit=self.niter_fit,
+                        callback=_cb if emit_progress else None,
+                        should_stop=self.isInterruptionRequested,
+                    )
+                    stage_logs.append(result["search_log"])
+                    stage_baselines.append(float(result.get("baseline_i_div", float("inf"))))
+                    stage_grid_info = result["grid"]
+                    stage_score_label = result.get("score_label", stage_score_label)
+
+                return stage_logs, stage_baselines, stage_grid_info, stage_score_label
+
+            coarse_logs, _, coarse_grid_info, coarse_score_label = _run_stage(
+                coarse_ri_grid,
+                trial_offset=0,
+            )
+            coarse_merged = _merge_logs(coarse_logs)
+            if not coarse_merged:
+                raise RuntimeError("No coarse RI search results were produced.")
+
+            coarse_best = min(coarse_merged, key=lambda e: e.get("i_div", float("inf")))
+            coarse_best_ri = float(coarse_best["params"].get("ri_sample", 1.47))
+            fine_lo = max(1.330, coarse_best_ri - fine_half_width)
+            fine_hi = min(1.515, coarse_best_ri + fine_half_width)
+            fine_ri_grid = [round(float(v), 4) for v in np.linspace(fine_lo, fine_hi, fine_grid_count)]
+
+            fine_logs, _, fine_grid_info, fine_score_label = _run_stage(
+                fine_ri_grid,
+                trial_offset=n_channels * len(coarse_ri_grid),
+            )
+            fine_merged = _merge_logs(fine_logs)
+            merged_log = _merge_logs([coarse_merged, fine_merged])
+            base_score_label = fine_score_label or coarse_score_label or "normalized residual + normalized roughness"
+            score_label = f"{base_score_label} (coarse-to-fine RI scan)"
+
+            orig_ri = float(self.base_params.get("ri_sample", 1.47))
+            baseline_logs, _, _, _ = _run_stage(
+                [orig_ri],
+                trial_offset=0,
+                emit_progress=False,
+            )
+            baseline_merged = _merge_logs(baseline_logs)
+            baseline_entry = baseline_merged[0] if baseline_merged else None
+
+            def _normalize_metric(values: list[float]) -> list[float]:
+                arr = np.asarray([float(v) for v in values], dtype=np.float64)
+                finite = np.isfinite(arr)
+                if not np.any(finite):
+                    return [float("inf")] * len(values)
+                vmin = float(np.min(arr[finite]))
+                vmax = float(np.max(arr[finite]))
+                if vmax <= vmin + 1e-12:
+                    return [0.0 if is_finite else float("inf") for is_finite in finite]
+                norm = (arr - vmin) / (vmax - vmin)
+                return [float(v) if is_finite else float("inf") for v, is_finite in zip(norm, finite)]
+
+            scored_entries = [dict(entry) for entry in merged_log]
+            if baseline_entry is not None:
+                scored_entries.append(dict(baseline_entry))
+
+            residual_norm = _normalize_metric([float(entry.get("residual", float("inf"))) for entry in scored_entries])
+            roughness_norm = _normalize_metric([float(entry.get("roughness", float("inf"))) for entry in scored_entries])
+            for entry, resid_n, rough_n in zip(scored_entries, residual_norm, roughness_norm):
+                score = resid_n + rough_n if np.isfinite(resid_n) and np.isfinite(rough_n) else float("inf")
+                entry["score"] = score
+                entry["i_div"] = score
+
+            if baseline_entry is not None:
+                baseline_scored = scored_entries[-1]
+                merged_log = scored_entries[:-1]
+            else:
+                baseline_scored = None
+                merged_log = scored_entries
+
+            ri_values = sorted({float(entry["params"].get("ri_sample", 1.33)) for entry in merged_log})
+            pinhole_values = sorted({float(entry["params"].get("pinhole_airy_units", 1.0)) for entry in merged_log})
+            grid_info = {
+                "pinhole": pinhole_values or coarse_grid_info.get("pinhole", fine_grid_info.get("pinhole", [])),
+                "ri_sample": ri_values or coarse_grid_info.get("ri_sample", fine_grid_info.get("ri_sample", [])),
+            }
+
+            # Find best from merged candidates and compare to the original parameters.
+            candidate_best = min(merged_log, key=lambda e: e["i_div"])
+            if baseline_scored is not None and baseline_scored["i_div"] <= candidate_best["i_div"]:
+                best = baseline_scored
+            else:
+                best = candidate_best
+
+            baseline_i_div = float(baseline_scored["i_div"]) if baseline_scored is not None else float("inf")
+            improvement_pct = (
+                max(0.0, (baseline_i_div - best["i_div"]) / baseline_i_div * 100.0)
+                if baseline_i_div > 0 and baseline_i_div != float("inf")
+                else 0.0
+            )
+
+            self.finished.emit({
+                "best_params": best["params"],
+                "best_i_div": best["i_div"],
+                "grid_best_params": candidate_best["params"],
+                "grid_best_i_div": candidate_best["i_div"],
+                "baseline_i_div": baseline_i_div,
+                "improvement_pct": improvement_pct,
+                "search_log": merged_log,
+                "grid": grid_info,
+                "score_label": score_label,
+            })
+        except Exception as exc:
+            if "Stopped by user" not in str(exc):
+                traceback.print_exc()
+            self.finished.emit(exc)
+
+
+def _guess_fit_zp_um(channels, pixel_size_z_nm):
+    """Guess emitter depth from the active stack depth for RI fitting."""
+    px_z_nm = float(pixel_size_z_nm)
+    if px_z_nm <= 0.0:
+        return None
+    z_sizes = [int(ch.shape[0]) for ch in channels if getattr(ch, "ndim", 0) == 3 and ch.shape[0] > 1]
+    if not z_sizes:
+        return None
+    nz = min(z_sizes)
+    stack_depth_um = max(nz - 1, 0) * px_z_nm / 1000.0
+    guess_um = max(stack_depth_um * 0.5, px_z_nm / 1000.0)
+    return guess_um, nz, stack_depth_um
 
 
 class _SaveTSeriesWorker(QThread):
@@ -3490,7 +4324,7 @@ def _detect_gpu_info() -> str:
 
 
 class DeconvolveCIWindow(QMainWindow):
-    def __init__(self, *, movie_available: bool = False):
+    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
@@ -3508,12 +4342,19 @@ class DeconvolveCIWindow(QMainWindow):
         self._metadata: dict = {}
         self._worker: Optional[_DeconvolveWorker] = None
         self._save_worker: Optional[_SaveTSeriesWorker] = None
+        self._fit_psf_worker: Optional[_FitPsfWorker] = None
+        self._fit_psf_started_at: Optional[float] = None
         self._monitor: Optional[_ResourceMonitor] = None
         self._log_dialog: Optional[_LogDialog] = None
         self._log_lines: list[str] = []
         self._log_running = False
         self._compute_image_metrics = False
+        self._live_charts_enabled = False
+        self._live_log_scale = False
+        self._last_live_update_s: float = 0.0
+        self._last_final_iteration_payload: Optional[dict] = None
         self._movie_available = bool(movie_available)
+        self._fitpsf_available = bool(fitpsf_available)
         self._log_emitter = _GuiLogEmitter(self)
         self._log_handler = _QtLogHandler(self._log_emitter)
         self._log_emitter.line.connect(self._log_from_logging)
@@ -3580,7 +4421,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
-        self._le_niter = QLineEdit("50")
+        self._le_niter = QLineEdit("80")
         self._le_niter.setToolTip(
             "Iterations per channel, comma-separated.\n"
             "E.g. '50' for all channels, or '50, 80' for ch1=50, ch2=80."
@@ -3882,7 +4723,35 @@ class DeconvolveCIWindow(QMainWindow):
 
         ctrl_layout.addWidget(ri_group)
 
-        # --- Coverslip / depths ---
+        # --- Fit PSF controls ---
+        fit_psf_group = QGroupBox("Fit PSF")
+        fit_psf_layout = QFormLayout()
+        fit_psf_group.setLayout(fit_psf_layout)
+
+        self._sp_fit_niter = NoWheelSpinBox()
+        self._sp_fit_niter.setRange(5, 200)
+        self._sp_fit_niter.setValue(40)
+        self._sp_fit_niter.setToolTip(
+            "Number of RL iterations per trial.\n"
+            "More iterations give a more reliable RI-sample result but take longer.\n"
+            "Fewer than ~25 iterations may bias the result toward compact (high-RI) PSFs "
+            "because narrower PSFs converge faster in early iterations."
+        )
+        fit_psf_layout.addRow("Fit iterations:", self._sp_fit_niter)
+
+        self._btn_fit_psf = QPushButton("Fit PSF\u2026")
+        self._btn_fit_psf.setToolTip(
+            "Search for the best sample RI with a rough scan followed by a fine scan.\n"
+            "Uses only the channels currently selected in the viewer.\n\n"
+            "Note: use \u226525 iterations so that RI-sample sensitivity is accurate; "
+            "fewer iterations bias toward compact PSFs (no spherical aberration)."
+        )
+        self._btn_fit_psf.setEnabled(False)
+        self._btn_fit_psf.clicked.connect(self._on_fit_psf)
+        fit_psf_layout.addRow(self._btn_fit_psf)
+
+        ctrl_layout.addWidget(fit_psf_group)
+        fit_psf_group.setVisible(self._fitpsf_available)
         cov_group = QGroupBox("Coverslip / Depth")
         cl = QFormLayout()
         cov_group.setLayout(cl)
@@ -3991,11 +4860,16 @@ class DeconvolveCIWindow(QMainWindow):
             "Ratio vs original",
             "Ratio vs final",
             "Raw / estimated (PSF*deconv)",
+            "Raw − estimated (PSF*deconv)",
         ])
         self._movie_inset_combo.setCurrentText("None")
         self._movie_inset_combo.setToolTip(
-            "Add a small top-right panel showing current-frame change. "
-            "Raw / estimated compares background-subtracted raw data with PSF * current deconvolution."
+            "Add a small top-right panel showing the mismatch between raw and PSF*deconvolved. "
+            "Both 'Raw / estimated' and 'Raw − estimated' use an inferno glow colormap "
+            "(black = perfect match, yellow/white = large error) with a colorbar legend. "
+            "'Raw / estimated' auto-normalises the log2 ratio each frame (always high-contrast). "
+            "'Raw − estimated' uses the absolute difference fixed to p99 of the raw signal — "
+            "brightness genuinely decreases toward black as the algorithm converges."
         )
         movie_layout.addRow("Mini-panel:", self._movie_inset_combo)
 
@@ -4393,8 +5267,11 @@ class DeconvolveCIWindow(QMainWindow):
             self._log_dialog = _LogDialog(self)
             self._log_dialog.finished.connect(lambda _code: setattr(self, "_log_dialog", None))
             self._log_dialog.metricsToggled.connect(self._set_compute_image_metrics)
+            self._log_dialog.chartsToggled.connect(self._set_live_charts)
             self._log_dialog.set_text("\n".join(self._log_lines))
             self._log_dialog.set_compute_metrics(self._compute_image_metrics)
+            self._log_dialog.set_charts_enabled(self._live_charts_enabled)
+            self._log_dialog.set_conv_log_scale(self._live_log_scale)
             self._log_dialog.set_running(self._log_running)
         self._log_dialog.show()
         self._log_dialog.raise_()
@@ -4403,9 +5280,12 @@ class DeconvolveCIWindow(QMainWindow):
     def _reset_log(self, title: str) -> None:
         self._log_lines = []
         self._log_running = False
+        self._last_final_iteration_payload = None
+        self._last_live_update_s = 0.0
         if self._log_dialog is not None:
             self._log_dialog.set_running(False)
             self._log_dialog.set_text("")
+            self._log_dialog.clear_charts()
         self._log("=" * 70)
         self._log(title)
         self._log("=" * 70)
@@ -4437,6 +5317,9 @@ class DeconvolveCIWindow(QMainWindow):
     def _set_compute_image_metrics(self, enabled: bool) -> None:
         self._compute_image_metrics = bool(enabled)
         self._log(f"Image metrics: {'enabled' if self._compute_image_metrics else 'disabled'}")
+
+    def _set_live_charts(self, enabled: bool) -> None:
+        self._live_charts_enabled = bool(enabled)
 
     def _on_worker_progress(self, msg: str) -> None:
         self._status.showMessage(msg)
@@ -4540,7 +5423,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._le_excitation.setEnabled(False)
             self._pinhole_airy_saved = self._le_pinhole_airy.text()
             self._pinhole_stack.setCurrentWidget(self._le_pinhole_na)
-            self._le_niter.setText("150")
+            self._le_niter.setText("80")
         self._refresh_two_d_wf_expert_state()
 
     def _refresh_two_d_wf_expert_state(self, _text: str = ""):
@@ -4739,7 +5622,7 @@ class DeconvolveCIWindow(QMainWindow):
             if micro == "confocal":
                 self._le_niter.setText("50")
             else:
-                self._le_niter.setText("150")
+                self._le_niter.setText("80")
         self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
 
         # Per-channel wavelengths
@@ -4792,6 +5675,7 @@ class DeconvolveCIWindow(QMainWindow):
             f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
         self._btn_run.setEnabled(True)
+        self._btn_fit_psf.setEnabled(True)
         self._btn_save_series.setEnabled(self._viewer.has_time_axis())
         self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
@@ -5082,6 +5966,11 @@ class DeconvolveCIWindow(QMainWindow):
                     "  pip install \"imageio[ffmpeg]\"",
                 )
                 return
+        # Clear charts and live-update state for a fresh run
+        self._last_final_iteration_payload = None
+        self._last_live_update_s = 0.0
+        if self._log_dialog is not None:
+            self._log_dialog.clear_charts()
         self._set_log_running(True)
         self._log("")
         self._log("=" * 70)
@@ -5093,6 +5982,9 @@ class DeconvolveCIWindow(QMainWindow):
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_deconv_done)
         self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.liveUpdate.connect(self._on_live_iteration_update)
+        movie_params = params.get("movie") or {}
+        self._live_log_scale = bool(movie_params.get("convergence_log_scale", False))
         self._worker.start()
 
     def _on_deconv_done(self, result):
@@ -5127,11 +6019,347 @@ class DeconvolveCIWindow(QMainWindow):
             self._sync_preview_buttons()
             self._log("Deconvolution complete.")
             self._status.showMessage(f"Deconvolution complete for T={timepoint + 1}", 5000)
+            # Push final residual to live chart panel if enabled
+            if self._log_dialog is not None and self._log_dialog.is_charts_enabled():
+                payload = self._last_final_iteration_payload
+                if payload is not None:
+                    estimated = payload.get("estimated")
+                    ch_idx = int(payload.get("channel_index", 0))
+                    if (
+                        estimated is not None
+                        and self._input_channels
+                        and ch_idx < len(self._input_channels)
+                    ):
+                        raw_arr = np.asarray(self._input_channels[ch_idx], dtype=np.float32)
+                        est_arr = np.asarray(estimated, dtype=np.float32)
+
+                        def _central_z(arr: np.ndarray) -> np.ndarray:
+                            if arr.ndim == 2:
+                                return arr
+                            if arr.ndim == 3:
+                                return arr[arr.shape[0] // 2]
+                            if arr.ndim == 4:
+                                return arr[0, arr.shape[1] // 2]
+                            return arr.reshape(arr.shape[-2], arr.shape[-1])
+
+                        self._log_dialog.push_final_residual(
+                            _central_z(raw_arr), _central_z(est_arr)
+                        )
         except Exception as exc:
             traceback.print_exc()
             QMessageBox.critical(self, "Viewer Error", str(exc))
         finally:
             self._worker = None
+
+    # -----------------------------------------------------------------------
+    # Live chart updates from worker thread
+    # -----------------------------------------------------------------------
+
+    def _on_live_iteration_update(self, payload: dict) -> None:
+        """Throttled handler for live iteration updates; runs on the main thread."""
+        if self._log_dialog is None or not self._log_dialog.is_charts_enabled():
+            return
+        is_final = bool(payload.get("is_final", False))
+        if is_final:
+            self._last_final_iteration_payload = payload
+        now = time.monotonic()
+        if is_final or (now - self._last_live_update_s) >= 0.25:
+            self._last_live_update_s = now
+            self._log_dialog.push_iteration(payload)
+
+    # -----------------------------------------------------------------------
+    # PSF fitting
+    # -----------------------------------------------------------------------
+
+    def _on_fit_psf(self):
+        if not self._input_channels:
+            self._log("No image loaded — cannot fit PSF.")
+            return
+        if self._fit_psf_worker is not None and self._fit_psf_worker.isRunning():
+            self._fit_psf_worker.requestInterruption()
+            self._btn_fit_psf.setEnabled(False)
+            self._btn_fit_psf.setText("Stopping…")
+            self._log("PSF fit stop requested by user.")
+            self._status.showMessage("Stopping PSF fit …", 0)
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Deconvolution running",
+                "Please wait for the current deconvolution to finish before fitting PSF.",
+            )
+            return
+
+        # Determine which channels to use — RI fitting requires exactly ONE channel.
+        active_indices = self._viewer._active_channel_indices() if hasattr(self._viewer, "_active_channel_indices") else []
+        if not active_indices:
+            active_indices = list(range(len(self._input_channels)))
+        if len(active_indices) > 1:
+            QMessageBox.warning(
+                self,
+                "Select One Channel",
+                "RI fitting is performed on a single channel.\n\n"
+                "Please enable exactly one channel in the viewer, then try again.",
+            )
+            return
+        channels = [self._input_channels[i] for i in active_indices if i < len(self._input_channels)]
+        if not channels:
+            self._log("No channels available for PSF fitting.")
+            return
+
+        params = self._collect_params()
+
+        # Build per-channel emission/excitation lists for the selected channels
+        em_all = params.get("emission_wavelengths", [520]) or [520]
+        ex_all = params.get("excitation_wavelengths", [488]) or [488]
+        ph_all = params.get("pinhole_airy_units", [1.0]) or [1.0]
+        em_sel = [em_all[i] if i < len(em_all) else em_all[-1] for i in active_indices]
+        ex_sel = [ex_all[i] if i < len(ex_all) else ex_all[-1] for i in active_indices]
+        ph_sel = [ph_all[i] if i < len(ph_all) else ph_all[-1] for i in active_indices]
+
+        fit_params = dict(params)
+        fit_params["emission_wavelengths"] = em_sel
+        fit_params["excitation_wavelengths"] = ex_sel
+        fit_params["pinhole_airy_units"] = ph_sel
+
+        is_2d = channels[0].ndim == 2 if channels else False
+
+        guessed_z_p = None
+        if not is_2d and float(params.get("z_p", 0.0)) <= 0.0:
+            guessed_z_p = _guess_fit_zp_um(channels, params.get("pixel_size_z_nm", 0.0))
+            if guessed_z_p is not None:
+                guessed_z_p_um, _, _ = guessed_z_p
+                fit_params["z_p"] = guessed_z_p_um * 1000.0
+                self._sp_zp.setValue(guessed_z_p_um)
+
+        self._btn_fit_psf.setEnabled(True)
+        self._btn_fit_psf.setText("Stop Fit PSF")
+        self._btn_fit_psf.setStyleSheet(
+            "QPushButton { background-color: #e53935; color: white; "
+            "font-weight: bold; }"
+        )
+        self._btn_run.setEnabled(False)
+        self._sp_fit_niter.setEnabled(False)
+        self._fit_psf_started_at = time.time()
+        niter_fit = self._sp_fit_niter.value()
+        self._log("")
+        self._log("PSF Fitting")
+        n_ch = len(channels)
+        microscope = params.get("microscope_type", "widefield")
+        self._log(f"  Channels    : {n_ch} (indices {active_indices})")
+        self._log(f"  Microscope  : {microscope}")
+        self._log(f"  RL iters/trial: {niter_fit}")
+        self._log(f"  RI sample   : {params['ri_sample']:.4f}")
+        if microscope == "confocal":
+            self._log(f"  Pinholes    : {ph_sel} (held fixed during fitting)")
+        self._log("  RI scan     : rough full-range scan + fine local refinement")
+        # Warn if image is 2D: RI mismatch mainly affects axial PSF (spherical aberration),
+        # so the RI axis of the heatmap will be near-flat for single Z-plane data.
+        if is_2d:
+            self._log("  Note: 2D image — RI sample has minimal effect on lateral PSF (spherical aberration is axial).")
+        if guessed_z_p is not None:
+            guessed_z_p_um, nz_guess, stack_depth_um = guessed_z_p
+            self._log(
+                f"  z_p         : auto {guessed_z_p_um:.3f} um from stack depth "
+                f"({nz_guess} planes, {stack_depth_um:.3f} um total)"
+            )
+        elif not is_2d and float(params.get("z_p", 0.0)) <= 0.0:
+            self._log("  Warning: Particle depth (z_p) is 0 um, and stack depth could not be inferred for automatic RI fitting.")
+        if niter_fit < 25:
+            self._log(
+                f"  Warning: {niter_fit} iterations may be too few to discriminate RI sample — "
+                "narrow PSFs converge faster in early iterations, biasing toward RI=1.515. "
+                "Recommend \u226525 iterations."
+            )
+        self._log("  Searching\u2026")
+
+        self._fit_psf_worker = _FitPsfWorker(channels, fit_params, niter_fit=niter_fit, parent=self)
+        self._fit_psf_worker.progress.connect(self._on_fit_psf_progress)
+        self._fit_psf_worker.finished.connect(self._on_fit_psf_done)
+        self._fit_psf_worker.start()
+
+    def _on_fit_psf_progress(self, idx: int, total: int, params: dict, i_div: float):
+        if total > 0:
+            pct = int(idx * 100 / total)
+            ri = params.get("ri_sample", "?")
+            eta_text = ""
+            if self._fit_psf_started_at is not None and idx > 0:
+                elapsed = max(time.time() - self._fit_psf_started_at, 0.0)
+                seconds_per_trial = elapsed / idx
+                eta_seconds = max(total - idx, 0) * seconds_per_trial
+                eta_text = f"  ETA {_format_duration(eta_seconds)}"
+            self._status.showMessage(
+                f"Fitting PSF… {pct}%{eta_text}  (RI={ri:.4f}, residual={i_div:.5g})"
+                if isinstance(ri, float) else
+                f"Fitting PSF… {pct}%{eta_text}  residual={i_div:.5g}",
+                0,
+            )
+
+    def _on_fit_psf_done(self, result):
+        self._btn_fit_psf.setText("Fit PSF\u2026")
+        self._btn_fit_psf.setStyleSheet("")
+        self._btn_fit_psf.setEnabled(bool(self._input_channels))
+        self._btn_run.setEnabled(bool(self._input_channels))
+        self._sp_fit_niter.setEnabled(True)
+        self._fit_psf_started_at = None
+
+        if isinstance(result, Exception):
+            self._fit_psf_worker = None
+            if "Stopped by user" in str(result):
+                self._log("PSF fitting stopped by user.")
+                self._status.showMessage("PSF fitting stopped", 5000)
+                return
+            self._log(f"PSF fitting failed: {result}")
+            QMessageBox.critical(self, "PSF Fit Error", str(result))
+            self._status.showMessage("PSF fitting failed", 5000)
+            return
+
+        try:
+            best = result["best_params"]
+            grid_best = result.get("grid_best_params", best)
+            improvement = result.get("improvement_pct", 0.0)
+            score_label = result.get("score_label", "PSF fit score")
+            best_ri = float(best.get("ri_sample", 1.33))
+            grid_best_ri = float(grid_best.get("ri_sample", best_ri))
+
+            self._log("")
+            self._log(f"  Best score        : {result['best_i_div']:.5g}")
+            baseline = result.get("baseline_i_div", float("inf"))
+            self._log(f"  Baseline score    : {baseline:.5g}" if baseline != float("inf") else "  Baseline score    : (not available)")
+            self._log(f"  Score model       : {score_label}")
+
+            if improvement <= 0.0:
+                msg = (
+                    f"PSF fit: no improvement found. "
+                    f"Original parameters kept. "
+                    f"(grid best RI={grid_best_ri:.4f})"
+                )
+                self._log(msg)
+                self._status.showMessage(msg, 8000)
+            else:
+                # Apply best params to UI
+                self._sp_ri_sample.setValue(best_ri)
+                msg = (
+                    f"PSF fit complete \u2014 {improvement:.0f}% improvement "
+                    f"(RI={best_ri:.4f})"
+                )
+                self._log(msg)
+                self._status.showMessage(msg, 8000)
+
+            # Always render heatmap so user can see the full search landscape
+            self._render_psf_fit_heatmap(result)
+
+        except Exception as exc:
+            traceback.print_exc()
+            self._log(f"PSF fit result display error: {exc}")
+        finally:
+            self._fit_psf_worker = None
+
+    def _render_psf_fit_heatmap(self, result: dict):
+        """Render a PSF fitting heatmap and display it in the decon viewer pane."""
+        try:
+            import matplotlib.figure as mfig
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+            search_log = result.get("search_log", [])
+            grid = result.get("grid", {})
+            pinhole_vals = grid.get("pinhole", [])
+            ri_vals = grid.get("ri_sample", [])
+            is_confocal = len(pinhole_vals) > 1
+
+            if not search_log:
+                return
+
+            if is_confocal:
+                n_ri = len(ri_vals)
+                n_ph = len(pinhole_vals)
+                matrix = np.full((n_ri, n_ph), np.nan)
+                ph_idx = {round(v, 6): i for i, v in enumerate(pinhole_vals)}
+                ri_idx = {round(v, 6): i for i, v in enumerate(ri_vals)}
+                for entry in search_log:
+                    ph = round(float(entry["params"].get("pinhole_airy_units", -1)), 6)
+                    ri = round(float(entry["params"].get("ri_sample", -1)), 6)
+                    pi = ph_idx.get(ph)
+                    ri_i = ri_idx.get(ri)
+                    if pi is not None and ri_i is not None:
+                        matrix[ri_i, pi] = entry["i_div"]
+
+                fig = mfig.Figure(figsize=(max(5.0, n_ph * 0.8), max(3.5, n_ri * 0.8)), dpi=100)
+                FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111)
+                im = ax.imshow(
+                    matrix,
+                    aspect="auto",
+                    cmap="inferno_r",
+                    origin="lower",
+                    interpolation="nearest",
+                )
+                ax.set_xticks(range(n_ph))
+                ax.set_xticklabels([f"{v:.2f}" for v in pinhole_vals], fontsize=8)
+                ax.set_yticks(range(n_ri))
+                ax.set_yticklabels([f"{v:.4f}" for v in ri_vals], fontsize=8)
+                ax.set_xlabel("Pinhole (AU)", fontsize=9)
+                ax.set_ylabel("RI sample", fontsize=9)
+                ax.set_title("PSF Fit — composite score (lower = better)", fontsize=9)
+
+                # Mark best
+                best = result.get("best_params", {})
+                best_ph = round(float(best.get("pinhole_airy_units", -1)), 6)
+                best_ri = round(float(best.get("ri_sample", -1)), 6)
+                bpi = ph_idx.get(best_ph)
+                bri = ri_idx.get(best_ri)
+                if bpi is not None and bri is not None:
+                    ax.plot(bpi, bri, "w*", markersize=14, zorder=5)
+
+                fig.colorbar(im, ax=ax, label="Composite score")
+                fig.tight_layout()
+
+            else:
+                # Widefield: 1D bar chart over RI
+                ri_div = [(e["params"].get("ri_sample", 0), e["i_div"]) for e in search_log]
+                ri_div.sort(key=lambda x: x[0])
+                xs = [v[0] for v in ri_div]
+                ys = [v[1] for v in ri_div]
+
+                fig = mfig.Figure(figsize=(5.5, 3.5), dpi=100)
+                FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111)
+                ax.bar(range(len(xs)), ys, color="#ff6600", edgecolor="white", alpha=0.85)
+                ax.set_xticks(range(len(xs)))
+                ax.set_xticklabels([f"{v:.4f}" for v in xs], fontsize=8, rotation=45, ha="right")
+                ax.set_xlabel("RI sample", fontsize=9)
+                ax.set_ylabel("Composite score", fontsize=9)
+                ax.set_title("PSF Fit — composite score by RI sample (lower = better)", fontsize=9)
+
+                # Mark best
+                best_ri = float(result.get("best_params", {}).get("ri_sample", -1))
+                for i, x in enumerate(xs):
+                    if abs(x - best_ri) < 1e-5:
+                        ax.bar(i, ys[i], color="#ffdd00", edgecolor="white", alpha=1.0)
+                        ax.annotate("best", (i, ys[i]), textcoords="offset points",
+                                    xytext=(0, 4), ha="center", fontsize=8, color="white",
+                                    fontweight="bold")
+                fig.tight_layout()
+
+            # Render to RGBA buffer via the Agg canvas
+            fig.canvas.draw()
+            buf = fig.canvas.buffer_rgba()
+            w, h = fig.canvas.get_width_height()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            rgb = arr[:, :, :3].copy()
+            fig.clf()
+
+            # Convert to QPixmap
+            h_px, w_px, _ = rgb.shape
+            qimg = QImage(rgb.data, w_px, h_px, w_px * 3, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+
+            self._viewer._output_pane.set_pixmap(pixmap)
+            self._viewer._output_pane.show_content()
+
+        except Exception as exc:
+            self._log(f"Heatmap render error: {exc}")
+            traceback.print_exc()
 
     # -----------------------------------------------------------------------
     # Save
@@ -5197,7 +6425,8 @@ class DeconvolveCIWindow(QMainWindow):
         original_path = Path(path)
         if original_path.suffix.lower() != ".png":
             original_path = original_path.with_suffix(".png")
-        decon_path = original_path.with_name(f"{original_path.stem}_decon.png")
+        method_suffix = _safe_filename_stem(self._method_combo.currentText()) or "decon"
+        decon_path = original_path.with_name(f"{original_path.stem}_{method_suffix}.png")
         self._last_save_dir = str(original_path.parent)
 
         try:
@@ -5453,9 +6682,14 @@ class DeconvolveCIWindow(QMainWindow):
         pinhole_val = data.get("pinhole_airy_units")
         if pinhole_val is not None:
             if isinstance(pinhole_val, list):
-                pinhole_text = _format_pinhole_values([float(value) for value in pinhole_val])
+                pinhole_text = _format_pinhole_values([float(v) for v in pinhole_val])
             else:
-                pinhole_text = f"{float(pinhole_val):.2f}"
+                # May be a single-value string ("1.37") or multi-channel string ("1.37, 1.19")
+                parts = [p.strip() for p in str(pinhole_val).split(",") if p.strip()]
+                try:
+                    pinhole_text = _format_pinhole_values([float(p) for p in parts])
+                except ValueError:
+                    pinhole_text = str(pinhole_val)
             self._pinhole_airy_saved = pinhole_text
             if self._pinhole_stack.currentWidget() is self._le_pinhole_airy:
                 self._le_pinhole_airy.setText(pinhole_text)
@@ -5712,6 +6946,11 @@ def main():
         action="store_true",
         help="Expose advanced MP4 iteration movie export controls.",
     )
+    parser.add_argument(
+        "--fitpsf",
+        action="store_true",
+        help="Expose the experimental Fit PSF panel for refractive-index fitting.",
+    )
     args, qt_args = parser.parse_known_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -5720,7 +6959,7 @@ def main():
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    window = DeconvolveCIWindow(movie_available=args.movie)
+    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf)
     window.show()
     sys.exit(app.exec())
 

@@ -1,6 +1,6 @@
 # ===========================================================================
 # Dependencies for the local GUI (gui_deconvolve_ci.py + launcher.py)
-# Python 3.10 or 3.11 recommended
+# Python 3.11 recommended!!
 # ===========================================================================
 
 # PyTorch with CUDA 12.6 support
@@ -30,3 +30,6 @@ omero-browser-qt[viewer]==0.2.2
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0
 nvidia-ml-py>=12.0.0
+
+# Zarr (needed for HCS plate reading/writing)
+zarr>=2.16
