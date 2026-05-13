@@ -14,6 +14,7 @@ from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -883,10 +884,38 @@ class _ChannelButton(QPushButton):
     def __init__(self, label: str, channel_index: int, parent=None):
         super().__init__(label, parent)
         self._channel_index = channel_index
+        self._ignore_next_release = False
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._apply_deferred_toggle)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        self.setDown(False)
+        if self._ignore_next_release:
+            self._ignore_next_release = False
+            event.accept()
+            return
+        if self.rect().contains(event.position().toPoint()):
+            self._click_timer.start(QApplication.doubleClickInterval())
+        event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        self._click_timer.stop()
+        self._ignore_next_release = True
+        self.setDown(False)
         self.colorPickRequested.emit(self._channel_index)
-        # Don't call super() — suppress the toggle that a double-click would cause.
+        event.accept()
+
+    def _apply_deferred_toggle(self) -> None:
+        if not self.isEnabled() or not self.isCheckable():
+            return
+        self.setChecked(not self.isChecked())
 
 
 class _AdvancedScalingWindow(QWidget):

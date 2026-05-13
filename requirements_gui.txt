@@ -27,6 +27,9 @@ bioio-nd2==1.7.0
 # Requires ZeroC ICE wheel installed separately — see README.md
 omero-browser-qt[viewer]==0.2.4
 
+# Leica browser (Open Leica… button)
+leica-browser-qt>=0.2.0
+
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0
 nvidia-ml-py>=12.0.0
