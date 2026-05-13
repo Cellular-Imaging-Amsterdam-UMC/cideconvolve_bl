@@ -72,7 +72,7 @@ For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
 ## GUI — Interactive Deconvolution (`gui_deconvolve_ci.py`)
 
-![GUI Deconvolution Panel](screenshots/gui_deconvolve_ci.png)
+![GUI Deconvolution Panel](docs/screenshots/gui_deconvolve_ci.png)
 
 The standalone interactive GUI is the primary tool for exploratory deconvolution.  It provides a full parameter panel on the left and a synchronized dual-pane image viewer on the right.
 
@@ -106,7 +106,10 @@ python gui_deconvolve_ci.py --movie --dlref
 |---|---|
 | **Open…** | OME-TIFF, ND2, CZI, LIF, and any format supported by BioIO |
 | **Open Zarr…** | OME-Zarr (local, HCS plates) |
+| **Open Leica…** | Leica LIF / LOF / XLEF containers via `leica-browser-qt` |
 | **Open OMERO…** | OMERO server — browse projects/datasets/images (requires `omero-browser-qt[viewer]`) |
+
+Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader instead of downloading the full plane.  The viewer loads the overview quickly and requests higher-resolution tiles as you zoom, matching the behaviour of the OMERO viewer in `omero-browser-qt`.
 
 ### Deconvolution controls (left panel)
 
@@ -193,6 +196,40 @@ A live status bar shows **CPU | RAM | SWAP | GPU | VRAM | SPILL** updated every 
 | **Save…** | Save current timepoint deconvolution result as OME-TIFF |
 | **Save T-Series…** | Export full T-series to OME-TIFF using memory-mapped staging |
 
+### Batch Deconvolver
+
+The **Batch…** button opens a session-only batch dialog for sequential GPU-safe processing.  It is intended for experiments where many images share the same optics and deconvolution settings.
+
+Batch inputs can be added from:
+
+| Button | Batch source |
+|---|---|
+| **Open…** | Multi-select regular image files |
+| **Open Zarr…** | Multi-select OME-Zarr folders |
+| **Open Leica…** | Multi-select images from Leica containers |
+| **Open OMERO…** | Multi-select OMERO images using the existing OMERO login/session |
+
+Batch workflow:
+
+1. Add images to the list.
+2. Choose a saved settings JSON.  These settings are the deconvolution/optics source of truth for the whole batch.
+3. Choose an output folder and format.  **OME-TIFF** is the default; **OME-Zarr** is also available.
+4. Optionally choose **Z output**: full stack, MIP, SUM, or Mean.  For 3D images, projection modes save only the projection.
+5. Start the batch.  Processing is strictly sequential to protect GPU memory, OMERO sessions, Leica handles, and large-image I/O.
+
+Each row stores the output folder that was selected when that image was added, so you can change the output folder and add another group of images to a different destination.  The table shows per-row status, progress, source, display name, shape, output folder, output filename, and messages such as current tile progress.  The bottom status bar shows elapsed time, ETA, predicted end date/time, and image progress, assuming images are roughly equal and refining the estimate after each tile update.
+
+Default batch output names are concise:
+
+```text
+Position_3_decon_mip.ome.tiff
+Position_3_decon.ome.zarr
+```
+
+For Leica sources, `save_child_name` is used as the table name and output filename base when available.
+
+Batch OME-TIFF output uses tiled BigTIFF internally, LZW lossless compression with floating-point predictor, and SubIFD pyramid levels when pyramids are enabled.  Batch OME-Zarr output is chunked and multiscale.  Existing outputs at the target path are overwritten.
+
 ### Image quality metrics
 
 Computed on both input and output (≤ 32 Z-planes, ≤ 512 YX) and shown in the log:
@@ -220,6 +257,8 @@ pip install -r requirements_gui.txt
 ```
 
 The **Open OMERO…** button requires `omero-browser-qt`, which depends on **ZeroC ICE**.  ZeroC ICE is not on PyPI and must be installed from a pre-built wheel matching your Python version and platform before running `pip install -r requirements_gui.txt`.
+
+OME-TIFF compression uses `tifffile` plus `imagecodecs`; both are listed in `requirements_gui.txt`.
 
 Download the wheel from the [zeroc-ice releases](https://github.com/zeroc-ice/ice/releases) or the [zeroc-ice PyPI mirror](https://zeroc.com/downloads/ice).  For the supported environment (Python 3.11, Windows x86-64):
 
@@ -320,10 +359,13 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 
 ---
 
-### Large tilescans / streaming OME-Zarr
+### Large tilescans / streaming output
 
-For very large images, use OME-Zarr output so CIDeconvolve can read and write
-tiles instead of materialising the full image in RAM:
+For very large images, use streaming output so CIDeconvolve can read and write
+tiles instead of materialising the full image in RAM.  OME-Zarr remains the
+preferred format for very large float32 tilescans because it is chunked,
+resumable, and viewer-friendly, but the GUI batch workflow also supports tiled
+OME-TIFF output.
 
 ```bash
 python wrapper.py \
@@ -334,8 +376,8 @@ python wrapper.py \
 
 Streaming mode reads halo-extended XY regions, deconvolves each tile with the
 existing CI solver, writes the tile core directly to level 0, then builds XY
-pyramid levels in the OME-Zarr output.  `--streaming auto` enables this path
-when the estimated full source array exceeds `--streaming_threshold_gb`.
+pyramid levels in the output.  `--streaming auto` enables this path when the
+estimated full source array exceeds `--streaming_threshold_gb`.
 The current streaming implementation keeps the full Z extent per tile to avoid
 axial boundary artefacts; the `max_z` value in `--tile_limits` is retained for
 future Z chunking.
@@ -418,7 +460,7 @@ docker run --rm --gpus all \
 
 ## Launcher — Docker GUI (`launcher.py`)
 
-![Launcher](screenshots/launcher.png)
+![Launcher](docs/screenshots/launcher.png)
 
 The launcher provides a graphical interface that reads `descriptor.json` at runtime, builds a matching parameter form, and generates / executes a `docker run` command — no command-line knowledge required.
 
@@ -456,6 +498,11 @@ Saved to `.last_settings.json` in the script directory (stores `values`, `folder
 When `--overrule_image_metadata false` (default), image metadata wins and CLI values are fallbacks.  When `true`, CLI values replace image metadata.
 
 **OME-TIFF / OME-Zarr readers extract:** pixel size, objective NA, magnification, immersion RI from standard OME `ObjectiveSettings` or objective immersion, per-channel wavelengths, acquisition mode (widefield vs confocal), and confocal pinhole size.  Additionally parsed: benchmark-style `MapAnnotation` keys (`SampleRefractiveIndex`, `PinholeAiryUnits`).
+
+Batch and streaming writers preserve metadata in the output:
+
+- **OME-Zarr:** NGFF multiscales with physical pixel-size coordinate transforms; OMERO channel labels, colors, active state, and contrast windows; CIDeconvolve/source metadata in the root `cideconvolve` attribute.
+- **OME-TIFF:** OME-XML physical pixel sizes, channel names, channel colors, and emission wavelengths where available; full CIDeconvolve/source metadata in private TIFF tag `65000`.
 
 Confocal pinhole diameters in the metadata are converted to Airy disk units as:
 
