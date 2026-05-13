@@ -163,6 +163,14 @@ def _rgb_to_ome_hex(color: Any) -> str | None:
     return "".join(f"{v:02X}" for v in rgb)
 
 
+def _rgb_to_ome_int(color: Any) -> int | None:
+    rgb = _coerce_rgb(color)
+    if rgb is None:
+        return None
+    r, g, b = rgb
+    return int((r << 24) | (g << 16) | (b << 8) | 255)
+
+
 def _positive_float(value: Any, default: float) -> float:
     try:
         out = float(value)
@@ -225,6 +233,26 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
     meta["channel_names"] = names[:c]
     meta["_defaulted_keys"] = defaulted
     return meta
+
+
+def _cideconvolve_metadata_payload(metadata: dict[str, Any], shape: tuple[int, int, int, int, int]) -> dict[str, Any]:
+    return {
+        "creator": "CIDeconvolve",
+        "shape_tczyx": list(shape),
+        "metadata": _jsonable(metadata),
+        "physical_pixel_sizes_um": {
+            "x": _positive_float(metadata.get("pixel_size_x"), 1.0),
+            "y": _positive_float(metadata.get("pixel_size_y"), _positive_float(metadata.get("pixel_size_x"), 1.0)),
+            "z": _positive_float(metadata.get("pixel_size_z"), 1.0),
+        },
+        "channels": _jsonable(metadata.get("channels") or []),
+        "processing": _jsonable(metadata.get("cideconvolve_processing") or {}),
+        "source": {
+            "id": metadata.get("id"),
+            "name": metadata.get("name"),
+            "source_id": metadata.get("source_id"),
+        },
+    }
 
 
 class InMemoryRegionSource:
@@ -655,26 +683,10 @@ class ZarrPyramidSink:
         except (TypeError, ValueError):
             pass
         self._root.attrs["omero"] = omero
-        self._root.attrs["_creator"] = {
-            "name": "CIDeconvolve",
-            "streaming": True,
-            "physical_pixel_sizes_um": {
-                "x": px_x,
-                "y": px_y,
-                "z": px_z,
-            },
-            "shape_tczyx": list(self.shape),
-            "channel_metadata": _jsonable(source_channels),
-            "processing": _jsonable(self.metadata.get("cideconvolve_processing") or {}),
-            "source_metadata": {
-                "source_id": self.metadata.get("id"),
-                "source_name": self.metadata.get("name"),
-                "microscope_type": self.metadata.get("microscope_type"),
-                "na": self.metadata.get("na"),
-                "refractive_index": self.metadata.get("refractive_index"),
-                "sample_refractive_index": self.metadata.get("sample_refractive_index"),
-            },
-        }
+        payload = _cideconvolve_metadata_payload(self.metadata, self.shape)
+        payload["streaming"] = True
+        self._root.attrs["_creator"] = payload
+        self._root.attrs["cideconvolve"] = payload
 
     def build_pyramids(self) -> None:
         current = self._level0
@@ -727,7 +739,7 @@ class TiledOmeTiffSink:
         metadata: Optional[dict[str, Any]] = None,
         tile_yx: tuple[int, int] = (512, 512),
         levels: int | None = None,
-        compression: str | None = None,
+        compression: str | None = "lzw",
         temp_dir: str | Path | None = None,
     ):
         self.path = Path(path)
@@ -802,10 +814,43 @@ class TiledOmeTiffSink:
             raw_channels = []
         channels = [dict(ch) if isinstance(ch, dict) else {} for ch in raw_channels]
         channel_names = []
+        channel_colors = []
+        emission_wavelengths = []
+        emission_units = []
+        excitation_wavelengths = []
+        excitation_units = []
+        pinhole_sizes = []
+        pinhole_units = []
         for i in range(self.shape[1]):
             ch = channels[i] if i < len(channels) else {}
             channel_names.append(str(ch.get("name") or ch.get("label") or (names[i] if i < len(names) else f"Ch{i}")))
+            channel_colors.append(_rgb_to_ome_int(ch.get("color")))
+            emission_wavelengths.append(ch.get("emission_wavelength"))
+            emission_units.append("nm")
+            excitation_wavelengths.append(ch.get("excitation_wavelength"))
+            excitation_units.append("nm")
+            pinhole_sizes.append(ch.get("pinhole_size_um") or ch.get("pinhole_size"))
+            pinhole_units.append("µm")
+        channel_meta: dict[str, Any] = {"Name": channel_names}
+        if any(value is not None for value in channel_colors):
+            channel_meta["Color"] = [value if value is not None else 0xFFFFFFFF for value in channel_colors]
+        if emission_wavelengths and all(value is not None for value in emission_wavelengths):
+            channel_meta["EmissionWavelength"] = [
+                float(value) for value in emission_wavelengths
+            ]
+            channel_meta["EmissionWavelengthUnit"] = emission_units
+        if excitation_wavelengths and all(value is not None for value in excitation_wavelengths):
+            channel_meta["ExcitationWavelength"] = [
+                float(value) for value in excitation_wavelengths
+            ]
+            channel_meta["ExcitationWavelengthUnit"] = excitation_units
+        if pinhole_sizes and all(value is not None for value in pinhole_sizes):
+            channel_meta["PinholeSize"] = [
+                float(value) for value in pinhole_sizes
+            ]
+            channel_meta["PinholeSizeUnit"] = pinhole_units
         return {
+            "Name": str(self.metadata.get("name") or self.path.stem),
             "axes": "TCZYX",
             "PhysicalSizeX": px_x,
             "PhysicalSizeXUnit": "µm",
@@ -813,28 +858,13 @@ class TiledOmeTiffSink:
             "PhysicalSizeYUnit": "µm",
             "PhysicalSizeZ": px_z,
             "PhysicalSizeZUnit": "µm",
-            "Channel": {"Name": channel_names},
+            "Channel": channel_meta,
         }
 
     def _description_metadata(self) -> str:
-        payload = {
-            "creator": "CIDeconvolve",
-            "shape_tczyx": list(self.shape),
-            "physical_pixel_sizes_um": {
-                "x": _positive_float(self.metadata.get("pixel_size_x"), 1.0),
-                "y": _positive_float(self.metadata.get("pixel_size_y"), _positive_float(self.metadata.get("pixel_size_x"), 1.0)),
-                "z": _positive_float(self.metadata.get("pixel_size_z"), 1.0),
-            },
-            "channels": _jsonable(self.metadata.get("channels") or []),
-            "processing": _jsonable(self.metadata.get("cideconvolve_processing") or {}),
-            "source": {
-                "id": self.metadata.get("id"),
-                "name": self.metadata.get("name"),
-            },
-        }
-        return json.dumps(payload, default=str)
+        return json.dumps(_cideconvolve_metadata_payload(self.metadata, self.shape), default=str)
 
-    def _write_tiff(self) -> None:
+    def _write_tiff_once(self, compression: str | None) -> None:
         try:
             import tifffile
         except Exception as exc:  # pragma: no cover - depends on optional GUI dependency
@@ -854,11 +884,13 @@ class TiledOmeTiffSink:
             "photometric": "minisblack",
             "tile": tile,
             "metadata": self._ome_metadata(),
+            "extratags": [(65000, "s", 0, self._description_metadata(), True)],
         }
         if self._pyramids:
             write_kwargs["subifds"] = len(self._pyramids)
-        if self.compression:
-            write_kwargs["compression"] = self.compression
+        if compression:
+            write_kwargs["compression"] = compression
+            write_kwargs["predictor"] = True
 
         with tifffile.TiffWriter(str(self.path), bigtiff=True, ome=True) as tif:
             tif.write(self._level0, **write_kwargs)
@@ -872,9 +904,23 @@ class TiledOmeTiffSink:
                     "tile": level_tile,
                     "subfiletype": 1,
                 }
-                if self.compression:
-                    level_kwargs["compression"] = self.compression
+                if compression:
+                    level_kwargs["compression"] = compression
+                    level_kwargs["predictor"] = True
                 tif.write(pyramid, **level_kwargs)
+
+    def _write_tiff(self) -> None:
+        try:
+            self._write_tiff_once(self.compression)
+        except Exception as exc:
+            if not self.compression:
+                raise
+            log.warning(
+                "Could not write compressed OME-TIFF with %s compression; writing uncompressed fallback: %s",
+                self.compression,
+                exc,
+            )
+            self._write_tiff_once(None)
 
     def close(self) -> None:
         if self._closed:

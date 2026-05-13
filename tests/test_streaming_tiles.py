@@ -208,6 +208,8 @@ def test_zarr_pyramid_sink_writes_multiscales_when_zarr_available(tmp_path: Path
     scale = root.attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"]
     assert scale == [1, 1, 1.25, 0.45499, 0.45499]
     assert root.attrs["_creator"]["physical_pixel_sizes_um"]["x"] == 0.45499
+    assert root.attrs["cideconvolve"]["physical_pixel_sizes_um"]["z"] == 1.25
+    assert root.attrs["cideconvolve"]["metadata"]["pixel_size_x"] == 0.45499
     source = ZarrRegionSource(tmp_path / "out.ome.zarr")
     assert source.metadata["channels"][0]["color"] == (255, 0, 0)
     assert source.metadata["channels"][0]["window_start"] == 12.0

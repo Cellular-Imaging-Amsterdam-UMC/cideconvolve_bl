@@ -12,6 +12,7 @@ torch>=2.4
 # Core dependencies
 numpy>=1.26,<3
 tifffile>=2024.1.30
+imagecodecs>=2024.1.1
 ome-types>=0.5
 Pillow>=10.0
 

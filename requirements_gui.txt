@@ -18,6 +18,7 @@ matplotlib>=3.8.0
 
 # OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
 tifffile>=2024.1.30
+imagecodecs>=2024.1.1
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
 bioio-ome-zarr==3.3.0
