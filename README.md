@@ -64,6 +64,7 @@ For full details on the DL method, training presets, GPU training tips, API usag
 - **Enhanced 2D widefield mode** (`--two_d_mode auto`) — collapses a full 3D Gibson-Lanni PSF to 2D for single-plane widefield data with aggressiveness and background controls
 - **Physically accurate PSF** — vectorial Richards-Wolf model (NA ≥ 0.9) or scalar Kirchhoff (NA < 0.9), Gibson-Lanni OPD aberration correction, sub-pixel integration, finite confocal pinhole convolution
 - **Automatic memory tiling** — tiles large volumes with feathered overlap to fit GPU or CPU RAM
+- **Streaming large tilescans** — optional OME-Zarr output path reads halo-extended regions and writes tiles/pyramids without materialising full 40k × 40k arrays
 
 For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
@@ -259,14 +260,18 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--method` | `ci_rl` | `ci_rl`, `ci_rl_dl`, `ci_rl_tv`, or `ci_sparse_hessian` |
+| `--method` | `ci_rl` | `ci_rl`, `ci_rl_tv`, or `ci_sparse_hessian` |
 | `--iterations` | `150` | RL iterations; comma-separated for per-channel |
-| `--convergence` | `auto` | Early stopping: `auto` or `none` |
+| `--convergence` | `auto` | Early stopping: `auto` or fixed iteration count: `fixed` |
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
 | `--projection` | `none` | Z-projection: `none`, `mip`, or `sum` |
-| `--tiling` | `custom` | `none` or `custom` |
-| `--tile_limits` | `512, 64` | Max tile `max_xy, max_z` (when tiling = custom) |
+| `--output_format` | `ome-tiff` | `ome-tiff` for eager saves, `ome-zarr` for streamed chunked output with pyramids |
+| `--streaming` | `auto` | `auto`, `always`, or `never`; auto enables region reads above `--streaming_threshold_gb` |
+| `--tile_limits` | `1024,64` | Streaming tile limit `max_xy,max_z`; XY is active, Z is reserved for future axial chunking |
+| `--streaming_threshold_gb` | `2.0` | Estimated full source-array size that triggers streaming auto mode |
+| `--scene` | `auto` | Optional BioIO scene index/name for multi-scene files |
+| `--hcs_field` | `auto` | Optional OME-Zarr HCS field path, for example `A/1/0` |
 
 #### PSF / optics
 
@@ -304,10 +309,6 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 |-----------|---------|-------------|
 | `--sparse_hessian_weight` | `0.6` | Hessian-vs-sparsity balance (0–1) |
 | `--sparse_hessian_reg` | `0.98` | Data-vs-regulariser balance (0–1) |
-| `--dl_model_path` | empty | Optional trained `final_model.pt` checkpoint for `ci_rl_dl`; empty returns plain `ci_rl` |
-| `--dl_z_context` | `2` | Number of neighbouring planes on each side used by the 2.5D model |
-| `--dl_batch_size` | `8` | Number of planes refined per DL inference batch |
-| `--dl_mixed_precision` | `true` | Use CUDA mixed precision for DL refinement when available |
 
 #### Benchmark
 
@@ -316,6 +317,28 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 | `--benchmark` | `false` | Run the three classical benchmark methods and write timing CSV + MIP montages |
 | `--bench_crop` | `false` | Centre-crop to tile limits before benchmarking |
 | `--compute_metrics` | `false` | Compute optional FFT / gradient quality metrics |
+
+---
+
+### Large tilescans / streaming OME-Zarr
+
+For very large images, use OME-Zarr output so CIDeconvolve can read and write
+tiles instead of materialising the full image in RAM:
+
+```bash
+python wrapper.py \
+    --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
+    --method ci_rl --iterations 50 \
+    --output_format ome-zarr --streaming always --tile_limits 1024,64
+```
+
+Streaming mode reads halo-extended XY regions, deconvolves each tile with the
+existing CI solver, writes the tile core directly to level 0, then builds XY
+pyramid levels in the OME-Zarr output.  `--streaming auto` enables this path
+when the estimated full source array exceeds `--streaming_threshold_gb`.
+The current streaming implementation keeps the full Z extent per tile to avoid
+axial boundary artefacts; the `max_z` value in `--tile_limits` is retained for
+future Z chunking.
 
 ---
 

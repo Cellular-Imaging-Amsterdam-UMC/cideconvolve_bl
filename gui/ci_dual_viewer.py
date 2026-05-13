@@ -182,8 +182,16 @@ def _resolve_channel_colors(channels: list[dict]) -> list[tuple[int, int, int]]:
     colors: list[tuple[int, int, int] | None] = []
     for ch in channels:
         color = ch.get("color")
-        if isinstance(color, tuple) and len(color) == 3 and color != (255, 255, 255):
-            colors.append(tuple(int(v) for v in color))
+        if isinstance(color, str):
+            text = color.strip().lstrip("#")
+            if len(text) == 6:
+                try:
+                    colors.append(tuple(int(text[i:i + 2], 16) for i in (0, 2, 4)))
+                    continue
+                except ValueError:
+                    pass
+        if isinstance(color, (list, tuple)) and len(color) >= 3 and tuple(color[:3]) != (255, 255, 255):
+            colors.append(tuple(int(v) for v in color[:3]))
             continue
         emission = ch.get("emission_wavelength")
         colors.append(_emission_to_rgb(emission))
@@ -271,6 +279,7 @@ class ZoomableImageView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._pix_item: Optional[QGraphicsPixmapItem] = None
+        self._custom_item = None
         self._linked: list["ZoomableImageView"] = []
         self._syncing = False
         self.setRenderHints(
@@ -296,18 +305,36 @@ class ZoomableImageView(QGraphicsView):
     def set_pixmap(self, pixmap: Optional[QPixmap]) -> None:
         self._scene.clear()
         self._pix_item = None
+        self._custom_item = None
         if pixmap is not None and not pixmap.isNull():
             self._pix_item = self._scene.addPixmap(pixmap)
             self._scene.setSceneRect(QRectF(pixmap.rect()))
 
+    def set_graphics_item(self, item) -> None:
+        """Show a custom graphics item, for example a progressive tiled pyramid."""
+        if item is self._custom_item:
+            if item is not None:
+                self._scene.setSceneRect(item.boundingRect())
+            return
+        self._scene.clear()
+        self._pix_item = None
+        self._custom_item = item
+        if item is not None:
+            self._scene.addItem(item)
+            self._scene.setSceneRect(item.boundingRect())
+
     def clear(self) -> None:
         self._scene.clear()
         self._pix_item = None
+        self._custom_item = None
 
     def fit_in_view(self) -> None:
         if self._pix_item is not None:
             self.resetTransform()
             self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
+        elif not self._scene.sceneRect().isEmpty():
+            self.resetTransform()
+            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def copy_view_state_from(self, other: "ZoomableImageView") -> None:
         self.setTransform(other.transform())
@@ -417,6 +444,11 @@ class _PaneWidget(QWidget):
         self.show_content()
         self._mode_stack.setCurrentIndex(0)
         self.view2d.set_pixmap(pixmap)
+
+    def set_graphics_item(self, item) -> None:
+        self.show_content()
+        self._mode_stack.setCurrentIndex(0)
+        self.view2d.set_graphics_item(item)
 
     def fit_2d(self) -> None:
         self.view2d.fit_in_view()
@@ -1478,6 +1510,8 @@ class DualViewerWidget(QWidget):
         self._metadata: dict = {}
         self._input_channels: list[np.ndarray] = []
         self._loaded_input_timepoint: Optional[int] = None
+        self._tiled_provider = None
+        self._tiled_item = None
         self._preview_by_t: dict[int, list[np.ndarray]] = {}
         self._channel_buttons: list[QPushButton] = []
         self._channel_colors: list[tuple[int, int, int]] = []
@@ -1688,6 +1722,8 @@ class DualViewerWidget(QWidget):
         root.addWidget(self._time_bar)
 
     def set_input_data(self, channels: list[np.ndarray], metadata: dict) -> None:
+        self._tiled_provider = None
+        self._tiled_item = None
         self._hist_cache.clear()
         self._max_cache.clear()
         self._sum_cache.clear()
@@ -1717,6 +1753,23 @@ class DualViewerWidget(QWidget):
         self._fit_on_next_render = True
         self._ensure_mode_valid()
         self._sync_advanced_scaling_window()
+        self._refresh_view()
+
+    def set_tiled_input_provider(self, provider) -> None:
+        """Enable progressive pyramid rendering for the original pane."""
+        try:
+            from omero_browser_qt.omero_viewer import TiledImageItem
+        except Exception:
+            self._tiled_provider = None
+            self._tiled_item = None
+            return
+        self._tiled_provider = provider
+        self._tiled_item = TiledImageItem(provider)
+        self._fit_on_next_render = True
+        if self._mode_combo.currentText() == _THREE_D_MODE:
+            self._mode_combo.blockSignals(True)
+            self._mode_combo.setCurrentText(_TWO_D_MODE)
+            self._mode_combo.blockSignals(False)
         self._refresh_view()
 
     def set_input_timepoint_data(self, timepoint: int, channels_zyx: list[np.ndarray]) -> None:
@@ -2319,6 +2372,8 @@ class DualViewerWidget(QWidget):
             self._mode_combo.setCurrentText(_TWO_D_MODE)
 
     def _can_show_3d(self) -> bool:
+        if self._tiled_provider is not None:
+            return False
         return _HAS_VISPY and bool(self._input_channels) and max(int(self._metadata.get("size_z", 1)), 1) > 1
 
     def _refresh_view(self) -> None:
@@ -2352,8 +2407,30 @@ class DualViewerWidget(QWidget):
         self._input_pane.set_mode(_TWO_D_MODE)
         self._output_pane.set_mode(_TWO_D_MODE)
 
-        input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
-        self._input_pane.set_pixmap(input_pixmap)
+        if self._tiled_provider is not None and self._tiled_item is not None:
+            input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
+            self._tiled_item.set_overview(input_pixmap)
+            contrast = {}
+            for idx in self._active_channel_indices():
+                if 0 <= idx < len(self._input_channels):
+                    contrast[idx] = self._channel_contrast(
+                        self._input_channels[idx],
+                        idx,
+                        "original",
+                        projection,
+                    )[:2]
+            self._tiled_item.set_display(
+                self._active_channel_indices(),
+                self._channel_colors,
+                contrast,
+                int(self._z_slider.value()),
+                timepoint,
+                projection,
+            )
+            self._input_pane.set_graphics_item(self._tiled_item)
+        else:
+            input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
+            self._input_pane.set_pixmap(input_pixmap)
 
         preview = self._preview_by_t.get(timepoint)
         if preview:

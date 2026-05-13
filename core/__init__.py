@@ -9,6 +9,14 @@ from .deconvolve import (
     _DEFAULT_PINHOLE_AIRY_UNITS,
     _apply_pinhole_airy_units,
 )
+from .streaming import (
+    InMemoryPyramidSink,
+    InMemoryRegionSource,
+    ZarrPyramidSink,
+    deconvolve_streaming,
+    open_region_source,
+    should_stream_source,
+)
 
 __all__ = [
     "deconvolve",
@@ -19,4 +27,10 @@ __all__ = [
     "save_result",
     "_DEFAULT_PINHOLE_AIRY_UNITS",
     "_apply_pinhole_airy_units",
+    "InMemoryPyramidSink",
+    "InMemoryRegionSource",
+    "ZarrPyramidSink",
+    "deconvolve_streaming",
+    "open_region_source",
+    "should_stream_source",
 ]

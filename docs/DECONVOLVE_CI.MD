@@ -363,6 +363,25 @@ individual tiles as balanced as possible in aspect ratio.
 
 ---
 
+### 10. Streaming Region I/O (Large Tilescans)
+For very large 2-D tilescans and shallow 3-D stacks, `core/streaming.py` adds a
+separate region-I/O layer around the existing solvers:
+
+- `ImageRegionSource` exposes canonical `T, C, Z, Y, X` shape plus
+  `read_region(...)` for halo-extended tile reads.
+- `PyramidSink` accepts incremental level-0 tile writes and can build OME-Zarr
+  XY pyramid levels after deconvolution.
+- `deconvolve_streaming(...)` computes an XY tile grid, reads each
+  halo-extended region, runs the normal tile solver callback, crops back to the
+  core tile, and writes directly to the sink.
+
+The CLI uses this path for `--output_format ome-zarr` or when
+`--streaming auto` estimates that eager loading would exceed
+`--streaming_threshold_gb`.  The first implementation streams XY while keeping
+the full Z extent per tile to avoid axial seam artefacts.
+
+---
+
 ## PSF Generation
 
 ### `ci_generate_psf` — Vectorial/Scalar PSF with Gibson-Lanni Correction

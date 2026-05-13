@@ -23,3 +23,5 @@ nvidia-ml-py>=12.0.0
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
 bioio-ome-zarr==3.3.0
+zarr>=2.16
+numcodecs>=0.12

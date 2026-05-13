@@ -58,6 +58,17 @@ def _pick_device(device: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _release_cuda_cache() -> None:
+    """Release PyTorch's cached CUDA blocks after large independent tiles."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def _pick_dtype(dev: torch.device) -> torch.dtype:
     return torch.float32 if dev.type == "cuda" else torch.float64
 
@@ -960,9 +971,12 @@ def _ci_deconvolve_tiled(
         ext = desc["extract"]
         numerator[ext] += weighted.astype(np.float64)
         denominator[ext] += weight[np.newaxis, :, :].astype(np.float64)
+        del tile_img, tile_out, tile_result, tile_cropped, weighted, weight
+        _release_cuda_cache()
 
     denominator = np.maximum(denominator, 1e-12)
     result = np.clip((numerator / denominator).astype(np.float32), 0, None)
+    _release_cuda_cache()
     return {
         "result": result,
         "convergence": all_convergence,

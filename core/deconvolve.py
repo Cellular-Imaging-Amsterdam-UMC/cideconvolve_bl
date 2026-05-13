@@ -352,7 +352,24 @@ def _load_first_hcs_zarr_field(path: Path) -> dict[str, Any]:
         meta["channel_names"] = [
             str(ch.get("label") or f"Ch{i}") for i, ch in enumerate(omero_channels)
         ]
-        meta["channels"] = [{} for _ in omero_channels]
+        channels = []
+        for i, ch in enumerate(omero_channels):
+            color = ch.get("color")
+            if isinstance(color, str) and len(color.strip().lstrip("#")) == 6:
+                text = color.strip().lstrip("#")
+                try:
+                    color = tuple(int(text[j:j + 2], 16) for j in (0, 2, 4))
+                except ValueError:
+                    color = None
+            window = ch.get("window") or {}
+            channels.append({
+                "name": str(ch.get("label") or f"Ch{i}"),
+                "color": color,
+                "active": bool(ch.get("active", True)),
+                "window_start": window.get("start"),
+                "window_end": window.get("end"),
+            })
+        meta["channels"] = channels
 
     logger.info("HCS plate detected; loaded first field %s/%s/%s", row, col, field)
     return {"images": images, "metadata": meta}
@@ -1275,13 +1292,25 @@ def _channel_color(metadata: dict[str, Any], ch_idx: int) -> tuple[int, int, int
     """Determine the display colour for a channel.
 
     Priority:
-      1. Emission wavelength → spectral RGB
-      2. Fallback palette (Green, Magenta, Cyan, Red, Blue, Yellow, …)
+      1. Explicit channel colour metadata
+      2. Emission wavelength → spectral RGB
+      3. Fallback palette (Green, Magenta, Cyan, Red, Blue, Yellow, …)
     """
     channels = metadata.get("channels", [])
-    em = None
-    if ch_idx < len(channels):
-        em = channels[ch_idx].get("emission_wavelength")
+    ch = channels[ch_idx] if ch_idx < len(channels) and isinstance(channels[ch_idx], dict) else {}
+    color = ch.get("color")
+    if isinstance(color, str) and len(color.strip().lstrip("#")) == 6:
+        text = color.strip().lstrip("#")
+        try:
+            return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+        except ValueError:
+            pass
+    if isinstance(color, (list, tuple)) and len(color) >= 3:
+        try:
+            return tuple(max(0, min(255, int(v))) for v in color[:3])  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            pass
+    em = ch.get("emission_wavelength")
     rgb = _emission_to_rgb(em)
     if rgb == (255, 255, 255):
         # Use fallback palette

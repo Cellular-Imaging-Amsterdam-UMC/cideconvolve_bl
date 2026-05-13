@@ -17,6 +17,7 @@ import argparse
 import gc
 import json
 import logging
+import math
 import os
 import platform
 import shutil
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -43,8 +45,8 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
-from PyQt6.QtCore import QObject, QEvent, Qt, QRectF, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon, QImage, QPainter, QPixmap, QTextCursor, QWheelEvent
+from PyQt6.QtCore import QObject, QEvent, Qt, QRectF, QSize, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QImage, QPainter, QPixmap, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -61,8 +63,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QMainWindow,
     QMessageBox,
+    QAbstractItemView,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -73,7 +77,11 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QHeaderView,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -258,9 +266,21 @@ def _emission_to_rgb(wavelength_nm: Optional[float]) -> tuple[int, int, int]:
 def _channel_color(metadata: dict, ch_idx: int) -> tuple[int, int, int]:
     """Determine display colour for a channel from metadata."""
     channels = metadata.get("channels", [])
-    em = None
-    if ch_idx < len(channels):
-        em = channels[ch_idx].get("emission_wavelength")
+    ch = channels[ch_idx] if ch_idx < len(channels) and isinstance(channels[ch_idx], dict) else {}
+    color = ch.get("color")
+    if isinstance(color, str):
+        text = color.strip().lstrip("#")
+        if len(text) == 6:
+            try:
+                return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+            except ValueError:
+                pass
+    if isinstance(color, (list, tuple)) and len(color) >= 3 and tuple(color[:3]) != (255, 255, 255):
+        try:
+            return tuple(max(0, min(255, int(v))) for v in color[:3])  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            pass
+    em = ch.get("emission_wavelength")
     rgb = _emission_to_rgb(em)
     if rgb == (255, 255, 255):
         rgb = _FALLBACK_COLORS[ch_idx % len(_FALLBACK_COLORS)]
@@ -275,6 +295,28 @@ def _resolve_channel_colors(
     if n_ch > 1 and len(set(colors)) == 1:
         colors = [_BGRCYM[i % len(_BGRCYM)] for i in range(n_ch)]
     return colors
+
+
+def _release_cuda_memory(*, synchronize: bool = False) -> None:
+    """Return cached CUDA memory to the driver after large tile jobs."""
+    gc.collect()
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        if synchronize:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +788,17 @@ def _hcs_zarr_metadata(field_group, row: str, col: str, field: str) -> dict:
         meta["channel_names"] = [
             str(ch.get("label") or _default_channel_name(i)) for i, ch in enumerate(omero_channels)
         ]
-        meta["channels"] = [{} for _ in omero_channels]
+        channels = []
+        for i, ch in enumerate(omero_channels):
+            window = ch.get("window") or {}
+            channels.append({
+                "name": str(ch.get("label") or _default_channel_name(i)),
+                "color": ch.get("color"),
+                "active": bool(ch.get("active", True)),
+                "window_start": window.get("start"),
+                "window_end": window.get("end"),
+            })
+        meta["channels"] = channels
     return meta
 
 
@@ -788,6 +840,13 @@ def _format_duration(seconds: float) -> str:
         return f"{int(minutes)}m {sec:.1f}s"
     hours, minutes = divmod(minutes, 60)
     return f"{int(hours)}h {int(minutes)}m {sec:.1f}s"
+
+
+def _format_duration_hm(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours}:{minutes:02d}"
 
 
 def _format_value(value, unit: str = "", digits: int = 4) -> str:
@@ -1179,10 +1238,17 @@ class _HcsZarrTimepointSource(_BaseTimepointSource):
 
 class _OmeroTimepointSource(_BaseTimepointSource):
     def __init__(self, image):
-        from omero_browser_qt import RegularImagePlaneProvider, get_image_metadata
+        from omero_browser_qt import (
+            PyramidTileProvider,
+            RegularImagePlaneProvider,
+            get_image_metadata,
+            is_large_image,
+        )
 
         self._image = image
-        self._provider = RegularImagePlaneProvider(image)
+        self.is_pyramidal = bool(is_large_image(image))
+        self.tile_provider = PyramidTileProvider(image) if self.is_pyramidal else None
+        self._provider = None if self.is_pyramidal else RegularImagePlaneProvider(image)
         meta = get_image_metadata(image)
         size_c = max(int(meta.get("size_c", 1)), 1)
         meta = _apply_metadata_defaults([None] * size_c, meta)
@@ -1200,6 +1266,18 @@ class _OmeroTimepointSource(_BaseTimepointSource):
         size_t = max(int(self.metadata.get("size_t", 1)), 1)
         size_z = max(int(self.metadata.get("size_z", 1)), 1)
         target_t = max(0, min(int(t_index), size_t - 1))
+        if self.is_pyramidal and self.tile_provider is not None:
+            if progress_cb is not None:
+                progress_cb(0, 1, "Loading OMERO pyramid overview…")
+            z = max(0, min(int(self.metadata.get("default_z", 0)), size_z - 1))
+            channels = [
+                _normalize_stack_to_zyx(ch).astype(np.float32, copy=False)
+                for ch in self.tile_provider.load_overview(z=z, t=target_t)
+            ]
+            if progress_cb is not None:
+                progress_cb(1, 1, "Loaded OMERO pyramid overview")
+            return channels
+
         channels: list[np.ndarray] = []
         total = max(size_c * size_z, 1)
         for c_index in range(size_c):
@@ -1219,6 +1297,131 @@ class _OmeroTimepointSource(_BaseTimepointSource):
             if progress_cb is not None:
                 progress_cb(base + size_z, total, f"Loading stack… channel {c_index + 1}/{size_c}")
         return channels
+
+
+class _OmeroPyramidRegionSource:
+    """Full-resolution OMERO region reader backed by PyramidTileProvider tiles."""
+
+    def __init__(self, source: _OmeroTimepointSource):
+        if not getattr(source, "is_pyramidal", False) or source.tile_provider is None:
+            raise ValueError("OMERO source is not pyramidal")
+        self._source = source
+        self._provider = source.tile_provider
+        self._level = max(int(self._provider.n_levels) - 1, 0)
+        size_x, size_y = self._provider.level_size(self._level)
+        self.shape = (
+            max(int(source.metadata.get("size_t", 1)), 1),
+            max(int(source.metadata.get("size_c", 1)), 1),
+            max(int(source.metadata.get("size_z", 1)), 1),
+            int(size_y),
+            int(size_x),
+        )
+        self.metadata = dict(source.metadata)
+        self.metadata["size_t"] = self.shape[0]
+        self.metadata["size_c"] = self.shape[1]
+        self.metadata["size_z"] = self.shape[2]
+        self.metadata["size_y"] = self.shape[3]
+        self.metadata["size_x"] = self.shape[4]
+        image = getattr(source, "_image", None)
+        image_id = image.getId() if image is not None and hasattr(image, "getId") else "unknown"
+        self.source_id = f"omero:pyramid:{image_id}"
+
+    def read_region(
+        self,
+        *,
+        t: int,
+        c: int,
+        z: slice,
+        y: slice,
+        x: slice,
+    ) -> np.ndarray:
+        size_t, size_c, size_z, size_y, size_x = self.shape
+        t = max(0, min(int(t), size_t - 1))
+        c = max(0, min(int(c), size_c - 1))
+        z0, z1, z_step = z.indices(size_z)
+        y0, y1, y_step = y.indices(size_y)
+        x0, x1, x_step = x.indices(size_x)
+        if z_step != 1 or y_step != 1 or x_step != 1:
+            raise ValueError("OMERO pyramid streaming only supports contiguous regions")
+
+        out = np.zeros((max(0, z1 - z0), max(0, y1 - y0), max(0, x1 - x0)), dtype=np.float32)
+        if out.size == 0:
+            return out
+
+        tile_w, tile_h = self._provider.tile_size(self._level)
+        tx0 = x0 // tile_w
+        tx1 = (x1 + tile_w - 1) // tile_w
+        ty0 = y0 // tile_h
+        ty1 = (y1 + tile_h - 1) // tile_h
+
+        for zi, z_abs in enumerate(range(z0, z1)):
+            for ty in range(ty0, ty1):
+                tile_y0 = ty * tile_h
+                tile_y1 = min(size_y, tile_y0 + tile_h)
+                oy0 = max(y0, tile_y0)
+                oy1 = min(y1, tile_y1)
+                if oy1 <= oy0:
+                    continue
+                for tx in range(tx0, tx1):
+                    tile_x0 = tx * tile_w
+                    tile_x1 = min(size_x, tile_x0 + tile_w)
+                    ox0 = max(x0, tile_x0)
+                    ox1 = min(x1, tile_x1)
+                    if ox1 <= ox0:
+                        continue
+                    tile = self._provider.get_tile(self._level, c, z_abs, t, tx, ty)
+                    if tile is None:
+                        continue
+                    out[
+                        zi,
+                        oy0 - y0:oy1 - y0,
+                        ox0 - x0:ox1 - x0,
+                    ] = np.asarray(
+                        tile[oy0 - tile_y0:oy1 - tile_y0, ox0 - tile_x0:ox1 - tile_x0],
+                        dtype=np.float32,
+                    )
+        return out
+
+
+class _TimepointRegionSource:
+    """Region-source adapter for sources that only expose full timepoint loads."""
+
+    def __init__(self, source: _BaseTimepointSource, *, source_id: str = "timepoint"):
+        self._source = source
+        self.metadata = dict(source.metadata)
+        self.shape = (
+            max(int(self.metadata.get("size_t", 1)), 1),
+            max(int(self.metadata.get("size_c", 1)), 1),
+            max(int(self.metadata.get("size_z", 1)), 1),
+            max(int(self.metadata.get("size_y", 1)), 1),
+            max(int(self.metadata.get("size_x", 1)), 1),
+        )
+        self.source_id = source_id
+        self._cache_t: Optional[int] = None
+        self._cache_channels: list[np.ndarray] | None = None
+
+    def _channels_for_t(self, t: int) -> list[np.ndarray]:
+        t = max(0, min(int(t), self.shape[0] - 1))
+        if self._cache_t != t or self._cache_channels is None:
+            self._cache_channels = [
+                _normalize_stack_to_zyx(ch).astype(np.float32, copy=False)
+                for ch in self._source.load_timepoint(t)
+            ]
+            self._cache_t = t
+        return self._cache_channels
+
+    def read_region(
+        self,
+        *,
+        t: int,
+        c: int,
+        z: slice,
+        y: slice,
+        x: slice,
+    ) -> np.ndarray:
+        channels = self._channels_for_t(t)
+        ci = max(0, min(int(c), len(channels) - 1))
+        return np.asarray(channels[ci][z, y, x], dtype=np.float32)
 
 
 def _leica_microscope_type(metadata: dict) -> str:
@@ -3966,6 +4169,8 @@ class _DeconvolveWorker(QThread):
                     pass
             traceback.print_exc()
             self.finished.emit(exc)
+        finally:
+            _release_cuda_memory(synchronize=True)
 
 
 class _FitPsfWorker(QThread):
@@ -4189,6 +4394,8 @@ class _FitPsfWorker(QThread):
             if "Stopped by user" not in str(exc):
                 traceback.print_exc()
             self.finished.emit(exc)
+        finally:
+            _release_cuda_memory(synchronize=True)
 
 
 def _guess_fit_zp_um(channels, pixel_size_z_nm):
@@ -4280,6 +4487,1558 @@ class _SaveTSeriesWorker(QThread):
                     pass
 
 
+class _StreamingOmeroWorker(QThread):
+    """Stream a pyramidal OMERO image directly to OME-Zarr."""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source: _OmeroTimepointSource,
+        metadata: dict,
+        params: dict,
+        output_path: str,
+        *,
+        tile_size: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source = source
+        self.metadata = dict(metadata)
+        self.params = dict(params)
+        self.output_path = output_path
+        self.tile_size = int(tile_size)
+
+    def run(self):
+        monitor = None
+        try:
+            if self.params.get("method") == "ci_rl_dl":
+                raise RuntimeError("Streaming ci_rl_dl is not enabled yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.")
+
+            from core.streaming import (
+                ZarrPyramidSink,
+                deconvolve_streaming,
+                save_streaming_provenance,
+                suggest_streaming_tile_size,
+            )
+            from core.deconvolve_ci import (
+                ci_generate_psf,
+                ci_rl_deconvolve,
+                ci_sparse_hessian_deconvolve,
+            )
+
+            region_source = _OmeroPyramidRegionSource(self.source)
+            region_source.metadata.update(self.metadata)
+            region_source.metadata["size_t"] = region_source.shape[0]
+            region_source.metadata["size_c"] = region_source.shape[1]
+            region_source.metadata["size_z"] = region_source.shape[2]
+            region_source.metadata["size_y"] = region_source.shape[3]
+            region_source.metadata["size_x"] = region_source.shape[4]
+            if self.tile_size <= 0:
+                self.tile_size = suggest_streaming_tile_size(
+                    region_source.shape,
+                    psf_xy_est=_estimate_psf_xy_for_params(self.params),
+                    method=str(self.params.get("method", "ci_rl")),
+                    device=self.params.get("device"),
+                )
+
+            sink = ZarrPyramidSink(
+                self.output_path,
+                shape=region_source.shape,
+                metadata=region_source.metadata,
+                resume=True,
+            )
+            psf_cache: dict[int, np.ndarray] = {}
+            psf_pixel_size_z_cache: dict[int, float] = {}
+            self.progress.emit("")
+            self.progress.emit("Streaming OMERO deconvolution")
+            self.progress.emit(
+                f"  Shape       : T={region_source.shape[0]} C={region_source.shape[1]} "
+                f"Z={region_source.shape[2]} Y={region_source.shape[3]} X={region_source.shape[4]}"
+            )
+            self.progress.emit(f"  Method      : {self.params['method']}")
+            self.progress.emit(f"  Iterations  : {', '.join(str(n) for n in self.params['niter_list'])}")
+            self.progress.emit(f"  Tile size   : {self.tile_size} x {self.tile_size} px")
+            self.progress.emit(f"  Output      : {self.output_path}")
+
+            monitor = _RunMetricsMonitor()
+            monitor.start()
+
+            def _stopped() -> bool:
+                return bool(self.isInterruptionRequested())
+
+            def _psf_for_channel(ci: int) -> np.ndarray:
+                cached = psf_cache.get(ci)
+                if cached is not None:
+                    return cached
+                if _stopped():
+                    raise RuntimeError("Stopped by user")
+                em_list = self.params["emission_wavelengths"]
+                em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
+                ex_list = self.params["excitation_wavelengths"]
+                ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
+                if self.params["microscope_type"] != "confocal":
+                    ex_wl = None
+                pinhole_list = self.params["pinhole_airy_units"]
+                pinhole_airy = (
+                    pinhole_list[ci] if ci < len(pinhole_list)
+                    else pinhole_list[-1] if pinhole_list
+                    else _DEFAULT_PINHOLE_AIRY_UNITS
+                )
+                is_2d = region_source.shape[2] == 1
+                use_2d_wf_auto = (
+                    is_2d
+                    and self.params["microscope_type"] == "widefield"
+                    and self.params["method"] in ("ci_rl", "ci_rl_tv")
+                    and self.params["two_d_mode"] == "auto"
+                )
+                psf_pixel_size_z_nm = self.params["pixel_size_z_nm"]
+                if use_2d_wf_auto:
+                    n_z_psf = 65
+                    psf_pixel_size_z_nm = _estimate_two_d_wf_psf_z_nm(
+                        em_wl,
+                        self.params["na"],
+                        self.params["ri_sample"],
+                        self.params["pixel_size_xy_nm"],
+                    )
+                elif not is_2d:
+                    n_z_psf = max(2 * region_source.shape[2] - 1, 1) | 1
+                else:
+                    n_z_psf = 1
+
+                airy_radius_nm = 0.61 * em_wl / self.params["na"]
+                airy_radius_px = airy_radius_nm / self.params["pixel_size_xy_nm"]
+                n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+                if n_xy_psf % 2 == 0:
+                    n_xy_psf += 1
+                self.progress.emit(
+                    f"  Generating PSF for channel {ci + 1}/{region_source.shape[1]} "
+                    f"(lambda={em_wl:.0f} nm)..."
+                )
+                psf = ci_generate_psf(
+                    na=self.params["na"],
+                    wavelength_nm=em_wl,
+                    pixel_size_xy_nm=self.params["pixel_size_xy_nm"],
+                    pixel_size_z_nm=psf_pixel_size_z_nm,
+                    n_xy=n_xy_psf,
+                    n_z=n_z_psf,
+                    ri_immersion=self.params["ri_immersion"],
+                    ri_sample=self.params["ri_sample"],
+                    ri_coverslip=self.params["ri_immersion"],
+                    ri_coverslip_design=self.params["ri_immersion"],
+                    ri_immersion_design=self.params["ri_immersion"],
+                    t_g=self.params["t_g"],
+                    t_g0=self.params["t_g0"],
+                    t_i0=self.params["t_i0"],
+                    z_p=self.params["z_p"],
+                    microscope_type=self.params["microscope_type"],
+                    excitation_nm=ex_wl,
+                    pinhole_airy_units=pinhole_airy,
+                    integrate_pixels=self.params["integrate_pixels"],
+                    n_subpixels=self.params["n_subpixels"],
+                    n_pupil=self.params["n_pupil"],
+                    device=self.params["device"],
+                )
+                self.progress.emit(
+                    f"    Ch{ci}: PSF shape={psf.shape} sum={float(psf.sum()):.6g}"
+                )
+                psf_cache[ci] = psf
+                psf_pixel_size_z_cache[ci] = float(psf_pixel_size_z_nm)
+                return psf
+
+            def _deconvolve_tile(tile_img: np.ndarray, psf: np.ndarray, ci: int) -> np.ndarray:
+                if _stopped():
+                    raise RuntimeError("Stopped by user")
+                effective_psf = psf
+                use_2d_wf_auto = (
+                    tile_img.ndim == 2
+                    and self.params["microscope_type"] == "widefield"
+                    and self.params["method"] in ("ci_rl", "ci_rl_tv")
+                    and self.params["two_d_mode"] == "auto"
+                )
+                if tile_img.ndim == 2 and effective_psf.ndim == 3 and not use_2d_wf_auto:
+                    if effective_psf.shape[0] != 1:
+                        raise ValueError(f"Expected singleton-Z PSF for 2D tile, got {effective_psf.shape}")
+                    effective_psf = effective_psf[0]
+                elif tile_img.ndim == 3 and effective_psf.ndim == 2:
+                    effective_psf = effective_psf[np.newaxis, :, :]
+                if tile_img.ndim == 3 and effective_psf.ndim == 3 and effective_psf.shape[0] > tile_img.shape[0]:
+                    start = (effective_psf.shape[0] - tile_img.shape[0]) // 2
+                    effective_psf = effective_psf[start:start + tile_img.shape[0]]
+
+                niter_list = self.params["niter_list"]
+                niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
+                common = dict(
+                    niter=niter,
+                    offset=self.params["offset"],
+                    prefilter_sigma=self.params["prefilter_sigma"],
+                    start=self.params["start"],
+                    background=self.params["background"],
+                    convergence=self.params["convergence"],
+                    rel_threshold=self.params["rel_threshold"],
+                    check_every=self.params["check_every"],
+                    pixel_size_xy=self.params["pixel_size_xy_nm"],
+                    pixel_size_z=(
+                        psf_pixel_size_z_cache.get(ci, self.params["pixel_size_z_nm"])
+                        if use_2d_wf_auto
+                        else self.params["pixel_size_z_nm"]
+                    ),
+                    device=self.params["device"],
+                    tiling="none",
+                    iteration_callback=None,
+                    channel_index=ci,
+                )
+                if self.params["method"] == "ci_sparse_hessian":
+                    out = ci_sparse_hessian_deconvolve(
+                        tile_img,
+                        effective_psf,
+                        sparse_hessian_weight=self.params["sparse_hessian_weight"],
+                        sparse_hessian_reg=self.params["sparse_hessian_reg"],
+                        **common,
+                    )
+                else:
+                    out = ci_rl_deconvolve(
+                        tile_img,
+                        effective_psf,
+                        tv_lambda=self.params["tv_lambda"] if self.params["method"] == "ci_rl_tv" else 0.0,
+                        damping=self.params["damping"],
+                        microscope_type=self.params["microscope_type"],
+                        two_d_mode=self.params["two_d_mode"],
+                        two_d_wf_aggressiveness=self.params["two_d_wf_aggressiveness"],
+                        two_d_wf_bg_radius_um=self.params["two_d_wf_bg_radius_um"],
+                        two_d_wf_bg_scale=self.params["two_d_wf_bg_scale"],
+                        **common,
+                    )
+                if _stopped():
+                    raise RuntimeError("Stopped by user")
+                result = out["result"]
+                del out
+                _release_cuda_memory()
+                return result
+
+            def _progress(payload: dict) -> None:
+                if _stopped():
+                    raise RuntimeError("Stopped by user")
+                event = payload.get("event")
+                if event == "tile_start":
+                    self.progress.emit(
+                        f"  Tile {int(payload.get('done', 0)) + 1}/{int(payload.get('total', 0))}: "
+                        f"T={int(payload.get('timepoint', 0)) + 1} "
+                        f"C={int(payload.get('channel', 0)) + 1} "
+                        f"{payload.get('core')}"
+                    )
+                elif event == "tile_done":
+                    self.progress.emit(
+                        f"    Done {int(payload.get('done', 0))}/{int(payload.get('total', 0))} tiles"
+                    )
+                elif event == "pyramid_start":
+                    self.progress.emit("  Building OME-Zarr pyramid levels...")
+
+            summary = deconvolve_streaming(
+                region_source,
+                sink,
+                psf_for_channel=_psf_for_channel,
+                deconvolve_tile=_deconvolve_tile,
+                tile_yx=(self.tile_size, self.tile_size),
+                progress=_progress,
+                resume=True,
+                build_pyramids=True,
+            )
+            provenance = save_streaming_provenance(
+                str(Path(self.output_path).with_suffix(Path(self.output_path).suffix + ".provenance.json")),
+                source=region_source,
+                sink=sink,
+                params={
+                    "method": self.params["method"],
+                    "iterations": self.params["niter_list"],
+                    "tile_size": self.tile_size,
+                    "convergence": self.params["convergence"],
+                    "rel_threshold": self.params["rel_threshold"],
+                    "background": self.params["background"],
+                    "offset": self.params["offset"],
+                    "prefilter_sigma": self.params["prefilter_sigma"],
+                    "start": self.params["start"],
+                },
+                summary=summary,
+            )
+            metrics = monitor.stop() if monitor is not None else {}
+            for line in _resource_metric_lines(metrics):
+                self.progress.emit(line)
+            self.finished.emit({
+                "streaming_output": self.output_path,
+                "provenance": str(provenance),
+                "summary": summary,
+                "metrics": metrics,
+            })
+        except Exception as exc:
+            if monitor is not None:
+                try:
+                    metrics = monitor.stop()
+                    for line in _resource_metric_lines(metrics):
+                        self.progress.emit(line)
+                except Exception:
+                    pass
+            if "Stopped by user" not in str(exc):
+                traceback.print_exc()
+            self.finished.emit(exc)
+
+
+def _streaming_output_metadata(base_metadata: dict, params: dict, *, source_name: str = "") -> dict:
+    meta = dict(base_metadata or {})
+    if source_name:
+        meta.setdefault("name", source_name)
+    meta["pixel_size_x"] = float(params.get("pixel_size_xy_nm", 1000.0)) / 1000.0
+    meta["pixel_size_y"] = float(params.get("pixel_size_xy_nm", 1000.0)) / 1000.0
+    meta["pixel_size_z"] = float(params.get("pixel_size_z_nm", 1000.0)) / 1000.0
+    meta["na"] = params.get("na")
+    meta["refractive_index"] = params.get("ri_immersion")
+    meta["sample_refractive_index"] = params.get("ri_sample")
+    meta["microscope_type"] = params.get("microscope_type")
+    raw_channels = meta.get("channels", [])
+    if isinstance(raw_channels, dict):
+        raw_channels = [raw_channels]
+    elif not isinstance(raw_channels, Sequence) or isinstance(raw_channels, (str, bytes, bytearray)):
+        raw_channels = []
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in raw_channels]
+    size_c = max(int(meta.get("size_c", len(channels) or 1)), 1)
+    if len(channels) < size_c:
+        channels.extend({} for _ in range(size_c - len(channels)))
+    raw_names = meta.get("channel_names") or []
+    names = list(raw_names) if isinstance(raw_names, Sequence) and not isinstance(raw_names, (str, bytes, bytearray)) else []
+
+    def _param_value(key: str, ci: int):
+        values = list(params.get(key) or [])
+        if not values:
+            return None
+        return values[ci] if ci < len(values) else values[-1]
+
+    for ci in range(size_c):
+        ch = channels[ci]
+        ch.setdefault("name", names[ci] if ci < len(names) else _default_channel_name(ci))
+        emission = _param_value("emission_wavelengths", ci)
+        excitation = _param_value("excitation_wavelengths", ci)
+        pinhole = _param_value("pinhole_airy_units", ci)
+        if emission is not None:
+            ch["emission_wavelength"] = emission
+        if excitation is not None:
+            ch["excitation_wavelength"] = excitation
+        if pinhole is not None:
+            ch["pinhole_airy_units"] = pinhole
+    meta["channels"] = channels[:size_c]
+    meta["channel_names"] = [
+        str(ch.get("name") or ch.get("label") or _default_channel_name(i))
+        for i, ch in enumerate(meta["channels"])
+    ]
+    meta["cideconvolve_processing"] = {
+        "method": params.get("method"),
+        "iterations": list(params.get("niter_list", [])),
+        "convergence": params.get("convergence"),
+        "background": params.get("background"),
+        "offset": params.get("offset"),
+        "prefilter_sigma": params.get("prefilter_sigma"),
+        "tile_streaming": True,
+    }
+    return meta
+
+
+def _validate_channel_parameter_lists(params: dict, size_c: int) -> None:
+    # The interactive GUI already accepts short channel lists by reusing the
+    # final value for extra channels.  Batch mode follows that behaviour so one
+    # saved 3-channel settings file can still process a mixed 3/4-channel list.
+    return None
+
+
+def _estimate_psf_xy_for_params(params: dict) -> int:
+    na = max(float(params.get("na", 1.4) or 1.4), 1e-6)
+    pixel_size_xy_nm = max(float(params.get("pixel_size_xy_nm", 65.0) or 65.0), 1e-6)
+    emissions = list(params.get("emission_wavelengths") or [520.0])
+    max_xy = 65
+    for value in emissions:
+        try:
+            em_wl = float(value)
+        except (TypeError, ValueError):
+            em_wl = 520.0
+        airy_radius_nm = 0.61 * em_wl / na
+        airy_radius_px = airy_radius_nm / pixel_size_xy_nm
+        n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+        if n_xy_psf % 2 == 0:
+            n_xy_psf += 1
+        max_xy = max(max_xy, n_xy_psf)
+    return int(max_xy)
+
+
+def _batch_metadata_overlay(metadata: dict[str, Any]) -> dict[str, Any]:
+    overlay = dict(metadata or {})
+    raw_channels = overlay.get("channels")
+    if raw_channels is not None and (
+        not isinstance(raw_channels, Sequence)
+        or isinstance(raw_channels, (str, bytes, bytearray))
+    ):
+        overlay.pop("channels", None)
+    raw_names = overlay.get("channel_names")
+    if raw_names is not None and (
+        not isinstance(raw_names, Sequence)
+        or isinstance(raw_names, (str, bytes, bytearray))
+    ):
+        overlay.pop("channel_names", None)
+    return overlay
+
+
+def _run_streaming_deconvolution_job(
+    region_source,
+    *,
+    params: dict,
+    output_path: str,
+    output_format: str,
+    tile_size: int,
+    projection_mode: str = "Full stack",
+    progress: Optional[Callable[[dict], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict:
+    if params.get("method") == "ci_rl_dl":
+        raise RuntimeError("Batch streaming does not support ci_rl_dl yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.")
+
+    from core.streaming import (
+        ProjectionPyramidSink,
+        TiledOmeTiffSink,
+        ZarrPyramidSink,
+        deconvolve_streaming,
+        save_streaming_provenance,
+        suggest_streaming_tile_size,
+    )
+    from core.deconvolve_ci import (
+        ci_generate_psf,
+        ci_rl_deconvolve,
+        ci_sparse_hessian_deconvolve,
+    )
+
+    shape = tuple(int(v) for v in region_source.shape)
+    _validate_channel_parameter_lists(params, shape[1])
+    region_source.metadata = _streaming_output_metadata(region_source.metadata, params)
+    for axis, value in zip(("size_t", "size_c", "size_z", "size_y", "size_x"), shape):
+        region_source.metadata[axis] = int(value)
+
+    output_format_key = output_format.strip().lower()
+    projection_key = str(projection_mode or "Full stack").strip().lower()
+    project_output = shape[2] > 1 and projection_key not in {"", "full stack", "full", "none"}
+    sink_shape = (shape[0], shape[1], 1 if project_output else shape[2], shape[3], shape[4])
+    sink_metadata = dict(region_source.metadata)
+    if project_output:
+        sink_metadata["size_z"] = 1
+        sink_metadata["default_z"] = 0
+        sink_metadata["projection"] = projection_key
+        sink_metadata["cideconvolve_processing"] = dict(sink_metadata.get("cideconvolve_processing") or {})
+        sink_metadata["cideconvolve_processing"]["projection"] = projection_key
+
+    psf_xy_est = _estimate_psf_xy_for_params(params)
+    effective_tile_size = int(tile_size)
+    if effective_tile_size <= 0:
+        effective_tile_size = suggest_streaming_tile_size(
+            shape,
+            psf_xy_est=psf_xy_est,
+            method=str(params.get("method", "ci_rl")),
+            device=params.get("device"),
+        )
+        if progress is not None:
+            progress({
+                "event": "message",
+                "message": f"Auto tile size: {effective_tile_size} x {effective_tile_size} px",
+            })
+    else:
+        effective_tile_size = max(128, effective_tile_size)
+
+    def _make_sink():
+        if "tiff" in output_format_key:
+            base_sink = TiledOmeTiffSink(
+                output_path,
+                shape=sink_shape,
+                metadata=sink_metadata,
+                tile_yx=(512, 512),
+            )
+        else:
+            base_sink = ZarrPyramidSink(
+                output_path,
+                shape=sink_shape,
+                metadata=sink_metadata,
+                resume=False,
+            )
+        return (
+            ProjectionPyramidSink(base_sink, source_shape=shape, mode=projection_key)
+            if project_output
+            else base_sink
+        )
+
+    def _is_out_of_memory(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "out of memory" in text or "cuda oom" in text or ("cublas" in text and "alloc" in text)
+
+    def _clear_cuda_cache() -> None:
+        _release_cuda_memory(synchronize=True)
+
+    def _stopped() -> bool:
+        return bool(should_stop() if should_stop is not None else False)
+
+    psf_cache: dict[int, np.ndarray] = {}
+    psf_pixel_size_z_cache: dict[int, float] = {}
+
+    def _psf_for_channel(ci: int) -> np.ndarray:
+        cached = psf_cache.get(ci)
+        if cached is not None:
+            return cached
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+        em_list = params["emission_wavelengths"]
+        em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
+        ex_list = params["excitation_wavelengths"]
+        ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
+        if params["microscope_type"] != "confocal":
+            ex_wl = None
+        pinhole_list = params["pinhole_airy_units"]
+        pinhole_airy = (
+            pinhole_list[ci] if ci < len(pinhole_list)
+            else pinhole_list[-1] if pinhole_list
+            else _DEFAULT_PINHOLE_AIRY_UNITS
+        )
+        is_2d = shape[2] == 1
+        use_2d_wf_auto = (
+            is_2d
+            and params["microscope_type"] == "widefield"
+            and params["method"] in ("ci_rl", "ci_rl_tv")
+            and params["two_d_mode"] == "auto"
+        )
+        psf_pixel_size_z_nm = params["pixel_size_z_nm"]
+        if use_2d_wf_auto:
+            n_z_psf = 65
+            psf_pixel_size_z_nm = _estimate_two_d_wf_psf_z_nm(
+                em_wl,
+                params["na"],
+                params["ri_sample"],
+                params["pixel_size_xy_nm"],
+            )
+        elif not is_2d:
+            n_z_psf = max(2 * shape[2] - 1, 1) | 1
+        else:
+            n_z_psf = 1
+
+        airy_radius_nm = 0.61 * em_wl / params["na"]
+        airy_radius_px = airy_radius_nm / params["pixel_size_xy_nm"]
+        n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+        if n_xy_psf % 2 == 0:
+            n_xy_psf += 1
+        if progress is not None:
+            progress({"event": "message", "message": f"Generating PSF for channel {ci + 1}/{shape[1]}..."})
+        psf = ci_generate_psf(
+            na=params["na"],
+            wavelength_nm=em_wl,
+            pixel_size_xy_nm=params["pixel_size_xy_nm"],
+            pixel_size_z_nm=psf_pixel_size_z_nm,
+            n_xy=n_xy_psf,
+            n_z=n_z_psf,
+            ri_immersion=params["ri_immersion"],
+            ri_sample=params["ri_sample"],
+            ri_coverslip=params["ri_immersion"],
+            ri_coverslip_design=params["ri_immersion"],
+            ri_immersion_design=params["ri_immersion"],
+            t_g=params["t_g"],
+            t_g0=params["t_g0"],
+            t_i0=params["t_i0"],
+            z_p=params["z_p"],
+            microscope_type=params["microscope_type"],
+            excitation_nm=ex_wl,
+            pinhole_airy_units=pinhole_airy,
+            integrate_pixels=params["integrate_pixels"],
+            n_subpixels=params["n_subpixels"],
+            n_pupil=params["n_pupil"],
+            device=params["device"],
+        )
+        psf_cache[ci] = psf
+        psf_pixel_size_z_cache[ci] = float(psf_pixel_size_z_nm)
+        return psf
+
+    def _deconvolve_tile(tile_img: np.ndarray, psf: np.ndarray, ci: int) -> np.ndarray:
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+        effective_psf = psf
+        use_2d_wf_auto = (
+            tile_img.ndim == 2
+            and params["microscope_type"] == "widefield"
+            and params["method"] in ("ci_rl", "ci_rl_tv")
+            and params["two_d_mode"] == "auto"
+        )
+        if tile_img.ndim == 2 and effective_psf.ndim == 3 and not use_2d_wf_auto:
+            if effective_psf.shape[0] != 1:
+                raise ValueError(f"Expected singleton-Z PSF for 2D tile, got {effective_psf.shape}")
+            effective_psf = effective_psf[0]
+        elif tile_img.ndim == 3 and effective_psf.ndim == 2:
+            effective_psf = effective_psf[np.newaxis, :, :]
+        if tile_img.ndim == 3 and effective_psf.ndim == 3 and effective_psf.shape[0] > tile_img.shape[0]:
+            start = (effective_psf.shape[0] - tile_img.shape[0]) // 2
+            effective_psf = effective_psf[start:start + tile_img.shape[0]]
+
+        niter_list = params["niter_list"]
+        niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
+        common = dict(
+            niter=niter,
+            offset=params["offset"],
+            prefilter_sigma=params["prefilter_sigma"],
+            start=params["start"],
+            background=params["background"],
+            convergence=params["convergence"],
+            rel_threshold=params["rel_threshold"],
+            check_every=params["check_every"],
+            pixel_size_xy=params["pixel_size_xy_nm"],
+            pixel_size_z=(
+                psf_pixel_size_z_cache.get(ci, params["pixel_size_z_nm"])
+                if use_2d_wf_auto
+                else params["pixel_size_z_nm"]
+            ),
+            device=params["device"],
+            tiling="none",
+            iteration_callback=None,
+            channel_index=ci,
+        )
+        if params["method"] == "ci_sparse_hessian":
+            out = ci_sparse_hessian_deconvolve(
+                tile_img,
+                effective_psf,
+                sparse_hessian_weight=params["sparse_hessian_weight"],
+                sparse_hessian_reg=params["sparse_hessian_reg"],
+                **common,
+            )
+        else:
+            out = ci_rl_deconvolve(
+                tile_img,
+                effective_psf,
+                tv_lambda=params["tv_lambda"] if params["method"] == "ci_rl_tv" else 0.0,
+                damping=params["damping"],
+                microscope_type=params["microscope_type"],
+                two_d_mode=params["two_d_mode"],
+                two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
+                two_d_wf_bg_radius_um=params["two_d_wf_bg_radius_um"],
+                two_d_wf_bg_scale=params["two_d_wf_bg_scale"],
+                **common,
+            )
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+        result = out["result"]
+        del out
+        _release_cuda_memory()
+        return result
+
+    def _progress(payload: dict) -> None:
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+        if progress is not None:
+            progress(payload)
+
+    attempt_tile_size = max(128, int(effective_tile_size))
+    while True:
+        sink = _make_sink()
+        try:
+            summary = deconvolve_streaming(
+                region_source,
+                sink,
+                psf_for_channel=_psf_for_channel,
+                deconvolve_tile=_deconvolve_tile,
+                tile_yx=(attempt_tile_size, attempt_tile_size),
+                progress=_progress,
+                resume=False,
+                build_pyramids=True,
+            )
+            provenance = save_streaming_provenance(
+                str(Path(output_path).with_suffix(Path(output_path).suffix + ".provenance.json")),
+                source=region_source,
+                sink=sink,
+                params={
+                    "method": params.get("method"),
+                    "iterations": params.get("niter_list"),
+                    "tile_size": attempt_tile_size,
+                    "output_format": output_format,
+                    "projection": projection_key if project_output else "full_stack",
+                },
+                summary=summary,
+            )
+            break
+        except Exception as exc:
+            abort = getattr(sink, "abort", None)
+            if callable(abort):
+                abort()
+            if not _is_out_of_memory(exc) or attempt_tile_size <= 256:
+                raise
+            _clear_cuda_cache()
+            _delete_output_path(output_path)
+            next_tile_size = max(256, (attempt_tile_size // 2 // 64) * 64)
+            if next_tile_size >= attempt_tile_size:
+                next_tile_size = max(256, attempt_tile_size // 2)
+            if progress is not None:
+                progress({
+                    "event": "message",
+                    "message": f"GPU memory retry: reducing tile to {next_tile_size} x {next_tile_size} px",
+                })
+            attempt_tile_size = next_tile_size
+    return {"summary": summary, "provenance": str(provenance), "output": output_path}
+
+
+@dataclass
+class _BatchItem:
+    source_type: str
+    display_name: str
+    locator: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    source_obj: Any = None
+    output_dir: str = ""
+    status: str = "Queued"
+    progress: int = 0
+    output_path: str = ""
+    message: str = ""
+
+    def stable_key(self) -> str:
+        return f"{self.source_type}:{self.locator}"
+
+    def row_payload(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "progress": self.progress,
+            "source_type": self.source_type,
+            "display_name": self.display_name,
+            "shape": _batch_shape_label(self.metadata),
+            "output_dir": self.output_dir,
+            "output_path": self.output_path,
+            "message": self.message,
+        }
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "source_type": self.source_type,
+            "display_name": self.display_name,
+            "locator": self.locator,
+            "metadata": dict(self.metadata),
+            "output_dir": self.output_dir,
+            "status": self.status,
+            "progress": self.progress,
+            "output_path": self.output_path,
+            "message": self.message,
+        }
+
+
+def _batch_shape_label(metadata: dict) -> str:
+    try:
+        t = int(metadata.get("size_t", 1))
+        c = int(metadata.get("size_c", 1))
+        z = int(metadata.get("size_z", 1))
+        y = int(metadata.get("size_y", 0))
+        x = int(metadata.get("size_x", 0))
+        if y and x:
+            return f"T{t} C{c} Z{z} {y}x{x}"
+    except Exception:
+        pass
+    return ""
+
+
+def _format_batch_output_display(path_text: str, *, max_chars: int = 96) -> str:
+    text = str(path_text or "")
+    if not text:
+        return ""
+    name = text.rstrip("\\/").replace("\\", "/").split("/")[-1]
+    if len(name) <= max_chars:
+        return name
+    keep = max(8, max_chars - 3)
+    head = max(4, keep // 3)
+    tail = max(4, keep - head)
+    return f"{name[:head]}...{name[-tail:]}"
+
+
+def _format_batch_folder_display(path_text: str, *, max_chars: int = 44) -> str:
+    text = str(path_text or "").strip().rstrip("\\/")
+    if not text:
+        return ""
+    parts = [p for p in text.replace("\\", "/").split("/") if p]
+    if not parts:
+        return text
+    leaf = parts[-1]
+    if len(parts) == 1 or len(leaf) >= max_chars:
+        name = leaf
+    else:
+        parent = parts[-2] if len(parts) >= 2 else ""
+        name = f".../{parent}/{leaf}" if parent else leaf
+        if len(name) > max_chars:
+            name = f".../{leaf}"
+    if len(name) <= max_chars:
+        return name
+    keep = max(8, max_chars - 3)
+    head = max(4, keep // 3)
+    tail = max(4, keep - head)
+    return f"{name[:head]}...{name[-tail:]}"
+
+
+def _batch_source_stem(name: str) -> str:
+    stem = str(name or "image").strip().rstrip("\\/").replace("\\", "/").split("/")[-1]
+    lower = stem.lower()
+    for suffix in (".ome.tiff", ".ome.tif", ".ome.zarr", ".tiff", ".tif", ".zarr"):
+        if lower.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return _safe_filename_stem(stem or "image")
+
+
+def _batch_output_base_name(item: _BatchItem) -> str:
+    if item.source_type == "leica":
+        save_child_name = item.metadata.get("save_child_name")
+        leica_context = item.metadata.get("leica_context")
+        if not save_child_name and isinstance(leica_context, dict):
+            save_child_name = leica_context.get("save_child_name")
+        if save_child_name:
+            return str(save_child_name)
+    return item.display_name
+
+
+def _batch_output_path(
+    item: _BatchItem,
+    output_dir: str | Path,
+    output_format: str,
+    params: dict,
+    projection_mode: str = "Full stack",
+) -> str:
+    del params
+    projection_key = str(projection_mode or "Full stack").strip().lower()
+    size_z = int(item.metadata.get("size_z", 1) or 1)
+    projection_tag = ""
+    if size_z > 1 and projection_key not in {"", "full stack", "full", "none"}:
+        projection_tag = f"_{_safe_filename_stem(projection_key)}"
+    stem = _safe_filename_stem(f"{_batch_source_stem(_batch_output_base_name(item))}_decon{projection_tag}")
+    suffix = ".ome.tiff" if "tiff" in output_format.lower() else ".ome.zarr"
+    return str(Path(output_dir) / f"{stem}{suffix}")
+
+
+def _delete_output_path(path_text: str) -> None:
+    path = Path(path_text)
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _metadata_from_region_source(source) -> dict[str, Any]:
+    meta = dict(getattr(source, "metadata", {}) or {})
+    shape = tuple(int(v) for v in getattr(source, "shape", (1, 1, 1, 0, 0)))
+    for axis, value in zip(("size_t", "size_c", "size_z", "size_y", "size_x"), shape):
+        meta[axis] = value
+    return meta
+
+
+def _file_or_zarr_batch_item(path_text: str, source_type: str) -> _BatchItem:
+    path = Path(path_text)
+    meta: dict[str, Any] = {"name": path.name}
+    message = ""
+    try:
+        from core.streaming import open_region_source
+        source = open_region_source(path)
+        meta.update(_metadata_from_region_source(source))
+    except Exception as exc:
+        message = f"Metadata probe deferred: {exc}"
+    return _BatchItem(
+        source_type=source_type,
+        display_name=path.name,
+        locator=str(path),
+        metadata=meta,
+        message=message,
+    )
+
+
+class _BatchDeconvolveWorker(QThread):
+    item_changed = pyqtSignal(int, object)
+    log = pyqtSignal(str)
+    finished = pyqtSignal(object)
+
+    def __init__(
+        self,
+        items: list[_BatchItem],
+        params: dict,
+        output_dir: str,
+        output_format: str,
+        *,
+        projection_mode: str = "Full stack",
+        tile_size: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.items = items
+        self.params = dict(params)
+        self.output_dir = output_dir
+        self.output_format = output_format
+        self.projection_mode = str(projection_mode or "Full stack")
+        self.tile_size = int(tile_size)
+
+    def _emit_item(self, index: int, **updates: Any) -> None:
+        item = self.items[index]
+        for key, value in updates.items():
+            setattr(item, key, value)
+        self.item_changed.emit(index, item.row_payload())
+
+    def _open_region_source(self, item: _BatchItem):
+        if item.source_type in ("file", "zarr"):
+            from core.streaming import open_region_source
+            return open_region_source(item.locator)
+        if item.source_type == "omero":
+            source = _build_omero_source(item.source_obj)
+            if bool(getattr(source, "is_pyramidal", False)):
+                return _OmeroPyramidRegionSource(source)
+            return _TimepointRegionSource(source, source_id=f"omero:{item.locator}")
+        if item.source_type == "leica":
+            source = _build_leica_source(item.source_obj)
+            return _TimepointRegionSource(source, source_id=f"leica:{item.locator}")
+        raise ValueError(f"Unsupported source type: {item.source_type}")
+
+    def run(self):
+        cancelled = False
+        for index, item in enumerate(self.items):
+            if self.isInterruptionRequested():
+                cancelled = True
+                break
+            if item.status == "Done":
+                continue
+            monitor = None
+            try:
+                item_output_dir = item.output_dir or self.output_dir
+                Path(item_output_dir).expanduser().mkdir(parents=True, exist_ok=True)
+                output_path = _batch_output_path(
+                    item,
+                    item_output_dir,
+                    self.output_format,
+                    self.params,
+                    self.projection_mode,
+                )
+                self._emit_item(index, status="Running", progress=0, output_path=output_path, message="Opening source")
+                self.log.emit(f"Batch: opening {item.display_name}")
+                source = self._open_region_source(item)
+                self._emit_item(index, message="Validating metadata", progress=0)
+                source.metadata.update(_batch_metadata_overlay(item.metadata))
+                source.metadata.update(_streaming_output_metadata(source.metadata, self.params, source_name=item.display_name))
+                item.metadata.update(_metadata_from_region_source(source))
+                _validate_channel_parameter_lists(self.params, int(source.shape[1]))
+                self._emit_item(index, message="Preparing output", progress=0)
+
+                _delete_output_path(output_path)
+                monitor = _RunMetricsMonitor()
+                monitor.start()
+
+                def _progress(payload: dict) -> None:
+                    event = payload.get("event")
+                    if event == "tile_done":
+                        done = int(payload.get("done", 0))
+                        total = max(int(payload.get("total", 1)), 1)
+                        tile_index = int(payload.get("tile_index", 0)) + 1
+                        tile_count = max(int(payload.get("tile_count", 1)), 1)
+                        self._emit_item(
+                            index,
+                            progress=min(99, int(done * 100 / total)),
+                            message=f"Done tile {tile_index}/{tile_count} ({done}/{total} total)",
+                        )
+                    elif event == "tile_start":
+                        done = int(payload.get("done", 0))
+                        total = max(int(payload.get("total", 1)), 1)
+                        tile_index = int(payload.get("tile_index", 0)) + 1
+                        tile_count = max(int(payload.get("tile_count", 1)), 1)
+                        timepoint = int(payload.get("timepoint", 0)) + 1
+                        channel = int(payload.get("channel", 0)) + 1
+                        self._emit_item(
+                            index,
+                            progress=min(98, int(done * 100 / total)),
+                            message=f"Processing tile {tile_index}/{tile_count} (T{timepoint} C{channel})",
+                        )
+                    elif event == "pyramid_start":
+                        self._emit_item(index, progress=99, message="Building pyramid")
+                    elif event == "message":
+                        self._emit_item(index, message=str(payload.get("message", "")))
+
+                result = _run_streaming_deconvolution_job(
+                    source,
+                    params=self.params,
+                    output_path=output_path,
+                    output_format=self.output_format,
+                    tile_size=self.tile_size,
+                    projection_mode=self.projection_mode,
+                    progress=_progress,
+                    should_stop=self.isInterruptionRequested,
+                )
+                metrics = monitor.stop() if monitor is not None else {}
+                self._emit_item(index, status="Done", progress=100, message="Done", output_path=output_path)
+                self.log.emit(f"Batch: done {item.display_name} -> {output_path}")
+                for line in _resource_metric_lines(metrics):
+                    self.log.emit(f"  {line}")
+                self.log.emit(f"  Provenance: {result.get('provenance')}")
+            except Exception as exc:
+                if monitor is not None:
+                    try:
+                        monitor.stop()
+                    except Exception:
+                        pass
+                if "Stopped by user" in str(exc) or self.isInterruptionRequested():
+                    self._emit_item(index, status="Cancelled", progress=max(item.progress, 0), message="Cancelled")
+                    cancelled = True
+                    break
+                message = str(exc) or exc.__class__.__name__
+                self._emit_item(index, status="Failed", message=message)
+                self.log.emit(f"Batch: failed {item.display_name}: {message}")
+                self.log.emit(traceback.format_exc())
+                continue
+            finally:
+                _release_cuda_memory(synchronize=True)
+        self.finished.emit({"cancelled": cancelled})
+
+
+class _BatchDeconvolverDialog(QDialog):
+    _STATUS_STYLE = {
+        "Queued": ("#2b2b2b", "#d9d9d9", "#8f9aa6"),
+        "Running": ("#172b3a", "#d7ecff", "#5db2ff"),
+        "Done": ("#193226", "#dff5e5", "#58c878"),
+        "Failed": ("#3a2023", "#ffd9d9", "#ff7676"),
+        "Cancelled": ("#3a321f", "#ffe6ad", "#e5b84f"),
+    }
+
+    def __init__(self, host, parent=None):
+        super().__init__(parent or host)
+        self._host = host
+        self._items: list[_BatchItem] = []
+        self._worker: Optional[_BatchDeconvolveWorker] = None
+        self._batch_started_at: Optional[float] = None
+        self._batch_finished_at: Optional[float] = None
+        self._batch_active_rows: list[int] = []
+        self._batch_status_label = "Ready"
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setInterval(1000)
+        self._batch_timer.timeout.connect(self._update_batch_status)
+        self.setWindowTitle("Batch Deconvolver")
+        self.setMinimumSize(1120, 620)
+        self.setModal(False)
+        self._build_ui()
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None:
+            QMessageBox.information(self, "Batch Running", "Stop or wait for the current batch before closing this dialog.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        add_bar = QHBoxLayout()
+        btn_open = QPushButton("Open\u2026")
+        btn_open.clicked.connect(self._on_add_files)
+        add_bar.addWidget(btn_open)
+        btn_zarr = QPushButton("Open Zarr\u2026")
+        btn_zarr.clicked.connect(self._on_add_zarr)
+        add_bar.addWidget(btn_zarr)
+        btn_leica = QPushButton("Open Leica\u2026")
+        btn_leica.clicked.connect(self._on_add_leica)
+        add_bar.addWidget(btn_leica)
+        btn_omero = QPushButton("Open OMERO\u2026")
+        btn_omero.clicked.connect(self._on_add_omero)
+        add_bar.addWidget(btn_omero)
+        add_bar.addStretch()
+        layout.addLayout(add_bar)
+
+        settings_row = QHBoxLayout()
+        self._settings_path = QLineEdit()
+        self._settings_path.setPlaceholderText("Saved settings JSON")
+        settings_row.addWidget(QLabel("Settings:"))
+        settings_row.addWidget(self._settings_path, stretch=1)
+        btn_settings = QPushButton("Browse\u2026")
+        btn_settings.clicked.connect(self._choose_settings)
+        settings_row.addWidget(btn_settings)
+        layout.addLayout(settings_row)
+
+        output_row = QHBoxLayout()
+        self._output_dir = QLineEdit(str(_default_downloads_dir()))
+        output_row.addWidget(QLabel("Output folder:"))
+        output_row.addWidget(self._output_dir, stretch=1)
+        btn_output = QPushButton("Browse\u2026")
+        btn_output.clicked.connect(self._choose_output_dir)
+        output_row.addWidget(btn_output)
+        self._format_combo = QComboBox()
+        self._format_combo.addItems(["OME-TIFF", "OME-Zarr"])
+        output_row.addWidget(QLabel("Format:"))
+        output_row.addWidget(self._format_combo)
+        self._projection_combo = QComboBox()
+        self._projection_combo.addItems(["Full stack", "MIP", "SUM", "Mean"])
+        self._projection_combo.setToolTip("For 3D images, save only a Z projection instead of the full Z stack.")
+        output_row.addWidget(QLabel("Z output:"))
+        output_row.addWidget(self._projection_combo)
+        layout.addLayout(output_row)
+
+        self._table = QTableWidget(0, 8)
+        self._table.setHorizontalHeaderLabels([
+            "Status", "Progress", "Source", "Name", "Shape", "Folder", "Output", "Message"
+        ])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._table.verticalHeader().setDefaultSectionSize(30)
+        self._table.setStyleSheet(
+            """
+            QTableWidget {
+                gridline-color: #3a3a3a;
+                alternate-background-color: #252525;
+                selection-background-color: #244a64;
+                selection-color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #343434;
+                color: #f0f0f0;
+                padding: 5px 7px;
+                border: 0;
+                border-right: 1px solid #464646;
+                border-bottom: 1px solid #464646;
+                font-weight: 600;
+            }
+            QTableCornerButton::section {
+                background-color: #343434;
+                border: 0;
+            }
+            """
+        )
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table, stretch=1)
+
+        action_row = QHBoxLayout()
+        self._btn_remove = QPushButton("Remove Selected")
+        self._btn_remove.clicked.connect(self._remove_selected)
+        action_row.addWidget(self._btn_remove)
+        self._btn_reset = QPushButton("Reset Selected")
+        self._btn_reset.clicked.connect(self._reset_selected)
+        action_row.addWidget(self._btn_reset)
+        self._btn_clear = QPushButton("Clear Completed/Failed")
+        self._btn_clear.clicked.connect(self._clear_finished)
+        action_row.addWidget(self._btn_clear)
+        action_row.addStretch()
+        self._btn_start = QPushButton("Start")
+        self._btn_start.clicked.connect(self._on_start_stop_batch)
+        action_row.addWidget(self._btn_start)
+        layout.addLayout(action_row)
+
+        self._batch_status = QStatusBar(self)
+        self._batch_status.setSizeGripEnabled(False)
+        self._batch_status.showMessage("Ready")
+        layout.addWidget(self._batch_status)
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({idx.row() for idx in self._table.selectedIndexes()}, reverse=True)
+
+    def _set_running(self, running: bool) -> None:
+        self._btn_start.setEnabled(True)
+        self._btn_start.setText("Stop" if running else "Start")
+        self._btn_start.setToolTip(
+            "Stop after the current tile/plane checkpoint"
+            if running else
+            "Start the queued batch"
+        )
+        self._btn_start.setStyleSheet(
+            "QPushButton { background-color: #8a3b3b; color: white; font-weight: bold; padding: 6px 14px; }"
+            if running else
+            ""
+        )
+        self._btn_remove.setEnabled(not running)
+        self._btn_reset.setEnabled(not running)
+        self._btn_clear.setEnabled(not running)
+
+    def _batch_completed_units(self) -> float:
+        units = 0.0
+        active_rows = self._batch_active_rows or [
+            i for i, item in enumerate(self._items) if item.status != "Done"
+        ]
+        for row in active_rows:
+            if row < 0 or row >= len(self._items):
+                continue
+            item = self._items[row]
+            if item.status in {"Done", "Failed", "Cancelled"}:
+                units += 1.0
+            elif item.status == "Running":
+                units += max(0.0, min(float(item.progress) / 100.0, 0.99))
+        return units
+
+    def _reset_batch_status_clock_if_idle(self) -> None:
+        if self._worker is not None:
+            return
+        self._batch_timer.stop()
+        self._batch_started_at = None
+        self._batch_finished_at = None
+        self._batch_active_rows = []
+        self._batch_status_label = "Ready"
+
+    def _update_batch_status(self) -> None:
+        status_bar = getattr(self, "_batch_status", None)
+        if status_bar is None:
+            return
+        if self._batch_started_at is None:
+            queued = sum(1 for item in self._items if item.status == "Queued")
+            status_bar.showMessage(f"Ready | {queued} queued")
+            return
+
+        now = self._batch_finished_at or time.time()
+        elapsed = max(0.0, now - self._batch_started_at)
+        total = max(len(self._batch_active_rows), 1)
+        completed = min(self._batch_completed_units(), float(total))
+
+        if self._batch_finished_at is not None:
+            eta = 0.0
+            end_ts = self._batch_finished_at
+        elif completed > 0.0:
+            seconds_per_image = elapsed / completed
+            eta = max(0.0, seconds_per_image * (total - completed))
+            end_ts = time.time() + eta
+        else:
+            eta = None
+            end_ts = None
+
+        eta_text = _format_duration_hm(eta) if eta is not None else "--:--"
+        end_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(end_ts)) if end_ts else "--"
+        status_bar.showMessage(
+            f"{self._batch_status_label} | "
+            f"Elapsed {_format_duration_hm(elapsed)} | "
+            f"ETA {eta_text} | "
+            f"End {end_text} | "
+            f"Images {completed:.1f}/{total}"
+        )
+
+    def _on_start_stop_batch(self) -> None:
+        if self._worker is not None:
+            self._stop_batch()
+            return
+        self._start_batch()
+
+    def _add_items(self, items: Sequence[_BatchItem]) -> None:
+        existing = {item.stable_key() for item in self._items}
+        output_dir = self._output_dir.text().strip()
+        for item in items:
+            if item.stable_key() in existing:
+                continue
+            if not item.output_dir:
+                item.output_dir = output_dir
+            self._items.append(item)
+            existing.add(item.stable_key())
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._update_row(row, item.row_payload())
+        self._reset_batch_status_clock_if_idle()
+        self._update_batch_status()
+
+    def _update_row(self, row: int, payload: dict[str, Any]) -> None:
+        values = [
+            str(payload.get("status", "")),
+            f"{int(payload.get('progress', 0))}%",
+            str(payload.get("source_type", "")),
+            str(payload.get("display_name", "")),
+            str(payload.get("shape", "")),
+            _format_batch_folder_display(str(payload.get("output_dir", ""))),
+            _format_batch_output_display(str(payload.get("output_path", ""))),
+            str(payload.get("message", "")),
+        ]
+        full_values = [
+            str(payload.get("status", "")),
+            f"{int(payload.get('progress', 0))}%",
+            str(payload.get("source_type", "")),
+            str(payload.get("display_name", "")),
+            str(payload.get("shape", "")),
+            str(payload.get("output_dir", "")),
+            str(payload.get("output_path", "")),
+            str(payload.get("message", "")),
+        ]
+        status = values[0]
+        row_bg, row_fg, accent = self._STATUS_STYLE.get(status, self._STATUS_STYLE["Queued"])
+        bg_brush = QBrush(QColor(row_bg))
+        fg_brush = QBrush(QColor(row_fg))
+        accent_brush = QBrush(QColor(accent))
+        for col, text in enumerate(values):
+            item = self._table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem()
+                self._table.setItem(row, col, item)
+            item.setText(text)
+            item.setBackground(bg_brush)
+            item.setForeground(accent_brush if col in (0, 1) else fg_brush)
+            item.setToolTip(full_values[col])
+            if col in (0, 1, 2, 4):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            font = item.font()
+            font.setBold(col == 0)
+            item.setFont(font)
+
+    def _on_add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add Images",
+            self._host._last_open_dir,
+            "Images (*.ome.tiff *.ome.tif *.tiff *.tif *.nd2 *.czi *.lif);;All Files (*)",
+        )
+        if not paths:
+            return
+        self._host._last_open_dir = str(Path(paths[0]).parent)
+        self._add_items([_file_or_zarr_batch_item(path, "file") for path in paths])
+
+    def _on_add_zarr(self) -> None:
+        dialog = QFileDialog(self, "Add OME-Zarr Folders", self._host._last_zarr_dir)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        for view_type in (QListView, QTreeView):
+            for view in dialog.findChildren(view_type):
+                view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        paths = [p for p in dialog.selectedFiles() if p]
+        if not paths:
+            return
+        self._host._last_zarr_dir = str(Path(paths[0]).parent)
+        self._add_items([_file_or_zarr_batch_item(path, "zarr") for path in paths])
+
+    def _on_add_leica(self) -> None:
+        try:
+            from leica_browser_qt import LeicaBrowserDialog
+        except ImportError:
+            QMessageBox.critical(self, "Leica Browser Missing", "leica-browser-qt is not installed.")
+            return
+        start_dir = _accessible_directory_or_home(self._host._last_leica_dir)
+        dialog = LeicaBrowserDialog(roots=[start_dir], selection_mode="multiple", parent=self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        browsed_root = self._host._leica_dialog_current_root(dialog)
+        if browsed_root is not None:
+            self._host._set_last_leica_dir(browsed_root, persist=True)
+        if not accepted:
+            return
+        if hasattr(dialog, "selected_contexts"):
+            contexts = list(dialog.selected_contexts() or [])
+        else:
+            context = dialog.selected_context()
+            contexts = [context] if context is not None else []
+        items = []
+        for ctx in contexts:
+            meta = dict(getattr(ctx, "metadata", {}) or {})
+            meta.update({
+                "name": getattr(ctx, "name", "Leica image"),
+                "size_t": max(int(getattr(ctx, "size_t", 1) or meta.get("ts", 1)), 1),
+                "size_c": max(int(getattr(ctx, "size_c", 1) or meta.get("channels", 1)), 1),
+                "size_z": max(int(getattr(ctx, "size_z", 1) or meta.get("zs", 1)), 1),
+                "size_y": max(int(getattr(ctx, "size_y", 0) or meta.get("ys", 0)), 0),
+                "size_x": max(int(getattr(ctx, "size_x", 0) or meta.get("xs", 0)), 0),
+                "leica_context": ctx.to_dict() if hasattr(ctx, "to_dict") else {},
+            })
+            locator = f"{getattr(ctx, 'container_path', '')}::{getattr(ctx, 'internal_path', getattr(ctx, 'name', ''))}"
+            display_name = _batch_output_base_name(
+                _BatchItem("leica", str(getattr(ctx, "name", "Leica image")), locator, meta)
+            )
+            items.append(_BatchItem("leica", display_name, locator, meta, source_obj=ctx))
+        self._add_items(items)
+
+    def _on_add_omero(self) -> None:
+        try:
+            from omero_browser_qt import LoginDialog, OmeroBrowserDialog, OmeroGateway
+        except ImportError:
+            QMessageBox.warning(self, "OMERO not available", "omero-browser-qt is not installed.")
+            return
+        if self._host._omero_gw is None:
+            try:
+                self._host._omero_gw = OmeroGateway()
+            except RuntimeError:
+                from PyQt6.QtCore import QObject as _QObj
+                inst = OmeroGateway._instance
+                _QObj.__init__(inst)
+                OmeroGateway.__init__(inst)
+                self._host._omero_gw = inst
+        gw = self._host._omero_gw
+        if gw.is_connected() and not self._host._omero_session_is_reusable():
+            gw.disconnect()
+            self._host._omero_session_deadline = 0.0
+        if not self._host._omero_session_is_reusable():
+            dlg = LoginDialog(self, gateway=gw)
+            self._host._configure_omero_login_dialog(dlg)
+            if dlg.exec() != LoginDialog.DialogCode.Accepted:
+                return
+            self._host._refresh_omero_session_deadline()
+        else:
+            self._host._refresh_omero_session_deadline()
+        browser = OmeroBrowserDialog(self, gateway=gw, multiselect=True)
+        if browser.exec() != OmeroBrowserDialog.DialogCode.Accepted:
+            return
+        self._host._refresh_omero_session_deadline()
+        images = list(browser.get_selected_images() or [])
+        items = []
+        for image in images:
+            image_id = image.getId() if hasattr(image, "getId") else id(image)
+            name = image.getName() if hasattr(image, "getName") else f"OMERO image {image_id}"
+            meta = {"name": name, "id": image_id}
+            try:
+                source = _build_omero_source(image)
+                meta.update(dict(source.metadata))
+            except Exception as exc:
+                meta["probe_error"] = str(exc)
+            items.append(_BatchItem("omero", str(name), str(image_id), meta, source_obj=image))
+        self._add_items(items)
+
+    def _choose_settings(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Batch Settings",
+            self._host._last_settings_dir,
+            "JSON Settings (*.json);;All Files (*)",
+        )
+        if path:
+            self._host._last_settings_dir = str(Path(path).parent)
+            self._settings_path.setText(path)
+
+    def _choose_output_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose Output Folder", self._output_dir.text().strip())
+        if path:
+            self._output_dir.setText(path)
+
+    def _remove_selected(self) -> None:
+        for row in self._selected_rows():
+            del self._items[row]
+            self._table.removeRow(row)
+        self._reset_batch_status_clock_if_idle()
+        self._update_batch_status()
+
+    def _reset_selected(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            rows = list(range(len(self._items) - 1, -1, -1))
+        for row in rows:
+            item = self._items[row]
+            item.status = "Queued"
+            item.progress = 0
+            item.message = ""
+            self._update_row(row, item.row_payload())
+        self._reset_batch_status_clock_if_idle()
+        self._update_batch_status()
+
+    def _clear_finished(self) -> None:
+        for row in range(len(self._items) - 1, -1, -1):
+            if self._items[row].status in {"Done", "Failed", "Cancelled"}:
+                del self._items[row]
+                self._table.removeRow(row)
+        self._reset_batch_status_clock_if_idle()
+        self._update_batch_status()
+
+    def _load_batch_params(self) -> dict:
+        settings_path = Path(self._settings_path.text().strip())
+        if not settings_path.is_file():
+            raise ValueError("Choose a saved settings JSON before starting the batch.")
+        with settings_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        self._host._apply_settings(data)
+        params = self._host._collect_params()
+        params["movie"] = {"enabled": False}
+        params["compute_metrics"] = False
+        return params
+
+    def _start_batch(self) -> None:
+        if self._worker is not None:
+            return
+        if not self._items:
+            QMessageBox.information(self, "Batch Deconvolver", "Add at least one image first.")
+            return
+        try:
+            params = self._load_batch_params()
+            default_output_dir = Path(self._output_dir.text().strip()).expanduser()
+            default_output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Batch Setup Error", str(exc))
+            return
+        worker_items = []
+        try:
+            for row, item in enumerate(self._items):
+                item_output_dir = str(Path(item.output_dir or default_output_dir).expanduser())
+                Path(item_output_dir).mkdir(parents=True, exist_ok=True)
+                if not item.output_dir:
+                    item.output_dir = item_output_dir
+                    self._update_row(row, item.row_payload())
+                worker_items.append(_BatchItem(
+                    item.source_type,
+                    item.display_name,
+                    item.locator,
+                    dict(item.metadata),
+                    source_obj=item.source_obj,
+                    output_dir=item_output_dir,
+                    status=item.status,
+                    progress=item.progress,
+                    output_path=item.output_path,
+                    message=item.message,
+                ))
+        except Exception as exc:
+            QMessageBox.critical(self, "Batch Setup Error", f"Could not create output folder: {exc}")
+            return
+        self._batch_started_at = time.time()
+        self._batch_finished_at = None
+        self._batch_active_rows = [
+            row for row, item in enumerate(self._items) if item.status != "Done"
+        ]
+        self._batch_status_label = "Running"
+        self._batch_timer.start()
+        self._update_batch_status()
+        self._set_running(True)
+        self._worker = _BatchDeconvolveWorker(
+            worker_items,
+            params,
+            str(default_output_dir),
+            self._format_combo.currentText(),
+            projection_mode=self._projection_combo.currentText(),
+            parent=self,
+        )
+        self._worker.item_changed.connect(self._on_worker_item_changed)
+        self._worker.log.connect(self._host._log)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.start()
+
+    def _stop_batch(self) -> None:
+        if self._worker is not None:
+            self._worker.requestInterruption()
+            _release_cuda_memory(synchronize=True)
+            self._batch_status_label = "Stopping"
+            self._update_batch_status()
+            self._btn_start.setEnabled(False)
+            self._btn_start.setText("Stopping...")
+            self._btn_start.setToolTip("Waiting for the current checkpoint to stop")
+
+    def _on_worker_item_changed(self, row: int, payload: object) -> None:
+        if not isinstance(payload, dict) or row < 0 or row >= len(self._items):
+            return
+        item = self._items[row]
+        item.status = str(payload.get("status", item.status))
+        item.progress = int(payload.get("progress", item.progress) or 0)
+        item.output_dir = str(payload.get("output_dir", item.output_dir))
+        item.output_path = str(payload.get("output_path", item.output_path))
+        item.message = str(payload.get("message", item.message))
+        self._update_row(row, payload)
+        self._update_batch_status()
+
+    def _on_worker_finished(self, result: object) -> None:
+        self._worker = None
+        self._set_running(False)
+        _release_cuda_memory(synchronize=True)
+        self._batch_timer.stop()
+        self._batch_finished_at = time.time()
+        if isinstance(result, dict) and result.get("cancelled"):
+            self._batch_status_label = "Cancelled"
+            self._host._status.showMessage("Batch cancelled", 5000)
+        else:
+            self._batch_status_label = "Complete"
+            self._host._status.showMessage("Batch complete", 5000)
+        self._update_batch_status()
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -4323,6 +6082,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._fit_psf_started_at: Optional[float] = None
         self._monitor: Optional[_ResourceMonitor] = None
         self._log_dialog: Optional[_LogDialog] = None
+        self._batch_dialog: Optional[_BatchDeconvolverDialog] = None
         self._log_lines: list[str] = []
         self._log_running = False
         self._compute_image_metrics = False
@@ -5153,6 +6913,11 @@ class DeconvolveCIWindow(QMainWindow):
         btn_open_omero.clicked.connect(self._on_open_omero)
         bottom.addWidget(btn_open_omero)
 
+        btn_batch = QPushButton("Batch\u2026")
+        btn_batch.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn_batch.clicked.connect(self._on_batch_deconvolver)
+        bottom.addWidget(btn_batch)
+
         middle_bar = QWidget()
         middle_bar.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -5548,6 +7313,14 @@ class DeconvolveCIWindow(QMainWindow):
             self._last_zarr_dir = str(Path(path).parent)
             self._do_load(path)
 
+    def _on_batch_deconvolver(self):
+        if self._batch_dialog is None:
+            self._batch_dialog = _BatchDeconvolverDialog(self, parent=self)
+            self._batch_dialog.finished.connect(lambda _=None: setattr(self, "_batch_dialog", None))
+        self._batch_dialog.show()
+        self._batch_dialog.raise_()
+        self._batch_dialog.activateWindow()
+
     def _on_open_leica(self):
         try:
             from leica_browser_qt import LeicaBrowserDialog
@@ -5717,23 +7490,37 @@ class DeconvolveCIWindow(QMainWindow):
         self._viewer.set_input_data([], self._metadata)
         self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
         self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
-
         size_t = self._metadata.get("size_t", 1)
         size_z = self._metadata.get("size_z", 1)
         size_y = self._metadata.get("size_y", "?")
         size_x = self._metadata.get("size_x", "?")
+        source_is_pyramidal = bool(getattr(source, "is_pyramidal", False))
+        if source_is_pyramidal:
+            provider = getattr(source, "tile_provider", None)
+            full_size = provider.full_size() if provider is not None else (size_y, size_x)
+            n_levels = getattr(provider, "n_levels", "?")
+            self._log(
+                "Large OMERO pyramid detected: using streamed pyramid tiles for viewing "
+                f"({full_size[0]}x{full_size[1]}, levels={n_levels})."
+            )
+            self._log(
+                "Run Deconvolution will stream full-resolution tiles directly to OME-Zarr."
+            )
+
         n_ch = int(self._metadata.get("size_c", 0))
         self._file_label.setText(display_name)
         self._file_label.setToolTip(
             f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
         self._btn_run.setEnabled(True)
-        self._btn_fit_psf.setEnabled(True)
-        self._btn_save_series.setEnabled(self._viewer.has_time_axis())
+        self._btn_fit_psf.setEnabled(not source_is_pyramidal)
+        self._btn_save_series.setEnabled(self._viewer.has_time_axis() and not source_is_pyramidal)
         self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
         self._btn_save_view.setEnabled(False)
         self._sync_preview_buttons()
+        if source_is_pyramidal:
+            self._btn_fit_psf.setEnabled(False)
         self._viewer.refresh_view()
         self._set_default_movie_output_path(display_name, source_path)
         self._status.showMessage(f"Loaded {display_name}", 5000)
@@ -5945,10 +7732,127 @@ class DeconvolveCIWindow(QMainWindow):
             "n_pupil": self._sp_n_pupil.value(),
         }
 
+    def _is_streamed_omero_pyramid_source(self) -> bool:
+        return (
+            isinstance(self._input_source, _OmeroTimepointSource)
+            and bool(getattr(self._input_source, "is_pyramidal", False))
+        )
+
+    def _start_streaming_omero_deconvolution(self) -> None:
+        if not isinstance(self._input_source, _OmeroTimepointSource):
+            return
+        params = self._collect_params()
+        streaming_metadata = dict(self._metadata)
+        streaming_metadata["pixel_size_x"] = float(params["pixel_size_xy_nm"]) / 1000.0
+        streaming_metadata["pixel_size_y"] = float(params["pixel_size_xy_nm"]) / 1000.0
+        streaming_metadata["pixel_size_z"] = float(params["pixel_size_z_nm"]) / 1000.0
+        streaming_metadata["microscope_type"] = params.get("microscope_type")
+        streaming_metadata["na"] = float(params["na"])
+        streaming_metadata["refractive_index"] = float(params["ri_immersion"])
+        streaming_metadata["sample_refractive_index"] = float(params["ri_sample"])
+        streaming_metadata["cideconvolve_processing"] = {
+            "method": params.get("method"),
+            "iterations": list(params.get("niter_list") or []),
+            "background": params.get("background"),
+            "offset": params.get("offset"),
+            "damping": params.get("damping"),
+            "tv_lambda": params.get("tv_lambda"),
+            "sparse_hessian_weight": params.get("sparse_hessian_weight"),
+            "sparse_hessian_reg": params.get("sparse_hessian_reg"),
+            "prefilter_sigma": params.get("prefilter_sigma"),
+            "convergence": params.get("convergence"),
+            "rel_threshold": params.get("rel_threshold"),
+            "check_every": params.get("check_every"),
+            "two_d_mode": params.get("two_d_mode"),
+            "two_d_wf_aggressiveness": params.get("two_d_wf_aggressiveness"),
+        }
+        channels_meta = [
+            dict(ch) if isinstance(ch, dict) else {}
+            for ch in streaming_metadata.get("channels", [])
+        ]
+        render_state = self._viewer.movie_render_state()
+        channel_colors = list(render_state.get("channel_colors") or [])
+        active_channels = set(int(v) for v in render_state.get("active_channels") or [])
+        size_c = max(int(streaming_metadata.get("size_c", len(channel_colors))), len(channel_colors))
+        while len(channels_meta) < size_c:
+            channels_meta.append({})
+        names = list(streaming_metadata.get("channel_names") or [])
+        for i in range(size_c):
+            if i < len(channel_colors):
+                channels_meta[i]["color"] = tuple(int(v) for v in channel_colors[i][:3])
+            channels_meta[i]["active"] = i in active_channels if active_channels else bool(channels_meta[i].get("active", True))
+            if "name" not in channels_meta[i] and i < len(names):
+                channels_meta[i]["name"] = names[i]
+        streaming_metadata["channels"] = channels_meta
+        if params.get("method") == "ci_rl_dl":
+            QMessageBox.warning(
+                self,
+                "Streaming not available",
+                "Streaming ci_rl_dl is not enabled yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.",
+            )
+            return
+        movie_params = params.get("movie") or {}
+        if movie_params.get("enabled"):
+            QMessageBox.warning(
+                self,
+                "Movie Export",
+                "Iteration movies are disabled for full-resolution streamed OMERO jobs.",
+            )
+            return
+
+        display_name = self._file_label.text().strip() or "omero_image"
+        method = params.get("method", "ci_rl")
+        niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
+        suggested = Path(self._last_save_dir) / f"{_safe_filename_stem(display_name)}_{method}_{niter_text}i.ome.zarr"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Streamed OME-Zarr",
+            str(suggested),
+            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
+        )
+        if not path:
+            return
+        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+            path += ".ome.zarr"
+        output_path = Path(path)
+        if output_path.exists() and not output_path.is_dir():
+            QMessageBox.warning(self, "Output Error", "OME-Zarr output must be a directory path.")
+            return
+
+        self._last_save_dir = str(output_path.parent)
+        self._save_last_settings()
+        self._btn_run.setText("Stop")
+        self._btn_run.setStyleSheet(
+            "QPushButton { background-color: #e53935; color: white; "
+            "font-weight: bold; padding: 8px; }"
+        )
+        self._btn_save.setEnabled(False)
+        self._btn_save_view.setEnabled(False)
+        self._btn_save_series.setEnabled(False)
+        self._begin_busy_progress("Streaming OMERO deconvolution ...")
+        self._monitor_bar.set_active(True)
+        self._set_log_running(True)
+        self._log("")
+        self._log("=" * 70)
+        self._log(f"Starting streamed OMERO deconvolution to {output_path}")
+        self._log("=" * 70)
+        self._worker = _StreamingOmeroWorker(
+            self._input_source,
+            streaming_metadata,
+            params,
+            str(output_path),
+            parent=self,
+        )
+        self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished.connect(self._on_deconv_done)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
     def _on_run(self):
         # --- Stop mode: cancel running worker ---
         if self._worker is not None and self._worker.isRunning():
             self._worker.requestInterruption()
+            _release_cuda_memory(synchronize=True)
             self._btn_run.setEnabled(False)
             self._log("Stop requested by user.")
             self._status.showMessage("Stopping …")
@@ -5963,6 +7867,9 @@ class DeconvolveCIWindow(QMainWindow):
             return
 
         if not self._input_channels:
+            return
+        if self._is_streamed_omero_pyramid_source():
+            self._start_streaming_omero_deconvolution()
             return
 
         self._btn_run.setText("Stop")
@@ -6043,6 +7950,7 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_deconv_done(self, result):
         self._monitor_bar.set_active(False)
         self._set_log_running(False)
+        _release_cuda_memory(synchronize=True)
 
         self._end_progress()
         self._btn_run.setText("Run Deconvolution")
@@ -6051,7 +7959,11 @@ class DeconvolveCIWindow(QMainWindow):
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_run.setEnabled(True)
-        self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+        self._btn_save_series.setEnabled(
+            bool(self._input_channels)
+            and self._viewer.has_time_axis()
+            and not self._is_streamed_omero_pyramid_source()
+        )
 
         if isinstance(result, Exception):
             self._worker = None
@@ -6066,6 +7978,20 @@ class DeconvolveCIWindow(QMainWindow):
             return
 
         try:
+            if isinstance(result, dict) and result.get("streaming_output"):
+                summary = result.get("summary") or {}
+                output_path = str(result.get("streaming_output"))
+                provenance = str(result.get("provenance") or "")
+                self._log(
+                    "Streaming deconvolution complete: "
+                    f"{summary.get('tiles_completed', '?')}/{summary.get('tiles_total', '?')} tiles written."
+                )
+                self._log(f"OME-Zarr output: {output_path}")
+                if provenance:
+                    self._log(f"Provenance: {provenance}")
+                self._status.showMessage(f"Streaming deconvolution complete → {Path(output_path).name}", 8000)
+                return
+
             timepoint = int(result["timepoint"])
             self._preview_outputs_by_t[timepoint] = result["channels"]
             self._viewer.set_preview_result(timepoint, result["channels"])
@@ -6127,6 +8053,14 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_fit_psf(self):
         if not self._input_channels:
             self._log("No image loaded — cannot fit PSF.")
+            return
+        if self._is_streamed_omero_pyramid_source():
+            QMessageBox.information(
+                self,
+                "Large OMERO image",
+                "PSF fitting is disabled for OMERO pyramid overview data. "
+                "Use a small crop/ROI or a non-pyramidal source for fitting.",
+            )
             return
         if self._fit_psf_worker is not None and self._fit_psf_worker.isRunning():
             self._fit_psf_worker.requestInterruption()
@@ -6503,6 +8437,13 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_save_t_series(self):
         if not self._input_channels:
+            return
+        if self._is_streamed_omero_pyramid_source():
+            QMessageBox.information(
+                self,
+                "Large OMERO image",
+                "Use Run Deconvolution to stream this OMERO pyramid to OME-Zarr.",
+            )
             return
         if self._worker is not None and self._worker.isRunning():
             QMessageBox.information(
@@ -6896,7 +8837,14 @@ class DeconvolveCIWindow(QMainWindow):
 
         size_z = max(int(self._metadata.get("size_z", 1)), 1)
         size_c = max(int(self._metadata.get("size_c", 1)), 1)
-        total = size_c * size_z if isinstance(self._input_source, _OmeroTimepointSource) and size_z > 1 else size_c
+        is_omero_pyramid = (
+            isinstance(self._input_source, _OmeroTimepointSource)
+            and bool(getattr(self._input_source, "is_pyramidal", False))
+        )
+        if is_omero_pyramid:
+            total = 1
+        else:
+            total = size_c * size_z if isinstance(self._input_source, _OmeroTimepointSource) and size_z > 1 else size_c
         if total > 1:
             self._begin_progress(total, f"Loading T={target_t + 1}…")
         else:
@@ -6914,6 +8862,10 @@ class DeconvolveCIWindow(QMainWindow):
             self._input_channels = channels
             self._loaded_timepoint = target_t
             self._viewer.set_input_timepoint_data(target_t, channels)
+            if is_omero_pyramid:
+                provider = getattr(self._input_source, "tile_provider", None)
+                if provider is not None:
+                    self._viewer.set_tiled_input_provider(provider)
             self._log(f"Loaded timepoint T={target_t + 1} in {_format_duration(time.time() - t_load)}")
         finally:
             self._end_progress()

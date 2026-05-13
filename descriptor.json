@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --output_format @output_format --streaming @streaming --tile_limits @tile_limits --streaming_threshold_gb @streaming_threshold_gb --scene @scene --hcs_field @hcs_field --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "method",
@@ -39,14 +39,14 @@
       "value-key": "@convergence",
       "command-line-flag": "--convergence",
       "name": "(ess) Convergence mode",
-      "description": "Early-stopping convergence check. 'auto' stops when relative change falls below the threshold. 'none' disables convergence checking and runs all iterations.",
+      "description": "Early-stopping convergence check. 'auto' stops when relative change falls below the threshold. 'fixed' runs all iterations.",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
         "auto",
-        "none"
+        "fixed"
       ]
     },
     {
@@ -212,6 +212,83 @@
         "mip",
         "sum"
       ]
+    },
+    {
+      "id": "output_format",
+      "value-key": "@output_format",
+      "command-line-flag": "--output_format",
+      "name": "(ess) Output format",
+      "description": "Output container for deconvolved data. OME-Zarr is recommended for very large float32 tilescans because it supports chunked writes and pyramids.",
+      "default-value": "ome-tiff",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "ome-tiff",
+        "ome-zarr"
+      ]
+    },
+    {
+      "id": "streaming",
+      "value-key": "@streaming",
+      "command-line-flag": "--streaming",
+      "name": "(ess) Large-image streaming",
+      "description": "Use region/tile reads and write output tiles directly. 'auto' enables streaming when the estimated source array exceeds the threshold; 'always' forces OME-Zarr streaming; 'never' keeps the eager path.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "auto",
+        "always",
+        "never"
+      ]
+    },
+    {
+      "id": "tile_limits",
+      "value-key": "@tile_limits",
+      "command-line-flag": "--tile_limits",
+      "name": "(ess) Tile limits",
+      "description": "Streaming tile limits as 'max_xy,max_z'. XY is used for the current streaming implementation; Z is reserved for future axial chunking.",
+      "default-value": "1024,64",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "streaming_threshold_gb",
+      "value-key": "@streaming_threshold_gb",
+      "command-line-flag": "--streaming_threshold_gb",
+      "name": "(adv) Streaming threshold GB",
+      "description": "Estimated full source array size above which streaming auto mode is enabled.",
+      "default-value": 2.0,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0.01,
+      "maximum": 1000
+    },
+    {
+      "id": "scene",
+      "value-key": "@scene",
+      "command-line-flag": "--scene",
+      "name": "(adv) BioIO scene",
+      "description": "Optional BioIO scene index or name for multi-scene inputs. Empty or auto uses the reader default scene.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "hcs_field",
+      "value-key": "@hcs_field",
+      "command-line-flag": "--hcs_field",
+      "name": "(adv) OME-Zarr HCS field",
+      "description": "Optional HCS field path such as A/1/0. Empty or auto uses the first field for backwards compatibility.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
     },
     {
       "id": "benchmark",

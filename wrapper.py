@@ -52,6 +52,13 @@ from core.deconvolve import (
     save_mip_png,
     save_result,
 )
+from core.streaming import (
+    ZarrPyramidSink,
+    deconvolve_streaming,
+    open_region_source,
+    save_streaming_provenance,
+    should_stream_source,
+)
 
 import numpy as np
 
@@ -146,6 +153,80 @@ def _parse_float_list_or_default(raw, default: str) -> list[float]:
         text = default
     values = [float(x.strip()) for x in text.split(",") if x.strip()]
     return values or [float(default)]
+
+
+def _parse_tile_limits(raw, default: tuple[int, int] = (1024, 64)) -> tuple[int, int]:
+    """Parse tile limits as ``max_xy,max_z``; Z is retained for future use."""
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    parts = [p.strip() for p in text.replace("x", ",").split(",") if p.strip()]
+    try:
+        max_xy = int(parts[0]) if parts else default[0]
+        max_z = int(parts[1]) if len(parts) > 1 else default[1]
+    except ValueError:
+        return default
+    return max(max_xy, 64), max(max_z, 1)
+
+
+def _metadata_use_value(current, value, overrule_metadata: bool) -> bool:
+    return value is not None and (overrule_metadata or current is None)
+
+
+def _apply_cli_metadata_to_source(
+    meta: dict,
+    *,
+    na,
+    refractive_index,
+    sample_ri,
+    microscope_type,
+    emission_wavelengths,
+    excitation_wavelengths,
+    pinhole_airy_units,
+    pixel_size_xy,
+    pixel_size_z,
+    overrule_metadata: bool,
+) -> dict:
+    """Mirror load_image metadata override semantics for streaming sources."""
+    meta = dict(meta)
+    if _metadata_use_value(meta.get("na"), na, overrule_metadata):
+        meta["na"] = na
+    if _metadata_use_value(meta.get("refractive_index"), refractive_index, overrule_metadata):
+        meta["refractive_index"] = refractive_index
+    if _metadata_use_value(meta.get("sample_refractive_index"), sample_ri, overrule_metadata):
+        meta["sample_refractive_index"] = sample_ri
+    if _metadata_use_value(meta.get("microscope_type"), microscope_type, overrule_metadata):
+        meta["microscope_type"] = microscope_type
+    if _metadata_use_value(meta.get("pixel_size_x"), pixel_size_xy, overrule_metadata):
+        meta["pixel_size_x"] = pixel_size_xy
+    if _metadata_use_value(meta.get("pixel_size_y"), pixel_size_xy, overrule_metadata):
+        meta["pixel_size_y"] = pixel_size_xy
+    if _metadata_use_value(meta.get("pixel_size_z"), pixel_size_z, overrule_metadata):
+        meta["pixel_size_z"] = pixel_size_z
+
+    n_channels = int(meta.get("size_c") or meta.get("n_channels") or 1)
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
+    if len(channels) < n_channels:
+        channels.extend({} for _ in range(n_channels - len(channels)))
+    if emission_wavelengths is not None:
+        for i, wl in enumerate(emission_wavelengths):
+            if i < len(channels) and _metadata_use_value(
+                channels[i].get("emission_wavelength"), wl, overrule_metadata
+            ):
+                channels[i]["emission_wavelength"] = wl
+    if excitation_wavelengths is not None:
+        for i, wl in enumerate(excitation_wavelengths):
+            if i < len(channels) and _metadata_use_value(
+                channels[i].get("excitation_wavelength"), wl, overrule_metadata
+            ):
+                channels[i]["excitation_wavelength"] = wl
+    meta["channels"] = channels[:n_channels]
+    _apply_pinhole_airy_units(
+        meta,
+        _DEFAULT_PINHOLE_AIRY if pinhole_airy_units is None else pinhole_airy_units,
+        overrule_metadata=overrule_metadata,
+    )
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -654,11 +735,23 @@ def _load_zarr_field(
     ch_info = []
     channel_names = []
     for i, och in enumerate(omero_channels):
+        color = och.get("color")
+        if isinstance(color, str) and len(color.strip().lstrip("#")) == 6:
+            text = color.strip().lstrip("#")
+            try:
+                color = tuple(int(text[j:j + 2], 16) for j in (0, 2, 4))
+            except ValueError:
+                color = None
+        window = och.get("window") or {}
         info = {
             "emission_wavelength": None,
             "excitation_wavelength": None,
             "acquisition_mode": None,
             "pinhole_size": None,
+            "color": color,
+            "active": bool(och.get("active", True)),
+            "window_start": window.get("start"),
+            "window_end": window.get("end"),
         }
         channel_names.append(och.get("label", f"Ch{i}"))
         ch_info.append(info)
@@ -1076,6 +1169,193 @@ def _run_plate_zarr(
     print(f"  Output: {out_zarr_path}")
 
 
+def _run_streaming_regular_image(
+    img_path: Path,
+    out_path: str,
+    *,
+    stem: str,
+    niter_list: list,
+    method: str,
+    device,
+    na,
+    refractive_index,
+    sample_ri: float,
+    microscope_type,
+    emission_wavelengths,
+    excitation_wavelengths,
+    pinhole_airy_units,
+    pixel_size_xy,
+    pixel_size_z,
+    overrule_metadata: bool,
+    tv_lambda: float,
+    damping,
+    sparse_hessian_weight: float,
+    sparse_hessian_reg: float,
+    background,
+    offset,
+    prefilter_sigma: float,
+    start: str,
+    convergence: str,
+    rel_threshold: float,
+    check_every: int,
+    ri_coverslip,
+    ri_coverslip_design,
+    ri_immersion_design,
+    t_g: float,
+    t_g0: float,
+    t_i0: float,
+    z_p: float,
+    two_d_mode: str,
+    two_d_wf_aggressiveness: str,
+    two_d_wf_bg_radius_um: float,
+    two_d_wf_bg_scale: float,
+    tile_limits: tuple[int, int],
+    scene=None,
+    hcs_field=None,
+) -> Path:
+    """Stream a regular image to OME-Zarr, reading only halo-extended tiles."""
+    if method == "ci_rl_dl":
+        raise ValueError("Streaming ci_rl_dl is not enabled yet; use ci_rl/ci_rl_tv or eager ci_rl_dl.")
+
+    source = open_region_source(img_path, scene=scene, hcs_field=hcs_field)
+    source.metadata = _apply_cli_metadata_to_source(
+        source.metadata,
+        na=na,
+        refractive_index=refractive_index,
+        sample_ri=sample_ri,
+        microscope_type=microscope_type,
+        emission_wavelengths=emission_wavelengths,
+        excitation_wavelengths=excitation_wavelengths,
+        pinhole_airy_units=pinhole_airy_units,
+        pixel_size_xy=pixel_size_xy,
+        pixel_size_z=pixel_size_z,
+        overrule_metadata=overrule_metadata,
+    )
+    out_zarr = Path(out_path) / f"{stem}_decon.ome.zarr"
+    sink = ZarrPyramidSink(
+        out_zarr,
+        shape=source.shape,
+        metadata=source.metadata,
+        zarr_format=OUTPUT_ZARR_FORMAT,
+        resume=True,
+    )
+
+    psf_cache: dict[int, np.ndarray] = {}
+
+    def _psf_for_channel(ch_idx: int) -> np.ndarray:
+        cached = psf_cache.get(ch_idx)
+        if cached is not None:
+            return cached
+        psf = generate_psf(
+            source.metadata,
+            channel_idx=ch_idx,
+            ri_coverslip=ri_coverslip,
+            ri_coverslip_design=ri_coverslip_design,
+            ri_immersion_design=ri_immersion_design,
+            t_g=t_g,
+            t_g0=t_g0,
+            t_i0=t_i0,
+            z_p=z_p,
+            two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv") else "legacy_2d",
+        )
+        psf_cache[ch_idx] = psf
+        return psf
+
+    def _deconvolve_tile(tile_img: np.ndarray, psf: np.ndarray, ch_idx: int) -> np.ndarray:
+        effective_psf = psf
+        keep_hidden_2d_psf = (
+            tile_img.ndim == 2
+            and psf.ndim == 3
+            and source.metadata.get("microscope_type", "widefield") == "widefield"
+            and method in ("ci_rl", "ci_rl_tv")
+            and str(two_d_mode).strip().lower() == "auto"
+        )
+        if tile_img.ndim == 2 and effective_psf.ndim == 3 and not keep_hidden_2d_psf:
+            effective_psf = effective_psf[effective_psf.shape[0] // 2]
+        elif tile_img.ndim == 3 and effective_psf.ndim == 2:
+            effective_psf = effective_psf[np.newaxis, :, :]
+        if isinstance(niter_list, list) and len(niter_list) > 1:
+            ch_niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
+        else:
+            ch_niter = niter_list[0] if isinstance(niter_list, list) else niter_list
+        return deconvolve(
+            tile_img,
+            effective_psf,
+            method=method,
+            niter=ch_niter,
+            background=background,
+            damping=damping,
+            offset=offset,
+            prefilter_sigma=prefilter_sigma,
+            start=start,
+            convergence=convergence,
+            rel_threshold=rel_threshold,
+            check_every=check_every,
+            device=device,
+            tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
+            sparse_hessian_weight=sparse_hessian_weight,
+            sparse_hessian_reg=sparse_hessian_reg,
+            pixel_size_xy=source.metadata.get("pixel_size_x"),
+            pixel_size_z=source.metadata.get("pixel_size_z"),
+            microscope_type=source.metadata.get("microscope_type", "widefield"),
+            two_d_mode=two_d_mode,
+            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+            two_d_wf_bg_scale=two_d_wf_bg_scale,
+        )
+
+    def _progress(payload: dict) -> None:
+        event = payload.get("event")
+        if event == "tile_start":
+            done = int(payload.get("done", 0))
+            total = int(payload.get("total", 0))
+            print(
+                f"    Tile {done + 1}/{total}: "
+                f"T={payload.get('timepoint')} C={payload.get('channel')} "
+                f"core={payload.get('core')}"
+            )
+        elif event == "pyramid_start":
+            print("    Building OME-Zarr pyramid levels...")
+
+    print("\n  Streaming deconvolution")
+    print(f"    Source     : {source.source_id}")
+    print(f"    Shape      : T={source.shape[0]} C={source.shape[1]} Z={source.shape[2]} Y={source.shape[3]} X={source.shape[4]}")
+    print(f"    Tile limits: XY={tile_limits[0]} px  Z={tile_limits[1]} slices (Z streaming reserved)")
+    print(f"    Output     : {out_zarr.name}")
+    t0 = time.time()
+    summary = deconvolve_streaming(
+        source,
+        sink,
+        psf_for_channel=_psf_for_channel,
+        deconvolve_tile=_deconvolve_tile,
+        tile_yx=(tile_limits[0], tile_limits[0]),
+        progress=_progress,
+        resume=True,
+        build_pyramids=True,
+    )
+    provenance = save_streaming_provenance(
+        out_zarr.with_suffix(out_zarr.suffix + ".provenance.json"),
+        source=source,
+        sink=sink,
+        params={
+            "method": method,
+            "iterations": niter_list,
+            "tile_limits": tile_limits,
+            "convergence": convergence,
+            "rel_threshold": rel_threshold,
+            "background": background,
+            "offset": offset,
+            "prefilter_sigma": prefilter_sigma,
+            "start": start,
+        },
+        summary=summary,
+    )
+    print(f"    Completed  : {summary['tiles_completed']}/{summary['tiles_total']} tile writes")
+    print(f"    Time       : {_format_duration(time.time() - t0)}")
+    print(f"    Provenance : {provenance.name}")
+    return out_zarr
+
+
 def main(argv):
     with BiaflowsJob.from_cli(argv) as bj:
         parameters = getattr(bj, "parameters", SimpleNamespace())
@@ -1135,6 +1415,8 @@ def main(argv):
         sparse_hessian_weight = float(getattr(parameters, "sparse_hessian_weight", 0.6))
         sparse_hessian_reg = float(getattr(parameters, "sparse_hessian_reg", 0.98))
         convergence = str(getattr(parameters, "convergence", "auto")).strip().lower()
+        if convergence in ("none", "fixed"):
+            convergence = "fixed"
         rel_threshold = float(getattr(parameters, "rel_threshold", 0.005))
         check_every = 5          # convergence check interval
 
@@ -1166,6 +1448,16 @@ def main(argv):
         benchmark = _to_bool(getattr(parameters, "benchmark", False))
         bench_crop = _to_bool(getattr(parameters, "bench_crop", False))
         compute_metrics = _to_bool(getattr(parameters, "compute_metrics", False))
+        output_format = str(getattr(parameters, "output_format", "ome-tiff")).strip().lower()
+        if output_format in ("ome_zarr", "zarr"):
+            output_format = "ome-zarr"
+        streaming_mode = str(getattr(parameters, "streaming", "auto")).strip().lower()
+        tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "1024,64"))
+        streaming_threshold_gb = float(getattr(parameters, "streaming_threshold_gb", 2.0))
+        scene = getattr(parameters, "scene", None)
+        scene = None if scene in (None, "", "auto") else scene
+        hcs_field = getattr(parameters, "hcs_field", None)
+        hcs_field = None if hcs_field in (None, "", "auto") else str(hcs_field)
 
         # 2D widefield parameters
         two_d_mode = str(getattr(parameters, "two_d_mode", "auto")).strip().lower()
@@ -1184,6 +1476,8 @@ def main(argv):
         print(f"  Iterations   : {', '.join(str(n) for n in niter_list)}")
         print(f"  Device       : {device_param}")
         print(f"  Projection   : {projection}")
+        print(f"  Output format: {output_format}")
+        print(f"  Streaming    : {streaming_mode} (threshold={streaming_threshold_gb:g} GB, tile={tile_limits[0]} px)")
         print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'use image metadata'}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")
@@ -1349,6 +1643,82 @@ def main(argv):
             monitor: _MetricsMonitor | None = None
 
             try:
+                use_streaming = False
+                if projection != "none" and output_format == "ome-zarr":
+                    raise ValueError("OME-Zarr streaming output currently writes full Z data; set projection=none.")
+                if streaming_mode not in ("auto", "always", "never"):
+                    raise ValueError("--streaming must be auto, always, or never")
+                if output_format == "ome-zarr" or streaming_mode == "always":
+                    use_streaming = True
+                elif streaming_mode == "auto":
+                    try:
+                        probe_source = open_region_source(img_path, scene=scene, hcs_field=hcs_field)
+                        use_streaming = should_stream_source(
+                            probe_source.shape,
+                            threshold_gb=streaming_threshold_gb,
+                        )
+                        if use_streaming:
+                            print(
+                                "  Streaming auto-enabled: source shape "
+                                f"{probe_source.shape} exceeds {streaming_threshold_gb:g} GB threshold."
+                            )
+                    except Exception as probe_exc:
+                        print(f"  Streaming probe unavailable; using eager load ({probe_exc})")
+
+                if use_streaming:
+                    if projection != "none":
+                        raise ValueError("Streaming output currently writes full Z data; set projection=none.")
+                    if output_format not in ("ome-zarr", "zarr"):
+                        print("  Large image detected; switching output format to OME-Zarr for streamed float output.")
+                    out_zarr = _run_streaming_regular_image(
+                        img_path,
+                        out_path,
+                        stem=_stem(img_resource.filename),
+                        niter_list=niter_list,
+                        method=method,
+                        device=device,
+                        na=na_override,
+                        refractive_index=ri_override,
+                        sample_ri=sample_ri,
+                        microscope_type=micro_override,
+                        emission_wavelengths=em_override,
+                        excitation_wavelengths=ex_override,
+                        pinhole_airy_units=pinhole_airy_override,
+                        pixel_size_xy=px_xy_override,
+                        pixel_size_z=px_z_override,
+                        overrule_metadata=overrule_metadata,
+                        tv_lambda=tv_lambda,
+                        damping=damping,
+                        sparse_hessian_weight=sparse_hessian_weight,
+                        sparse_hessian_reg=sparse_hessian_reg,
+                        background=background,
+                        offset=offset,
+                        prefilter_sigma=prefilter_sigma,
+                        start=start,
+                        convergence=convergence,
+                        rel_threshold=rel_threshold,
+                        check_every=check_every,
+                        ri_coverslip=ri_override if overrule_metadata else None,
+                        ri_coverslip_design=ri_override if overrule_metadata else None,
+                        ri_immersion_design=ri_override if overrule_metadata else None,
+                        t_g=t_g,
+                        t_g0=t_g0,
+                        t_i0=t_i0,
+                        z_p=z_p,
+                        two_d_mode=two_d_mode,
+                        two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                        two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                        two_d_wf_bg_scale=two_d_wf_bg_scale,
+                        tile_limits=tile_limits,
+                        scene=scene,
+                        hcs_field=hcs_field,
+                    )
+                    print(f"  Output path : {out_zarr}")
+                    elapsed = time.time() - t0
+                    print("\n  Timing summary")
+                    print(f"    Total      : {_format_duration(elapsed)}")
+                    continue
+
                 # Load image and extract metadata
                 t_load = time.time()
                 data = load_image(

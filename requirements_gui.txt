@@ -17,6 +17,7 @@ imageio[ffmpeg]>=2.34.0
 matplotlib>=3.8.0
 
 # OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
+tifffile>=2024.1.30
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
 bioio-ome-zarr==3.3.0
@@ -25,7 +26,7 @@ bioio-nd2==1.7.0
 
 # OMERO browser (Open OMERO… button)
 # Requires ZeroC ICE wheel installed separately — see README.md
-omero-browser-qt[viewer]==0.2.4
+omero-browser-qt[viewer]==0.2.5
 
 # Leica browser (Open Leica… button)
 leica-browser-qt>=0.2.0
@@ -36,3 +37,4 @@ nvidia-ml-py>=12.0.0
 
 # Zarr (needed for HCS plate reading/writing)
 zarr>=2.16
+numcodecs>=0.12
