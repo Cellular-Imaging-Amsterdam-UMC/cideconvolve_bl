@@ -11,6 +11,12 @@ import sys
 import threading
 from pathlib import Path
 
+# Ensure repo root is on sys.path so core.* and training.* are importable
+# when this script is run directly (python gui/gui_train.py)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon.
 if sys.platform == "win32":
     import ctypes
@@ -41,7 +47,7 @@ except Exception as exc:  # pragma: no cover - exercised only without PyQt6.
     print(f"PyQt6 is required for gui_train.py and is not available: {exc}")
     raise SystemExit(1)
 
-from train import TrainConfig, train
+from training.train import TrainConfig, train
 
 try:
     from PyQt6.QtSvg import QSvgRenderer

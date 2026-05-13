@@ -33,8 +33,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install --no-compile -r requirements_docker.txt
 
 # --- Application code ---
-COPY deconvolve.py /app/deconvolve.py
-COPY deconvolve_ci.py /app/deconvolve_ci.py
+COPY core/ /app/core/
 COPY bioflows_local.py /app/bioflows_local.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json

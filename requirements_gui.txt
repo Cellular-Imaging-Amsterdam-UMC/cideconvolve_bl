@@ -25,7 +25,7 @@ bioio-nd2==1.7.0
 
 # OMERO browser (Open OMERO… button)
 # Requires ZeroC ICE wheel installed separately — see README.md
-omero-browser-qt[viewer]==0.2.2
+omero-browser-qt[viewer]==0.2.4
 
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0

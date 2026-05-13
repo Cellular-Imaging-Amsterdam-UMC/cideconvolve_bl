@@ -1,12 +1,12 @@
 """
 Diagnostic test: coarse-to-fine RI scan on channel 1 of Dendrites_Crop.ome.tiff.
 
-Ground-truth parameters (from OME-XML / Huygens SVI metadata):
+Ground-truth parameters (from OME-XML / reference acquisition metadata):
   pixel XY : 29 nm
   pixel Z  : 150 nm
   NA       : 1.4
   immersion: Oil  (RI 1.515)
-  medium   : ~1.338  (water-like, RefrIndexMedium from SVI block)
+  medium   : ~1.338  (water-like reference value)
   channel 1: ex=564 nm, em=600 nm, pinhole ~1 AU
 
 Expected result: best RI should be in the range 1.33–1.43, NOT 1.50–1.515.
@@ -27,7 +27,7 @@ import tifffile
 # make sure the repo root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deconvolve_ci import ci_fit_psf_params  # noqa: E402
+from core.deconvolve_ci import ci_fit_psf_params  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Load image
@@ -160,7 +160,7 @@ print("SUMMARY")
 print("="*60)
 print(f"  Coarse best RI : {coarse_best_ri:.4f}")
 print(f"  Fine best RI   : {fine_best_ri:.4f}")
-print(f"  Expected ~     : 1.338  (SVI medium RI from OME metadata)")
+print(f"  Expected ~     : 1.338  (reference medium RI)")
 total = coarse_elapsed + fine_elapsed
 print(f"  Total scan time: {total:.1f}s")
 

@@ -158,9 +158,7 @@ def prepare_data(
     **flags,
 ):
     """Prepare input/output directories and enumerate available images."""
-    del discipline, flags
-    if not is_2d:
-        print("Warning: local workflow set is_2d=False; proceeding regardless.")
+    del discipline, is_2d, flags
 
     job.input_dir.mkdir(parents=True, exist_ok=True)
     job.output_dir.mkdir(parents=True, exist_ok=True)

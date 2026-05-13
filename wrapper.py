@@ -40,10 +40,11 @@ from bioflows_local import (
     prepare_data,
 )
 
-# Import deconvolve first (handles torch-before-numpy DLL load order)
-from deconvolve import (
+# Import core first (handles torch-before-numpy DLL load order)
+from core.deconvolve import (
     _DEFAULT_PINHOLE_AIRY_UNITS,
     _apply_pinhole_airy_units,
+    _format_float_list,
     deconvolve,
     deconvolve_image,
     generate_psf,
@@ -145,10 +146,6 @@ def _parse_float_list_or_default(raw, default: str) -> list[float]:
         text = default
     values = [float(x.strip()) for x in text.split(",") if x.strip()]
     return values or [float(default)]
-
-
-def _format_float_list(values: list[float]) -> str:
-    return ", ".join(f"{value:g}" for value in values)
 
 
 # ---------------------------------------------------------------------------
@@ -957,11 +954,6 @@ def _run_plate_zarr(
     two_d_wf_aggressiveness: str = "balanced",
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
-    dl_model_path: str | None = None,
-    dl_z_context: int = 2,
-    dl_batch_size: int = 8,
-    dl_mixed_precision: bool = True,
-    dl_residual_strength: float = 1.0,
     projection: str = "none",
 ) -> None:
     """Process an HCS plate zarr: deconvolve every field and write output plate zarr."""
@@ -1033,7 +1025,7 @@ def _run_plate_zarr(
                 img.ndim == 2
                 and psf.ndim == 3
                 and meta.get("microscope_type", "widefield") == "widefield"
-                and method in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+                and method in ("ci_rl", "ci_rl_tv")
                 and str(two_d_mode).strip().lower() == "auto"
             )
             if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
@@ -1063,11 +1055,6 @@ def _run_plate_zarr(
                 two_d_wf_aggressiveness=two_d_wf_aggressiveness,
                 two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
                 two_d_wf_bg_scale=two_d_wf_bg_scale,
-                dl_model_path=dl_model_path,
-                dl_z_context=dl_z_context,
-                dl_batch_size=dl_batch_size,
-                dl_mixed_precision=dl_mixed_precision,
-                dl_residual_strength=dl_residual_strength,
             )
             result_channels.append(result)
 
@@ -1185,12 +1172,6 @@ def main(argv):
         two_d_wf_aggressiveness = str(getattr(parameters, "two_d_wf_aggressiveness", "Balanced")).strip()
         two_d_wf_bg_radius_um = float(getattr(parameters, "two_d_wf_bg_radius_um", 0.5))
         two_d_wf_bg_scale = float(getattr(parameters, "two_d_wf_bg_scale", 1.0))
-        dl_model_raw = str(getattr(parameters, "dl_model_path", "")).strip()
-        dl_model_path = dl_model_raw or None
-        dl_z_context = int(getattr(parameters, "dl_z_context", 2))
-        dl_batch_size = int(getattr(parameters, "dl_batch_size", 8))
-        dl_mixed_precision = _to_bool(getattr(parameters, "dl_mixed_precision", True))
-        dl_residual_strength = float(getattr(parameters, "dl_residual_strength", 1.0))
 
         print("=" * 70)
         print("CIDeconvolve - BIAFLOWS Workflow")
@@ -1206,13 +1187,8 @@ def main(argv):
         print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'use image metadata'}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")
-        if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl"):
+        if method in ("ci_rl", "ci_rl_tv"):
             print(f"  Damping      : {damping}")
-        if method == "ci_rl_dl":
-            print(f"  DL model     : {dl_model_path or '(none; ci_rl output unchanged)'}")
-            print(f"  DL z-context : {dl_z_context}")
-            print(f"  DL batch size: {dl_batch_size}")
-            print(f"  DL residual strength: {dl_residual_strength}")
         if method == "ci_sparse_hessian":
             print(f"  Sparse weight: {sparse_hessian_weight}")
             print(f"  Sparse reg   : {sparse_hessian_reg}")
@@ -1351,11 +1327,6 @@ def main(argv):
                     two_d_wf_aggressiveness=two_d_wf_aggressiveness,
                     two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
                     two_d_wf_bg_scale=two_d_wf_bg_scale,
-                    dl_model_path=dl_model_path,
-                    dl_z_context=dl_z_context,
-                    dl_batch_size=dl_batch_size,
-                    dl_mixed_precision=dl_mixed_precision,
-                    dl_residual_strength=dl_residual_strength,
                     projection=projection,
                 )
             except Exception as exc:
@@ -1415,15 +1386,12 @@ def main(argv):
                       f"(threshold={rel_threshold}, every={check_every})")
                 if method == "ci_rl_tv":
                     print(f"    TV lambda  : {tv_lambda}")
-                if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl"):
+                if method in ("ci_rl", "ci_rl_tv"):
                     print(f"    Damping    : {damping}")
                     print(f"    2D WF mode : {two_d_mode} "
                           f"(aggr={two_d_wf_aggressiveness}, "
                           f"bg radius={two_d_wf_bg_radius_um} um, "
                           f"bg scale={two_d_wf_bg_scale})")
-                if method == "ci_rl_dl":
-                    print(f"    DL model   : {dl_model_path or '(none; ci_rl output unchanged)'}")
-                    print(f"    DL params  : z-context={dl_z_context}, batch={dl_batch_size}, mixed_precision={dl_mixed_precision}, residual_strength={dl_residual_strength}")
                 if method == "ci_sparse_hessian":
                     print(f"    Sparse     : weight={sparse_hessian_weight}, "
                           f"reg={sparse_hessian_reg}")
@@ -1448,7 +1416,7 @@ def main(argv):
                         t_g0=t_g0,
                         t_i0=t_i0,
                         z_p=z_p,
-                        two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl") else "legacy_2d",
+                        two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv") else "legacy_2d",
                     )
                     psfs.append(psf)
 
@@ -1456,7 +1424,7 @@ def main(argv):
                         img.ndim == 2
                         and psf.ndim == 3
                         and meta.get("microscope_type", "widefield") == "widefield"
-                        and method in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+                        and method in ("ci_rl", "ci_rl_tv")
                         and str(two_d_mode).strip().lower() == "auto"
                     )
                     effective_psf = psf
@@ -1492,11 +1460,6 @@ def main(argv):
                             two_d_wf_aggressiveness=two_d_wf_aggressiveness,
                             two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
                             two_d_wf_bg_scale=two_d_wf_bg_scale,
-                            dl_model_path=dl_model_path,
-                            dl_z_context=dl_z_context,
-                            dl_batch_size=dl_batch_size,
-                            dl_mixed_precision=dl_mixed_precision,
-                            dl_residual_strength=dl_residual_strength,
                         )
                     )
                     print(f"    Channel {ch_idx}: done in {_format_duration(time.time() - t_ch)}")

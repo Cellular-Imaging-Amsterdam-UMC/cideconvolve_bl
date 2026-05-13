@@ -50,204 +50,25 @@ logger = logging.getLogger(__name__)
 
 # OME XML namespace
 _OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
-_DEFAULT_PINHOLE_AIRY_UNITS = 1.0
+from ._meta_helpers import (
+    _DEFAULT_PINHOLE_AIRY_UNITS,
+    _apply_map_metadata,
+    _apply_pinhole_airy_units,
+    _calculate_pinhole_airy_units,
+    _format_float_list,
+    _metadata_float,
+    _metadata_float_list,
+    _ome_enum_name,
+    _pinhole_size_to_um,
+)
 
-
-def _ome_enum_name(value: Any) -> str:
-    """Return a compact lowercase name for OME enum-like values."""
-    if value is None:
-        return ""
-    name = getattr(value, "name", None)
-    text = str(name if name is not None else value).strip()
-    return text.split(".")[-1].lower()
-
-
-def _pinhole_size_to_um(size: Any, unit: Any) -> Optional[float]:
-    """Convert metadata pinhole size to micrometers when possible."""
-    if size is None:
-        return None
-    try:
-        size_f = float(size)
-    except (TypeError, ValueError):
-        return None
-    unit_name = _ome_enum_name(unit)
-    if unit_name in ("", "µm", "um", "micrometer", "micrometre", "micrometers", "micrometres"):
-        return size_f
-    if unit_name in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
-        return size_f / 1000.0
-    if unit_name in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
-        return size_f * 1000.0
-    if unit_name in ("m", "meter", "metre", "meters", "metres"):
-        return size_f * 1_000_000.0
-    return None
-
-
-def _calculate_pinhole_airy_units(
-    pinhole_size: Any,
-    pinhole_unit: Any,
-    emission_wavelength_nm: Any,
-    na: Any,
-    magnification: Any,
-) -> Optional[float]:
-    """Convert detector-plane pinhole diameter metadata to Airy disk units."""
-    pinhole_um = _pinhole_size_to_um(pinhole_size, pinhole_unit)
-    try:
-        emission_um = float(emission_wavelength_nm) / 1000.0
-        na_f = float(na)
-        mag_f = float(magnification)
-    except (TypeError, ValueError):
-        return None
-    denom = 1.22 * emission_um * mag_f / max(na_f, 1e-12)
-    if pinhole_um is None or denom <= 0.0:
-        return None
-    return float(pinhole_um / denom)
-
-
-def _metadata_float(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _metadata_float_list(value: Any) -> list[float]:
-    if value is None:
-        return []
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        values = value
-    else:
-        values = str(value).replace(";", ",").split(",")
-    parsed: list[float] = []
-    for item in values:
-        number = _metadata_float(str(item).strip())
-        if number is not None:
-            parsed.append(number)
-    return parsed
-
-
-def _apply_map_metadata(meta: dict[str, Any], values: dict[str, Any]) -> set[str]:
-    """Apply OME MapAnnotation metadata used by cideconvolve benchmark files."""
-    if not values:
-        return set()
-
-    applied: set[str] = set()
-    normalized = {str(key).strip().lower(): value for key, value in values.items()}
-
-    sample_ri = _metadata_float(normalized.get("samplerefractiveindex"))
-    if sample_ri is not None:
-        meta["sample_refractive_index"] = sample_ri
-        applied.add("sample_refractive_index")
-
-    pinhole_values = _metadata_float_list(normalized.get("pinholeairyunits"))
-    if pinhole_values:
-        channels = meta.get("channels") or []
-        if not channels:
-            channels = [{}]
-            meta["channels"] = channels
-        for idx, ch in enumerate(channels):
-            ch["pinhole_airy_units"] = (
-                pinhole_values[idx] if idx < len(pinhole_values) else pinhole_values[-1]
-            )
-        applied.add("pinhole_airy_units")
-
-    return applied
-
-
-def _microscope_type_from_text(value: Any) -> Optional[str]:
-    text = str(value or "").replace("_", " ").replace("-", " ").lower()
-    if "confocal" in text or "multi photon" in text:
-        return "confocal"
-    if "wide" in text:
-        return "widefield"
-    return None
-
-
-def _iter_annotation_dict_items(node: Any):
-    if isinstance(node, dict):
-        qname = node.get("qname")
-        attrs = node.get("attributes") or {}
-        if qname:
-            yield str(qname), {str(k): str(v) for k, v in attrs.items()}
-        for child in node.get("children") or []:
-            yield from _iter_annotation_dict_items(child)
-        for child in node.get("any_elements") or []:
-            yield from _iter_annotation_dict_items(child)
-
-
-def _apply_svi_xml_metadata(meta: dict[str, Any], items) -> set[str]:
-    """Apply SVI/Huygens custom XML annotation values when present."""
-    applied: set[str] = set()
-    channels = meta.get("channels") or []
-    channel_by_id = {
-        str(ch.get("id", f"Channel:{idx}")).lower(): ch
-        for idx, ch in enumerate(channels)
-    }
-
-    for qname, attrs in items:
-        if qname.split("}")[-1] != "ChannelData":
-            continue
-
-        sample_ri = _metadata_float(attrs.get("RefrIndexMedium"))
-        if sample_ri is not None and meta.get("sample_refractive_index") is None:
-            meta["sample_refractive_index"] = sample_ri
-            applied.add("sample_refractive_index")
-
-        immersion_ri = _metadata_float(attrs.get("RefrIndexLensMedium"))
-        if immersion_ri is not None and meta.get("refractive_index") is None:
-            meta["refractive_index"] = immersion_ri
-            applied.add("refractive_index")
-
-        microscope_type = _microscope_type_from_text(attrs.get("MicroscopeSpec"))
-        if microscope_type is not None and not meta.get("microscope_type"):
-            meta["microscope_type"] = microscope_type
-            applied.add("microscope_type")
-
-        channel = channel_by_id.get(str(attrs.get("ChannelID", "")).lower())
-        if channel is None:
-            continue
-        emission = _metadata_float(attrs.get("LambdaEm"))
-        if emission is not None and channel.get("emission_wavelength") is None:
-            channel["emission_wavelength"] = emission
-            applied.add("emission_wavelength")
-        excitation = _metadata_float(attrs.get("LambdaEx"))
-        if excitation is not None and channel.get("excitation_wavelength") is None:
-            channel["excitation_wavelength"] = excitation
-            applied.add("excitation_wavelength")
-
-    return applied
-
-
-def _apply_pinhole_airy_units(
-    meta: dict[str, Any],
-    fallback_airy_units: Optional[float | Sequence[float]] = _DEFAULT_PINHOLE_AIRY_UNITS,
-    *,
-    overrule_metadata: bool = False,
-) -> bool:
-    """Populate per-channel pinhole Airy units; return True if metadata converted."""
-    metadata_used = False
-    if fallback_airy_units is None:
-        fallbacks = [_DEFAULT_PINHOLE_AIRY_UNITS]
-    elif isinstance(fallback_airy_units, Sequence) and not isinstance(fallback_airy_units, (str, bytes)):
-        fallbacks = [float(value) for value in fallback_airy_units] or [_DEFAULT_PINHOLE_AIRY_UNITS]
-    else:
-        fallbacks = [float(fallback_airy_units)]
-    for i, ch in enumerate(meta.get("channels") or []):
-        fallback = fallbacks[i] if i < len(fallbacks) else fallbacks[-1]
-        if ch.get("pinhole_airy_units") is not None and not overrule_metadata:
-            metadata_used = True
-        calculated = _calculate_pinhole_airy_units(
-            ch.get("pinhole_size"),
-            ch.get("pinhole_size_unit"),
-            ch.get("emission_wavelength"),
-            meta.get("na"),
-            meta.get("magnification"),
-        )
-        if calculated is not None:
-            ch["pinhole_airy_units_from_metadata"] = calculated
-            metadata_used = True
-        if overrule_metadata or ch.get("pinhole_airy_units") is None:
-            ch["pinhole_airy_units"] = fallback if overrule_metadata or calculated is None else calculated
-    return metadata_used
+_IMMERSION_RI = {
+    "OIL": 1.515,
+    "WATER": 1.333,
+    "GLYCEROL": 1.47,
+    "AIR": 1.0,
+    "MULTI": 1.515,
+}
 
 # ---------------------------------------------------------------------------
 # Helper: detect GPU availability
@@ -283,12 +104,16 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
             else None
         )
         meta["immersion"] = obj.get("Immersion")
+        immersion_name = str(meta["immersion"] or "").upper()
+        if immersion_name in _IMMERSION_RI:
+            meta["refractive_index"] = _IMMERSION_RI[immersion_name]
 
     # --- ObjectiveSettings (refractive index) ---
     objset = root.find(".//ome:Image/ome:ObjectiveSettings", ns)
     if objset is not None:
         ri_str = objset.get("RefractiveIndex")
-        meta["refractive_index"] = float(ri_str) if ri_str else None
+        if ri_str:
+            meta["refractive_index"] = float(ri_str)
 
     # --- Pixels ---
     pixels = root.find(".//ome:Image/ome:Pixels", ns)
@@ -333,11 +158,6 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
         if key and item.text is not None:
             map_values[key] = item.text
     _apply_map_metadata(meta, map_values)
-
-    _apply_svi_xml_metadata(
-        meta,
-        ((elem.tag, dict(elem.attrib)) for elem in root.iter()),
-    )
 
     return meta
 
@@ -405,21 +225,11 @@ def _extract_bioio_metadata(img) -> dict[str, Any]:
                         map_values[str(key)] = str(val)
         _apply_map_metadata(meta, map_values)
 
-        xml_items = []
-        if structured is not None:
-            for annotation in getattr(structured, "xml_annotations", []) or []:
-                value = getattr(annotation, "value", None)
-                if hasattr(value, "model_dump"):
-                    value = value.model_dump()
-                elif hasattr(value, "dict"):
-                    value = value.dict()
-                xml_items.extend(_iter_annotation_dict_items(value))
-        _apply_svi_xml_metadata(meta, xml_items)
-
         # Objective info
         if image.objective_settings is not None:
             ri = getattr(image.objective_settings, "refractive_index", None)
-            meta["refractive_index"] = float(ri) if ri is not None else None
+            if ri is not None:
+                meta["refractive_index"] = float(ri)
 
         # Try to get NA from instrument
         if ome.instruments:
@@ -432,6 +242,9 @@ def _extract_bioio_metadata(img) -> dict[str, Any]:
                         meta["magnification"] = float(obj.nominal_magnification)
                     if obj.immersion is not None:
                         meta["immersion"] = str(obj.immersion)
+                        imm_name = getattr(obj.immersion, "name", str(obj.immersion)).upper()
+                        if imm_name in _IMMERSION_RI and "refractive_index" not in meta:
+                            meta["refractive_index"] = _IMMERSION_RI[imm_name]
                     break
     except Exception as e:
         logger.warning("Could not extract full OME metadata: %s", e)
@@ -883,7 +696,7 @@ def generate_psf(
     numpy.ndarray
         Normalized PSF, shape (Z,Y,X) for 3D or (Y,X) for 2D. Sum = 1.
     """
-    from deconvolve_ci import ci_generate_psf
+    from .deconvolve_ci import ci_generate_psf
 
     na = metadata["na"]
     ri = metadata["refractive_index"]
@@ -1146,7 +959,7 @@ def _deconvolve_ci_method(
     dl_residual_strength: float = 1.0,
     device: Optional[str] = None,
 ) -> np.ndarray:
-    from deconvolve_ci import (
+    from .deconvolve_ci import (
         ci_rl_deconvolve,
         ci_sparse_hessian_deconvolve,
     )
@@ -1174,7 +987,7 @@ def _deconvolve_ci_method(
             **common,
         )
     elif method == "ci_rl_dl":
-        from deconvolve_ci_dl import deconvolve_ci_rl_dl
+        from .deconvolve_ci_dl import deconvolve_ci_rl_dl
 
         result = deconvolve_ci_rl_dl(
             image,

@@ -1,25 +1,24 @@
 {
   "name": "W_CIDeconvolve",
-  "description": "3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy, optional experimental 2.5D DL refinement, SHB-RL with Total Variation, or sparse-Hessian variational deconvolution. Supports GPU acceleration via CUDA (PyTorch).",
+  "description": "3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy, SHB-RL with Total Variation regularisation, or sparse-Hessian variational deconvolution. Supports GPU acceleration via CUDA (PyTorch).",
   "container-image": {
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale --dl_model_path @dl_model_path --dl_z_context @dl_z_context --dl_batch_size @dl_batch_size --dl_mixed_precision @dl_mixed_precision --dl_residual_strength @dl_residual_strength",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "method",
       "value-key": "@method",
       "command-line-flag": "--method",
       "name": "(ess) Deconvolution method",
-      "description": "Which deconvolution algorithm to use. ci_rl: SHB-accelerated Richardson-Lucy. ci_rl_dl: ci_rl plus experimental 2.5D residual U-Net refinement. ci_rl_tv: same with Total Variation regularisation. ci_sparse_hessian: sparse-Hessian / SPITFIRE-style variational deconvolution.",
+      "description": "Which deconvolution algorithm to use. ci_rl: SHB-accelerated Richardson-Lucy. ci_rl_tv: same with Total Variation regularisation. ci_sparse_hessian: sparse-Hessian / SPITFIRE-style variational deconvolution.",
       "default-value": "ci_rl",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
         "ci_rl",
-        "ci_rl_dl",
         "ci_rl_tv",
         "ci_sparse_hessian"
       ]
@@ -425,67 +424,6 @@
       "type": "Number",
       "minimum": 0.1,
       "maximum": 10
-    },
-    {
-      "id": "dl_model_path",
-      "value-key": "@dl_model_path",
-      "command-line-flag": "--dl_model_path",
-      "name": "(exp) ci_rl_dl model path",
-      "description": "Path to a trained ci_rl_dl final_model.pt checkpoint. If empty, ci_rl_dl returns the normal ci_rl result unchanged.",
-      "default-value": "",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "dl_z_context",
-      "value-key": "@dl_z_context",
-      "command-line-flag": "--dl_z_context",
-      "name": "(exp) ci_rl_dl Z context",
-      "description": "Number of neighboring planes on each side of the central plane used by the 2.5D model. Must match the trained checkpoint.",
-      "default-value": 2,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 8
-    },
-    {
-      "id": "dl_batch_size",
-      "value-key": "@dl_batch_size",
-      "command-line-flag": "--dl_batch_size",
-      "name": "(exp) ci_rl_dl batch size",
-      "description": "Number of Z planes refined per inference batch.",
-      "default-value": 8,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 1,
-      "maximum": 128
-    },
-    {
-      "id": "dl_mixed_precision",
-      "value-key": "@dl_mixed_precision",
-      "command-line-flag": "--dl_mixed_precision",
-      "name": "(exp) ci_rl_dl mixed precision",
-      "description": "Use CUDA mixed precision for the DL refinement pass when CUDA is available.",
-      "default-value": true,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Boolean"
-    },
-    {
-      "id": "dl_residual_strength",
-      "value-key": "@dl_residual_strength",
-      "command-line-flag": "--dl_residual_strength",
-      "name": "(exp) ci_rl_dl residual strength",
-      "description": "Inference-only multiplier for the learned residual correction. Use values such as 0.25 or 0.5 when DL refinement is too aggressive.",
-      "default-value": 1.0,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0.0,
-      "maximum": 2.0
     }
   ],
   "schema-version": "cytomine-0.1"

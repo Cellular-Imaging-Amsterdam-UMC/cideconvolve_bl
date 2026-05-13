@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
 # Resolve paths relative to this script
 SCRIPT_DIR = Path(__file__).resolve().parent
 DESCRIPTOR_PATH = SCRIPT_DIR / "descriptor.json"
-ICON_PATH = SCRIPT_DIR / "icon.svg"
+ICON_PATH = SCRIPT_DIR / "gui" / "icon.svg"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
 
 

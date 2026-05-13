@@ -25,8 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deconvolve import deconvolve_image
-from deconvolve_ci_dl import (
+from core.deconvolve import deconvolve_image
+from core.deconvolve_ci_dl import (
     apply_dl_refinement_25d,
     conditioning_vector,
     load_residual_unet_checkpoint,

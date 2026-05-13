@@ -19,7 +19,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from deconvolve_ci import (
+from .deconvolve_ci import (
     _forward_project,
     _pick_device,
     _prepare_otf,

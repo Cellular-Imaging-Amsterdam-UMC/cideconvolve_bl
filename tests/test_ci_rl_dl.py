@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import tifffile
 
-from deconvolve_ci_dl import (
+from core.deconvolve_ci_dl import (
     CONDITIONING_CHANNELS,
     GatedResidualUNet25D,
     ResidualUNet25D,
@@ -15,8 +15,8 @@ from deconvolve_ci_dl import (
     input_channel_count,
     load_residual_unet_checkpoint,
 )
-from deconvolve import deconvolve
-from train import SyntheticVolumeDataset, TrainConfig, generate_training_data, generate_synthetic_gt
+from core.deconvolve import deconvolve
+from training.train import SyntheticVolumeDataset, TrainConfig, generate_training_data, generate_synthetic_gt
 
 
 class CiRlDlSmokeTests(unittest.TestCase):

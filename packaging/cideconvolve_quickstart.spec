@@ -1,8 +1,17 @@
-# cideconvolve.spec — PyInstaller build spec (single-file)
-# Build with:  pyinstaller cideconvolve.spec
+# cideconvolve_quickstart.spec — PyInstaller one-FOLDER build spec
+# Build with:  pyinstaller cideconvolve_quickstart.spec
 #              (run from the repository root)
 #
-# Produces:  dist/cideconvolve.exe  (single-file executable)
+# Produces:  dist/cideconvolve/cideconvolve.exe  (folder distribution)
+#            Run cideconvolve.exe from inside dist/cideconvolve/ — it needs
+#            the _internal/ sibling folder next to it.
+#            For release: zip the dist/cideconvolve/ folder itself.
+#
+# Why use this instead of cideconvolve.spec?
+#   • Folder builds skip the single-file extraction step → app starts instantly.
+#   • Incremental rebuilds are much faster (only changed files are re-written).
+#   • Ideal for quick iteration / testing during development.
+#   • Ship the whole dist/cideconvolve/ folder (e.g. zip it) for distribution.
 #
 # NOTE: icon.ico is used for the Windows executable icon.
 
@@ -48,6 +57,14 @@ ice_toplevel = [
     if name.startswith(('omero_', 'Glacier2', 'IcePatch2', 'IceBox', 'IceGrid', 'IceStorm'))
 ]
 
+# ── Collect bioio reader plugins (as installed per requirements_gui.txt) ─────
+bioio_datas,    bioio_binaries,    bioio_hiddenimports    = collect_all('bioio')
+bioio_b_datas,  bioio_b_binaries,  bioio_b_hiddenimports  = collect_all('bioio_base')
+bioio_ot_datas, bioio_ot_binaries, bioio_ot_hiddenimports = collect_all('bioio_ome_tiff')
+bioio_oz_datas, bioio_oz_binaries, bioio_oz_hiddenimports = collect_all('bioio_ome_zarr')
+bioio_cz_datas, bioio_cz_binaries, bioio_cz_hiddenimports = collect_all('bioio_czi')
+bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_nd2')
+
 # ── Collect imagecodecs (TIFF/OME-TIFF codec extensions required by tifffile) ─
 imc_datas, imc_binaries, imc_hiddenimports = collect_all('imagecodecs')
 
@@ -61,22 +78,14 @@ mpl_datas, mpl_binaries, mpl_hiddenimports = collect_all('matplotlib')
 # ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
-# ── Collect bioio reader plugins (as installed per requirements_gui.txt) ─────
-bioio_datas,    bioio_binaries,    bioio_hiddenimports    = collect_all('bioio')
-bioio_b_datas,  bioio_b_binaries,  bioio_b_hiddenimports  = collect_all('bioio_base')
-bioio_ot_datas, bioio_ot_binaries, bioio_ot_hiddenimports = collect_all('bioio_ome_tiff')
-bioio_oz_datas, bioio_oz_binaries, bioio_oz_hiddenimports = collect_all('bioio_ome_zarr')
-bioio_cz_datas, bioio_cz_binaries, bioio_cz_hiddenimports = collect_all('bioio_czi')
-bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_nd2')
-
 # ── Resolve exe icon (needs .ico on Windows) ─────────────────────────────────
-_icon = os.path.abspath('icon.ico')
+_icon = os.path.abspath('gui/icon.ico')
 if not os.path.exists(_icon):
-    raise FileNotFoundError('icon.ico is required for the Windows executable icon')
+    raise FileNotFoundError('gui/icon.ico is required for the Windows executable icon')
 
 a = Analysis(
-    ['gui_deconvolve_ci.py'],
-    pathex=['.'],
+    ['gui/gui_deconvolve_ci.py'],
+    pathex=['.', 'gui'],
     binaries=(
         pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
         + zarr_binaries + numcodecs_binaries
@@ -91,25 +100,25 @@ a = Analysis(
         + bioio_cz_binaries + bioio_nd_binaries
     ),
     datas=[
-        ('icon.svg', '.'),          # runtime window icon (loaded by the app)
-        ('icon.ico', '.'),          # Windows executable icon
+        ('gui/icon.svg', '.'),      # runtime window icon (loaded by the app)
+        ('gui/icon.ico', '.'),      # Windows executable icon
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
       + xsdata_datas + xspb_datas
       + pyd_datas + pyde_datas + dask_datas
-      + imc_datas
       + imgio_datas + imgff_datas
       + mpl_datas
+      + imc_datas
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
       + bioio_cz_datas + bioio_nd_datas,
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
-        'deconvolve_ci',
-        'deconvolve_ci_dl',
-        'deconvolve',
+        'core.deconvolve_ci',
+        'core.deconvolve_ci_dl',
+        'core.deconvolve',
         'wrapper',
         # ── numeric / array ─────────────────────────────────────────────────
         'numpy',
@@ -227,18 +236,36 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    [],                         # no binaries/datas embedded — goes into COLLECT
     name='cideconvolve',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,                  # skip UPX compression for faster builds
     console=False,
     disable_windowed_traceback=False,
-    icon=_icon,             # icon.ico (see note at the top of this file)
+    icon=_icon,                 # icon.ico (see note at the top of this file)
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
 )
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='cideconvolve',        # → dist/cideconvolve/
+)
+
+# ── Post-build: remove the bare bootloader exe that PyInstaller writes to
+#    dist/ as a side-effect of the EXE step.  Only the folder in
+#    dist/cideconvolve/ is a working distribution.
+import os as _os
+_stale = _os.path.join(DISTPATH, 'cideconvolve.exe')
+if _os.path.isfile(_stale):
+    _os.remove(_stale)
+    print(f'Removed stale bootloader: {_stale}')

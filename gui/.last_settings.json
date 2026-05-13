@@ -1,0 +1,43 @@
+{
+  "values": {
+    "method": "ci_rl",
+    "iterations": "150",
+    "convergence": "auto",
+    "rel_threshold": 0.005,
+    "overrule_image_metadata": false,
+    "na": 1.4,
+    "emission_wl": "520",
+    "pixel_size_xy": 65.0,
+    "pixel_size_z": 200.0,
+    "microscope_type": "confocal",
+    "excitation_wl": "488",
+    "pinhole_airy": "1.0",
+    "refractive_index": "oil (1.515)",
+    "sample_ri": "prolong gold (1.47)",
+    "projection": "none",
+    "benchmark": true,
+    "bench_crop": true,
+    "compute_metrics": false,
+    "tv_lambda": 0.0001,
+    "damping": "none",
+    "two_d_mode": "auto",
+    "sparse_hessian_weight": 0.6,
+    "sparse_hessian_reg": 0.98,
+    "background": "auto",
+    "offset": "auto",
+    "prefilter_sigma": 0.0,
+    "start": "auto",
+    "device": "auto",
+    "two_d_wf_aggressiveness": "Balanced",
+    "two_d_wf_bg_radius_um": 0.5,
+    "two_d_wf_bg_scale": 1.0
+  },
+  "folders": {
+    "infolder": "C:\\rahoebe\\Python\\cideconvolve\\infolder",
+    "outfolder": "C:\\rahoebe\\Python\\cideconvolve\\outfolder",
+    "gtfolder": "C:\\rahoebe\\Python\\cideconvolve\\gui\\gtfolder"
+  },
+  "docker_options": {
+    "use_gpus": true
+  }
+}

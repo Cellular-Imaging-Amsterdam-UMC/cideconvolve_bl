@@ -11,12 +11,19 @@ import math
 import multiprocessing
 import os
 import random
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
+
+# Ensure repo root is on sys.path so core.* is importable when this
+# script is run directly (python training/train.py)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import tifffile
@@ -31,8 +38,8 @@ try:
 except Exception:  # pragma: no cover - Pillow fallback covers minimal envs.
     plt = None
 
-from deconvolve_ci import ci_generate_psf, ci_rl_deconvolve
-from deconvolve_ci_dl import (
+from core.deconvolve_ci import ci_generate_psf, ci_rl_deconvolve
+from core.deconvolve_ci_dl import (
     CONDITIONING_CHANNELS,
     GatedResidualUNet25D,
     ResidualUNet25D,

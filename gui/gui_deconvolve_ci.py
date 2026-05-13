@@ -28,6 +28,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+# Ensure repo root is on sys.path so core.* is importable when this
+# script is run directly (python gui/gui_deconvolve_ci.py)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import numpy as np
 
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon
@@ -149,15 +155,17 @@ def _safe_filename_stem(text: str) -> str:
     return cleaned or "deconvolution"
 
 
-_DEFAULT_PINHOLE_AIRY_UNITS = 1.0
-
-
-def _ome_enum_name(value: Any) -> str:
-    if value is None:
-        return ""
-    name = getattr(value, "name", None)
-    text = str(name if name is not None else value).strip()
-    return text.split(".")[-1].lower()
+from core._meta_helpers import (
+    _DEFAULT_PINHOLE_AIRY_UNITS,
+    _apply_map_metadata,
+    _apply_pinhole_airy_units,
+    _calculate_pinhole_airy_units,
+    _format_float_list,
+    _metadata_float,
+    _metadata_float_list,
+    _ome_enum_name,
+    _pinhole_size_to_um,
+)
 
 
 def _display_enum_name(value: Any) -> str:
@@ -169,187 +177,9 @@ def _display_enum_name(value: Any) -> str:
     return text.replace("_", " ").title() if text.isupper() else text
 
 
-def _pinhole_size_to_um(size: Any, unit: Any) -> Optional[float]:
-    if size is None:
-        return None
-    try:
-        size_f = float(size)
-    except (TypeError, ValueError):
-        return None
-    unit_name = _ome_enum_name(unit)
-    if unit_name in ("", "µm", "um", "micrometer", "micrometre", "micrometers", "micrometres"):
-        return size_f
-    if unit_name in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
-        return size_f / 1000.0
-    if unit_name in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
-        return size_f * 1000.0
-    if unit_name in ("m", "meter", "metre", "meters", "metres"):
-        return size_f * 1_000_000.0
-    return None
-
-
-def _calculate_pinhole_airy_units(
-    pinhole_size: Any,
-    pinhole_unit: Any,
-    emission_wavelength_nm: Any,
-    na: Any,
-    magnification: Any,
-) -> Optional[float]:
-    pinhole_um = _pinhole_size_to_um(pinhole_size, pinhole_unit)
-    try:
-        emission_um = float(emission_wavelength_nm) / 1000.0
-        na_f = float(na)
-        mag_f = float(magnification)
-    except (TypeError, ValueError):
-        return None
-    denom = 1.22 * emission_um * mag_f / max(na_f, 1e-12)
-    if pinhole_um is None or denom <= 0.0:
-        return None
-    return float(pinhole_um / denom)
-
-
-def _format_float_list(values: list[float]) -> str:
-    return ", ".join(f"{value:g}" for value in values)
-
-
 def _format_pinhole_values(values: list[float]) -> str:
     return ", ".join(f"{value:.2f}" for value in values)
 
-
-def _metadata_float(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _metadata_float_list(value: Any) -> list[float]:
-    if value is None:
-        return []
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        values = value
-    else:
-        values = str(value).replace(";", ",").split(",")
-    parsed: list[float] = []
-    for item in values:
-        number = _metadata_float(str(item).strip())
-        if number is not None:
-            parsed.append(number)
-    return parsed
-
-
-def _apply_map_metadata(meta: dict, values: dict[str, Any]) -> set[str]:
-    """Apply custom OME MapAnnotation values from benchmark-style OME-TIFFs."""
-    if not values:
-        return set()
-
-    applied: set[str] = set()
-    normalized = {str(key).strip().lower(): value for key, value in values.items()}
-
-    sample_ri = _metadata_float(normalized.get("samplerefractiveindex"))
-    if sample_ri is not None:
-        meta["sample_refractive_index"] = sample_ri
-        applied.add("sample_refractive_index")
-
-    pinhole_values = _metadata_float_list(normalized.get("pinholeairyunits"))
-    if pinhole_values:
-        channels = meta.get("channels") or []
-        if not channels:
-            channels = [{}]
-            meta["channels"] = channels
-        for idx, ch in enumerate(channels):
-            ch["pinhole_airy_units"] = (
-                pinhole_values[idx] if idx < len(pinhole_values) else pinhole_values[-1]
-            )
-        applied.add("pinhole_airy_units")
-
-    return applied
-
-
-def _microscope_type_from_text(value: Any) -> Optional[str]:
-    text = str(value or "").replace("_", " ").replace("-", " ").lower()
-    if "confocal" in text or "multi photon" in text:
-        return "confocal"
-    if "wide" in text:
-        return "widefield"
-    return None
-
-
-def _iter_annotation_dict_items(node: Any):
-    if isinstance(node, dict):
-        qname = node.get("qname")
-        attrs = node.get("attributes") or {}
-        if qname:
-            yield str(qname), {str(k): str(v) for k, v in attrs.items()}
-        for child in node.get("children") or []:
-            yield from _iter_annotation_dict_items(child)
-        for child in node.get("any_elements") or []:
-            yield from _iter_annotation_dict_items(child)
-
-
-def _apply_svi_xml_metadata(meta: dict, items) -> set[str]:
-    """Apply SVI/Huygens custom XML annotation values when present."""
-    applied: set[str] = set()
-    channels = meta.get("channels") or []
-    channel_by_id = {
-        str(ch.get("id", f"Channel:{idx}")).lower(): ch
-        for idx, ch in enumerate(channels)
-    }
-
-    for qname, attrs in items:
-        if qname.split("}")[-1] != "ChannelData":
-            continue
-
-        sample_ri = _metadata_float(attrs.get("RefrIndexMedium"))
-        if sample_ri is not None and meta.get("sample_refractive_index") is None:
-            meta["sample_refractive_index"] = sample_ri
-            applied.add("sample_refractive_index")
-
-        immersion_ri = _metadata_float(attrs.get("RefrIndexLensMedium"))
-        if immersion_ri is not None and meta.get("refractive_index") is None:
-            meta["refractive_index"] = immersion_ri
-            applied.add("refractive_index")
-
-        microscope_type = _microscope_type_from_text(attrs.get("MicroscopeSpec"))
-        if microscope_type is not None and not meta.get("microscope_type"):
-            meta["microscope_type"] = microscope_type
-            applied.add("microscope_type")
-
-        channel = channel_by_id.get(str(attrs.get("ChannelID", "")).lower())
-        if channel is None:
-            continue
-        emission = _metadata_float(attrs.get("LambdaEm"))
-        if emission is not None and channel.get("emission_wavelength") is None:
-            channel["emission_wavelength"] = emission
-            applied.add("emission_wavelength")
-        excitation = _metadata_float(attrs.get("LambdaEx"))
-        if excitation is not None and channel.get("excitation_wavelength") is None:
-            channel["excitation_wavelength"] = excitation
-            applied.add("excitation_wavelength")
-
-    return applied
-
-
-def _apply_pinhole_airy_units(meta: dict, fallback_airy_units: float = _DEFAULT_PINHOLE_AIRY_UNITS) -> bool:
-    metadata_used = False
-    for ch in meta.get("channels") or []:
-        if ch.get("pinhole_airy_units") is not None:
-            metadata_used = True
-            continue
-        calculated = _calculate_pinhole_airy_units(
-            ch.get("pinhole_size"),
-            ch.get("pinhole_size_unit"),
-            ch.get("emission_wavelength"),
-            meta.get("na"),
-            meta.get("magnification"),
-        )
-        if calculated is not None:
-            ch["pinhole_airy_units"] = calculated
-            ch["pinhole_airy_units_from_metadata"] = calculated
-            metadata_used = True
-        else:
-            ch.setdefault("pinhole_airy_units", float(fallback_airy_units))
-    return metadata_used
 
 # ---------------------------------------------------------------------------
 # Channel colour helpers (same scheme as deconvolve.save_mip_png)
@@ -725,17 +555,6 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
                         if key and val is not None:
                             map_values[str(key)] = str(val)
             _apply_map_metadata(meta, map_values)
-
-            xml_items = []
-            if structured is not None:
-                for annotation in getattr(structured, "xml_annotations", []) or []:
-                    value = getattr(annotation, "value", None)
-                    if hasattr(value, "model_dump"):
-                        value = value.model_dump()
-                    elif hasattr(value, "dict"):
-                        value = value.dict()
-                    xml_items.extend(_iter_annotation_dict_items(value))
-            _apply_svi_xml_metadata(meta, xml_items)
 
             # Objective (NA, immersion → RI)
             if ome.instruments:
@@ -3556,12 +3375,12 @@ def _deconvolve_channel_stacks(
         return bool(should_stop and should_stop())
 
     try:
-        from deconvolve_ci import (
+        from core.deconvolve_ci import (
             ci_generate_psf,
             ci_rl_deconvolve,
             ci_sparse_hessian_deconvolve,
         )
-        from deconvolve_ci_dl import deconvolve_ci_rl_dl
+        from core.deconvolve_ci_dl import deconvolve_ci_rl_dl
     except OSError as exc:
         raise RuntimeError(
             f"Failed to load deconvolve_ci (torch DLL error).\n\n"
@@ -3602,7 +3421,7 @@ def _deconvolve_channel_stacks(
         # Check whether the image will be tiled — movie is incompatible with tiling.
         # Do this early so the user gets a clear error before any computation starts.
         if channels_zyx:
-            from deconvolve_ci import _auto_n_tiles
+            from core.deconvolve_ci import _auto_n_tiles
             _sample = _channel_stack_to_solver_input(channels_zyx[0])
             _n_tiles_check = _auto_n_tiles(_sample.shape, device=params.get("device"), psf_xy_est=65)
             if _n_tiles_check > 1:
@@ -4012,7 +3831,7 @@ class _FitPsfWorker(QThread):
 
     def run(self):
         try:
-            from deconvolve_ci import ci_fit_psf_params
+            from core.deconvolve_ci import ci_fit_psf_params
 
             n_channels = len(self.channels)
             if n_channels == 0:
@@ -4324,7 +4143,7 @@ def _detect_gpu_info() -> str:
 
 
 class DeconvolveCIWindow(QMainWindow):
-    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False):
+    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False, dlref_available: bool = False):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
@@ -4355,6 +4174,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_final_iteration_payload: Optional[dict] = None
         self._movie_available = bool(movie_available)
         self._fitpsf_available = bool(fitpsf_available)
+        self._dlref_available = bool(dlref_available)
         self._log_emitter = _GuiLogEmitter(self)
         self._log_handler = _QtLogHandler(self._log_emitter)
         self._log_emitter.line.connect(self._log_from_logging)
@@ -4417,7 +4237,11 @@ class DeconvolveCIWindow(QMainWindow):
         method_group.setLayout(ml)
 
         self._method_combo = NoWheelComboBox()
-        self._method_combo.addItems(["ci_rl", "ci_rl_dl", "ci_rl_tv", "ci_sparse_hessian"])
+        _method_items = ["ci_rl"]
+        if self._dlref_available:
+            _method_items.append("ci_rl_dl")
+        _method_items += ["ci_rl_tv", "ci_sparse_hessian"]
+        self._method_combo.addItems(_method_items)
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
@@ -4493,47 +4317,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_sparse_reg.setValue(0.98)
         aml.addRow("Sparse reg:", self._sp_sparse_reg)
         self._sparse_reg_label = aml.labelForField(self._sp_sparse_reg)  # type: ignore
-
-        dl_model_widget = QWidget()
-        self._dl_model_widget = dl_model_widget
-        dl_model_row = QHBoxLayout(dl_model_widget)
-        dl_model_row.setContentsMargins(0, 0, 0, 0)
-        self._le_dl_model = QLineEdit("")
-        self._le_dl_model.setPlaceholderText("optional final_model.pt")
-        self._btn_dl_model = QPushButton("Browse")
-        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
-        dl_model_row.addWidget(self._le_dl_model)
-        dl_model_row.addWidget(self._btn_dl_model)
-        aml.addRow("DL model:", dl_model_widget)
-        self._dl_model_label = aml.labelForField(dl_model_widget)  # type: ignore
-
-        self._sp_dl_z_context = NoWheelSpinBox()
-        self._sp_dl_z_context.setRange(0, 8)
-        self._sp_dl_z_context.setValue(2)
-        aml.addRow("DL z-context:", self._sp_dl_z_context)
-        self._dl_z_context_label = aml.labelForField(self._sp_dl_z_context)  # type: ignore
-
-        self._sp_dl_batch_size = NoWheelSpinBox()
-        self._sp_dl_batch_size.setRange(1, 128)
-        self._sp_dl_batch_size.setValue(8)
-        aml.addRow("DL batch size:", self._sp_dl_batch_size)
-        self._dl_batch_size_label = aml.labelForField(self._sp_dl_batch_size)  # type: ignore
-
-        self._cb_dl_mixed_precision = QCheckBox()
-        self._cb_dl_mixed_precision.setChecked(True)
-        aml.addRow("DL mixed precision:", self._cb_dl_mixed_precision)
-        self._dl_mixed_precision_label = aml.labelForField(self._cb_dl_mixed_precision)  # type: ignore
-
-        self._sp_dl_residual_strength = QDoubleSpinBox()
-        self._sp_dl_residual_strength.setRange(0.0, 2.0)
-        self._sp_dl_residual_strength.setDecimals(2)
-        self._sp_dl_residual_strength.setSingleStep(0.05)
-        self._sp_dl_residual_strength.setValue(1.0)
-        self._sp_dl_residual_strength.setToolTip(
-            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
-        )
-        aml.addRow("DL residual strength:", self._sp_dl_residual_strength)
-        self._dl_residual_strength_label = aml.labelForField(self._sp_dl_residual_strength)  # type: ignore
 
         self._bg_combo = NoWheelComboBox()
         self._bg_combo.addItems(["auto", "manual"])
@@ -4893,6 +4676,50 @@ class DeconvolveCIWindow(QMainWindow):
         movie_layout.addRow("Quality:", quality_label)
         self._movie_group.setVisible(self._movie_available)
         advanced_layout.addWidget(self._movie_group)
+
+        # --- DL Refinement parameters (hidden unless launched with --dlref) ---
+        self._dl_group = QGroupBox("DL Refinement Parameters")
+        dl_group_layout = QFormLayout()
+        self._dl_group.setLayout(dl_group_layout)
+
+        dl_model_widget = QWidget()
+        self._dl_model_widget = dl_model_widget
+        dl_model_row = QHBoxLayout(dl_model_widget)
+        dl_model_row.setContentsMargins(0, 0, 0, 0)
+        self._le_dl_model = QLineEdit("")
+        self._le_dl_model.setPlaceholderText("optional final_model.pt")
+        self._btn_dl_model = QPushButton("Browse")
+        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
+        dl_model_row.addWidget(self._le_dl_model)
+        dl_model_row.addWidget(self._btn_dl_model)
+        dl_group_layout.addRow("DL model:", dl_model_widget)
+
+        self._sp_dl_z_context = NoWheelSpinBox()
+        self._sp_dl_z_context.setRange(0, 8)
+        self._sp_dl_z_context.setValue(2)
+        dl_group_layout.addRow("DL z-context:", self._sp_dl_z_context)
+
+        self._sp_dl_batch_size = NoWheelSpinBox()
+        self._sp_dl_batch_size.setRange(1, 128)
+        self._sp_dl_batch_size.setValue(8)
+        dl_group_layout.addRow("DL batch size:", self._sp_dl_batch_size)
+
+        self._cb_dl_mixed_precision = QCheckBox()
+        self._cb_dl_mixed_precision.setChecked(True)
+        dl_group_layout.addRow("DL mixed precision:", self._cb_dl_mixed_precision)
+
+        self._sp_dl_residual_strength = QDoubleSpinBox()
+        self._sp_dl_residual_strength.setRange(0.0, 2.0)
+        self._sp_dl_residual_strength.setDecimals(2)
+        self._sp_dl_residual_strength.setSingleStep(0.05)
+        self._sp_dl_residual_strength.setValue(1.0)
+        self._sp_dl_residual_strength.setToolTip(
+            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
+        )
+        dl_group_layout.addRow("DL residual strength:", self._sp_dl_residual_strength)
+
+        self._dl_group.setVisible(self._dlref_available)
+        advanced_layout.addWidget(self._dl_group)
 
         advanced_layout.addStretch()
         ctrl_layout.addWidget(advanced_section)
@@ -5332,7 +5159,6 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_method_changed(self, text: str):
         is_rl_family = text in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
         is_tv = text == "ci_rl_tv"
-        is_dl = text == "ci_rl_dl"
         is_sparse = text == "ci_sparse_hessian"
         self._sp_tv_lambda.setEnabled(is_tv)
         if not is_tv:
@@ -5347,11 +5173,6 @@ class DeconvolveCIWindow(QMainWindow):
             (self._two_d_mode_label, self._two_d_mode_combo),
             (self._sparse_weight_label, self._sp_sparse_weight),
             (self._sparse_reg_label, self._sp_sparse_reg),
-            (self._dl_model_label, self._dl_model_widget),
-            (self._dl_z_context_label, self._sp_dl_z_context),
-            (self._dl_batch_size_label, self._sp_dl_batch_size),
-            (self._dl_mixed_precision_label, self._cb_dl_mixed_precision),
-            (self._dl_residual_strength_label, self._sp_dl_residual_strength),
         ):
             if label is not None:
                 label.setVisible(False)
@@ -5378,17 +5199,6 @@ class DeconvolveCIWindow(QMainWindow):
         if self._sparse_reg_label is not None:
             self._sparse_reg_label.setVisible(is_sparse)
         self._sp_sparse_reg.setVisible(is_sparse)
-
-        for label, widget in (
-            (self._dl_model_label, self._dl_model_widget),
-            (self._dl_z_context_label, self._sp_dl_z_context),
-            (self._dl_batch_size_label, self._sp_dl_batch_size),
-            (self._dl_mixed_precision_label, self._cb_dl_mixed_precision),
-            (self._dl_residual_strength_label, self._sp_dl_residual_strength),
-        ):
-            if label is not None:
-                label.setVisible(is_dl)
-            widget.setVisible(is_dl)
 
         self._on_damping_changed(self._damping_combo.currentText())
         self._refresh_two_d_wf_expert_state()
@@ -5719,7 +5529,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self,
                 "OMERO not available",
                 "omero-browser-qt is not installed.\n\n"
-                "Install with:\n  pip install \"omero-browser-qt[viewer]==0.2.2\"",
+                "Install with:\n  pip install \"omero-browser-qt[viewer]==0.2.5\"",
             )
             return
 
@@ -5750,7 +5560,7 @@ class DeconvolveCIWindow(QMainWindow):
         else:
             self._refresh_omero_session_deadline()
 
-        browser = OmeroBrowserDialog(self, gateway=gw)
+        browser = OmeroBrowserDialog(self, gateway=gw, multiselect=False)
         if browser.exec() != OmeroBrowserDialog.DialogCode.Accepted:
             return
 
@@ -6951,6 +6761,11 @@ def main():
         action="store_true",
         help="Expose the experimental Fit PSF panel for refractive-index fitting.",
     )
+    parser.add_argument(
+        "--dlref",
+        action="store_true",
+        help="Expose the ci_rl_dl method and DL refinement parameter panel.",
+    )
     args, qt_args = parser.parse_known_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -6959,7 +6774,7 @@ def main():
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf)
+    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf, dlref_available=args.dlref)
     window.show()
     sys.exit(app.exec())
 

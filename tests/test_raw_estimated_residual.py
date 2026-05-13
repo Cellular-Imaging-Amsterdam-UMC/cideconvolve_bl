@@ -29,9 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deconvolve import deconvolve_image
-from deconvolve_ci import ci_rl_deconvolve
-from deconvolve_ci_dl import deconvolve_ci_rl_dl, reconvolve_same
+from core.deconvolve import deconvolve_image
+from core.deconvolve_ci import ci_rl_deconvolve
+from core.deconvolve_ci_dl import deconvolve_ci_rl_dl, reconvolve_same
 
 IMAGE_PATH = REPO_ROOT / "localdata" / "Dendrites_Crop.ome.tiff"
 MODEL_PATH = REPO_ROOT / "models" / "Full-Mix-Test-v2" / "best_model.pt"
