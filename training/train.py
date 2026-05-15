@@ -121,6 +121,11 @@ class TrainConfig:
     intensity_retention_weight: float = 0.0
     intensity_retention_min: float = 0.90
     intensity_retention_max: float = 1.15
+    global_intensity_weight: float = 0.0
+    global_intensity_min: float = 0.98
+    global_intensity_max: float = 1.02
+    background_offset_weight: float = 0.0
+    training_xy_padding: int = 0
     train_samples_per_epoch: int = 256
     val_samples: int = 64
     synthetic_complexity: str = "standard"
@@ -1275,6 +1280,7 @@ class SyntheticVolumeDataset(Dataset):
         use_residual_channel: bool = True,
         cache_size: int = 8,
         use_conditioning: bool = False,
+        xy_padding: int = 0,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -1287,6 +1293,7 @@ class SyntheticVolumeDataset(Dataset):
         self.seed = int(seed)
         self.use_residual_channel = bool(use_residual_channel)
         self.use_conditioning = bool(use_conditioning)
+        self.xy_padding = max(int(xy_padding), 0)
         self.cache_size = max(int(cache_size), 0)
         self._cache: OrderedDict[Path, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]] = OrderedDict()
 
@@ -1322,9 +1329,21 @@ class SyntheticVolumeDataset(Dataset):
         y0 = int(rng.integers(0, h - patch + 1)) if h > patch else 0
         x0 = int(rng.integers(0, w - patch + 1)) if w > patch else 0
         yx = (slice(y0, y0 + patch), slice(x0, x0 + patch))
-        raw_p = raw[:, yx[0], yx[1]]
-        ci_p = ci_rl[:, yx[0], yx[1]]
+        pad = self.xy_padding
+        if pad > 0:
+            raw_context = np.pad(raw, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+            ci_context = np.pad(ci_rl, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+            context_yx = (
+                slice(y0, y0 + patch + 2 * pad),
+                slice(x0, x0 + patch + 2 * pad),
+            )
+            raw_p = raw_context[:, context_yx[0], context_yx[1]]
+            ci_p = ci_context[:, context_yx[0], context_yx[1]]
+        else:
+            raw_p = raw[:, yx[0], yx[1]]
+            ci_p = ci_rl[:, yx[0], yx[1]]
         gt_p = gt[:, yx[0], yx[1]]
+        ci_target = ci_rl[:, yx[0], yx[1]]
         x_in, scale = make_25d_input(
             raw_p,
             ci_p,
@@ -1338,11 +1357,11 @@ class SyntheticVolumeDataset(Dataset):
                 microscope_type=metadata.get("psf_params", {}).get("microscope_type"),
             ) if self.use_conditioning else None,
         )
-        target = ((gt_p[z_idx] - ci_p[z_idx]) / scale).astype(np.float32)[np.newaxis, ...]
+        target = ((gt_p[z_idx] - ci_target[z_idx]) / scale).astype(np.float32)[np.newaxis, ...]
         return {
             "input": torch.from_numpy(x_in),
             "target_residual": torch.from_numpy(target),
-            "ci": torch.from_numpy((ci_p[z_idx] / scale).astype(np.float32)[np.newaxis, ...]),
+            "ci": torch.from_numpy((ci_target[z_idx] / scale).astype(np.float32)[np.newaxis, ...]),
             "gt": torch.from_numpy((gt_p[z_idx] / scale).astype(np.float32)[np.newaxis, ...]),
             "psf": torch.from_numpy(psf.astype(np.float32)),
             "bucket": metadata.get("synthetic_morphology", "unknown"),
@@ -1362,6 +1381,19 @@ def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     tgt_dx = target[..., :, 1:] - target[..., :, :-1]
     tgt_dy = target[..., 1:, :] - target[..., :-1, :]
     return charbonnier(pred_dx, tgt_dx) + charbonnier(pred_dy, tgt_dy)
+
+
+def crop_like(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Center-crop a fully-convolutional prediction to match the loss target."""
+    if pred.shape[-2:] == target.shape[-2:]:
+        return pred
+    y_extra = pred.shape[-2] - target.shape[-2]
+    x_extra = pred.shape[-1] - target.shape[-1]
+    if y_extra < 0 or x_extra < 0:
+        raise ValueError(f"Prediction is smaller than target: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    y0 = y_extra // 2
+    x0 = x_extra // 2
+    return pred[..., y0:y0 + target.shape[-2], x0:x0 + target.shape[-1]]
 
 
 def negative_residual_guard_loss(
@@ -1405,6 +1437,39 @@ def intensity_retention_loss(
     low = torch.relu(float(min_ratio) - ratio)
     high = torch.relu(ratio - float(max_ratio))
     return torch.mean(low * low + high * high)
+
+
+def global_intensity_ratio_loss(
+    pred: torch.Tensor,
+    ci_plane: torch.Tensor,
+    *,
+    min_ratio: float = 0.98,
+    max_ratio: float = 1.02,
+) -> torch.Tensor:
+    """Keep total refined image energy near the ci_rl image energy."""
+    ci = ci_plane.clamp(min=0)
+    final = (ci + pred).clamp(min=0)
+    eps = torch.as_tensor(1e-6, dtype=ci.dtype, device=ci.device)
+    ratio = torch.sum(final, dim=(1, 2, 3)) / (torch.sum(ci, dim=(1, 2, 3)) + eps)
+    low = torch.relu(float(min_ratio) - ratio)
+    high = torch.relu(ratio - float(max_ratio))
+    return torch.mean(low * low + high * high)
+
+
+def background_offset_loss(
+    pred: torch.Tensor,
+    ci_plane: torch.Tensor,
+    gt_plane: torch.Tensor,
+) -> torch.Tensor:
+    """Discourage the residual from adding/removing a constant background floor."""
+    ci = ci_plane.clamp(min=0)
+    gt = gt_plane.clamp(min=0)
+    signal = torch.maximum(ci.detach(), gt.detach())
+    threshold = torch.quantile(signal.flatten(start_dim=1), 0.20, dim=1).view(-1, 1, 1, 1)
+    bg_mask = (signal <= threshold).to(pred.dtype)
+    denom = torch.sum(bg_mask, dim=(1, 2, 3)).clamp(min=1.0)
+    offset = torch.sum(pred * bg_mask, dim=(1, 2, 3)) / denom
+    return torch.mean(offset * offset)
 
 
 def central_plane_reconvolution_loss(
@@ -1490,7 +1555,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
         for batch in loader:
             x = batch["input"].to(device, non_blocking=pin_memory)
             target = batch["target_residual"].to(device, non_blocking=pin_memory)
-            pred = model(x)
+            pred = crop_like(model(x), target)
             losses.append(float(charbonnier(pred, target).detach().cpu()))
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -1503,7 +1568,7 @@ def evaluate_by_bucket(model: torch.nn.Module, loader: DataLoader, device: torch
         for batch in loader:
             x = batch["input"].to(device, non_blocking=pin_memory)
             target = batch["target_residual"].to(device, non_blocking=pin_memory)
-            pred = model(x)
+            pred = crop_like(model(x), target)
             per_sample = torch.sqrt((pred - target) ** 2 + 1e-6).mean(dim=(1, 2, 3)).detach().cpu().numpy()
             batch_buckets = batch.get("bucket", ["unknown"] * len(per_sample))
             for bucket, value in zip(batch_buckets, per_sample, strict=False):
@@ -1515,7 +1580,8 @@ def save_example_prediction(model: torch.nn.Module, dataset: SyntheticVolumeData
     model.eval()
     item = dataset[0]
     with torch.no_grad():
-        pred = model(item["input"].unsqueeze(0).to(device)).cpu()[0]
+        target = item["target_residual"].unsqueeze(0).to(device)
+        pred = crop_like(model(item["input"].unsqueeze(0).to(device)), target).cpu()[0]
     ci = item["ci"].numpy()[0]
     gt = item["gt"].numpy()[0]
     refined = np.clip(ci + pred.numpy()[0], 0, None)
@@ -1582,6 +1648,7 @@ def checkpoint_metadata(
                 "z_radius": int(config.z_context),
                 "batch_size": max(int(config.batch_size), 1),
                 "mixed_precision": bool(config.mixed_precision),
+                "xy_padding": int(config.training_xy_padding),
             },
             "dl_z_context": int(config.z_context),
             "dl_batch_size": max(int(config.batch_size), 1),
@@ -1595,6 +1662,7 @@ def checkpoint_metadata(
             "synthetic_artifact_level": config.synthetic_artifact_level,
             "super_sample_xy": int(config.super_sample_xy),
             "super_sample_z": int(config.super_sample_z),
+            "training_xy_padding": int(config.training_xy_padding),
         },
         "best_epoch": best,
     }
@@ -1632,6 +1700,7 @@ def train(
         seed=config.seed + 1000,
         cache_size=config.volume_cache_size,
         use_conditioning=config.use_conditioning,
+        xy_padding=config.training_xy_padding,
     )
     val_ds = SyntheticVolumeDataset(
         run_dir,
@@ -1642,6 +1711,7 @@ def train(
         seed=config.seed + 2000,
         cache_size=config.volume_cache_size,
         use_conditioning=config.use_conditioning,
+        xy_padding=config.training_xy_padding,
     )
     loader_kwargs: dict[str, Any] = {
         "batch_size": config.batch_size,
@@ -1703,29 +1773,44 @@ def train(
             target = batch["target_residual"].to(device, non_blocking=pin_memory)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(config.mixed_precision and device.type == "cuda")):
-                pred = model(x)
+                pred = crop_like(model(x), target)
                 charbonnier_loss = charbonnier(pred, target)
                 loss = charbonnier_loss
+                ci_plane = batch["ci"].to(device, non_blocking=pin_memory)
+                gt_plane = batch["gt"].to(device, non_blocking=pin_memory)
                 if config.gradient_weight > 0:
                     loss = loss + config.gradient_weight * gradient_loss(pred, target)
                 if config.negative_residual_weight > 0:
                     loss = loss + config.negative_residual_weight * negative_residual_guard_loss(
                         pred,
-                        batch["ci"].to(device, non_blocking=pin_memory),
-                        batch["gt"].to(device, non_blocking=pin_memory),
+                        ci_plane,
+                        gt_plane,
                         max_fraction=config.max_negative_residual_fraction,
                     )
                 if config.intensity_retention_weight > 0:
                     loss = loss + config.intensity_retention_weight * intensity_retention_loss(
                         pred,
-                        batch["ci"].to(device, non_blocking=pin_memory),
-                        batch["gt"].to(device, non_blocking=pin_memory),
+                        ci_plane,
+                        gt_plane,
                         min_ratio=config.intensity_retention_min,
                         max_ratio=config.intensity_retention_max,
                     )
+                if config.global_intensity_weight > 0:
+                    loss = loss + config.global_intensity_weight * global_intensity_ratio_loss(
+                        pred,
+                        ci_plane,
+                        min_ratio=config.global_intensity_min,
+                        max_ratio=config.global_intensity_max,
+                    )
+                if config.background_offset_weight > 0:
+                    loss = loss + config.background_offset_weight * background_offset_loss(
+                        pred,
+                        ci_plane,
+                        gt_plane,
+                    )
                 if config.reconvolution_weight > 0:
-                    final_plane = (batch["ci"].to(device, non_blocking=pin_memory) + pred).clamp(min=0)
-                    raw_central = x[:, config.z_context:config.z_context + 1]
+                    final_plane = (ci_plane + pred).clamp(min=0)
+                    raw_central = crop_like(x[:, config.z_context:config.z_context + 1], pred)
                     loss = loss + config.reconvolution_weight * central_plane_reconvolution_loss(
                         final_plane,
                         raw_central,
@@ -1903,6 +1988,11 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
             intensity_retention_weight=args.intensity_retention_weight if args.intensity_retention_weight != 0.0 else 0.05,
             intensity_retention_min=args.intensity_retention_min,
             intensity_retention_max=args.intensity_retention_max,
+            global_intensity_weight=args.global_intensity_weight,
+            global_intensity_min=args.global_intensity_min,
+            global_intensity_max=args.global_intensity_max,
+            background_offset_weight=args.background_offset_weight,
+            training_xy_padding=args.training_xy_padding,
             super_sample_xy=args.super_sample_xy,
             super_sample_z=args.super_sample_z,
         )
@@ -1947,6 +2037,11 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
             intensity_retention_weight=args.intensity_retention_weight,
             intensity_retention_min=args.intensity_retention_min,
             intensity_retention_max=args.intensity_retention_max,
+            global_intensity_weight=args.global_intensity_weight,
+            global_intensity_min=args.global_intensity_min,
+            global_intensity_max=args.global_intensity_max,
+            background_offset_weight=args.background_offset_weight,
+            training_xy_padding=args.training_xy_padding,
             super_sample_xy=1,
             super_sample_z=1,
         )
@@ -1990,6 +2085,11 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         intensity_retention_weight=args.intensity_retention_weight,
         intensity_retention_min=args.intensity_retention_min,
         intensity_retention_max=args.intensity_retention_max,
+        global_intensity_weight=args.global_intensity_weight,
+        global_intensity_min=args.global_intensity_min,
+        global_intensity_max=args.global_intensity_max,
+        background_offset_weight=args.background_offset_weight,
+        training_xy_padding=args.training_xy_padding,
         super_sample_xy=args.super_sample_xy,
         super_sample_z=args.super_sample_z,
     )
@@ -2023,11 +2123,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--intensity-retention-weight", type=float, default=0.0, help="Penalty weight for foreground intensity changes outside the configured ratio range")
     parser.add_argument("--intensity-retention-min", type=float, default=0.90)
     parser.add_argument("--intensity-retention-max", type=float, default=1.15)
+    parser.add_argument("--global-intensity-weight", type=float, default=0.0, help="Penalty weight for total image energy changes outside the configured ratio range")
+    parser.add_argument("--global-intensity-min", type=float, default=0.98)
+    parser.add_argument("--global-intensity-max", type=float, default=1.02)
+    parser.add_argument("--background-offset-weight", type=float, default=0.0, help="Penalty weight for mean residual offset in background-like pixels")
+    parser.add_argument("--training-xy-padding", type=int, default=0, help="Reflect-padding halo used for DL training patches; loss is cropped to the central patch")
     parser.add_argument("--train-samples-per-epoch", type=int, default=256)
     parser.add_argument("--val-samples", type=int, default=64)
     parser.add_argument("--synthetic-complexity", choices=["standard", "full"], default="standard")
     parser.add_argument("--synthetic-artifact-level", choices=["standard", "strong"], default="standard")
-    parser.add_argument("--super-sample-xy", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--super-sample-xy", type=int, choices=[1, 2, 3], default=1)
     parser.add_argument("--super-sample-z", type=int, choices=[1], default=1)
     parser.add_argument("--synthetic-morphology", choices=list(SYNTHETIC_MORPHOLOGIES), default="mixed")
     parser.add_argument("--microscope-type", choices=["widefield", "confocal", "mixed"], default="widefield")

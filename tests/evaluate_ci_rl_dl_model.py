@@ -153,13 +153,14 @@ def load_checkpoint_settings(model_path: Path) -> dict[str, Any]:
     return {}
 
 
-def infer_model_settings(metadata: dict[str, Any]) -> tuple[int, int, bool]:
+def infer_model_settings(metadata: dict[str, Any]) -> tuple[int, int, bool, int]:
     recommended = metadata.get("recommended_inference", {})
     dl_kwargs = recommended.get("dl_kwargs", {})
     z_radius = int(dl_kwargs.get("z_radius", recommended.get("dl_z_context", 2)))
     batch_size = int(dl_kwargs.get("batch_size", recommended.get("dl_batch_size", 8)))
     mixed_precision = bool(dl_kwargs.get("mixed_precision", recommended.get("dl_mixed_precision", True)))
-    return z_radius, max(batch_size, 1), mixed_precision
+    xy_padding = int(dl_kwargs.get("xy_padding", 0))
+    return z_radius, max(batch_size, 1), mixed_precision, max(xy_padding, 0)
 
 
 def synthetic_sample_dirs(data_dir: Path, num_synthetic: int) -> list[Path]:
@@ -196,6 +197,7 @@ def evaluate_synthetic(
     z_radius: int,
     batch_size: int,
     mixed_precision: bool,
+    xy_padding: int,
     device: str,
     output_dir: Path,
     checkpoint_metadata: dict[str, Any],
@@ -236,6 +238,7 @@ def evaluate_synthetic(
                     batch_size=batch_size,
                     mixed_precision=mixed_precision,
                     residual_strength=strength,
+                    xy_padding=xy_padding,
                     conditioning_values=cond,
                 )
                 result = refined["result"]
@@ -299,6 +302,7 @@ def evaluate_real_file(
     z_radius: int,
     batch_size: int,
     mixed_precision: bool,
+    xy_padding: int,
     device: str,
     niter: int,
     output_dir: Path,
@@ -364,6 +368,7 @@ def evaluate_real_file(
                     batch_size=batch_size,
                     mixed_precision=mixed_precision,
                     residual_strength=strength,
+                    xy_padding=xy_padding,
                     conditioning_values=cond,
                 )
                 result = np.asarray(refined["result"], dtype=np.float32)
@@ -520,7 +525,7 @@ def main() -> int:
     device_obj = resolve_torch_device(args.device)
     device = str(device_obj)
     metadata = load_checkpoint_settings(args.model_path)
-    z_radius, batch_size, mixed_precision = infer_model_settings(metadata)
+    z_radius, batch_size, mixed_precision, xy_padding = infer_model_settings(metadata)
     niter = args.niter
     if niter is None:
         niter = int(metadata.get("recommended_inference", {}).get("iterations", 50))
@@ -528,12 +533,13 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model, _ = load_residual_unet_checkpoint(args.model_path, device=device)
     log.info(
-        "Evaluating %s on %s, strengths=%s, z_radius=%d, batch_size=%d, niter=%d",
+        "Evaluating %s on %s, strengths=%s, z_radius=%d, batch_size=%d, xy_padding=%d, niter=%d",
         args.model_path,
         device,
         args.strengths,
         z_radius,
         batch_size,
+        xy_padding,
         niter,
     )
 
@@ -550,6 +556,7 @@ def main() -> int:
                 z_radius=z_radius,
                 batch_size=batch_size,
                 mixed_precision=mixed_precision,
+                xy_padding=xy_padding,
                 device=device,
                 output_dir=args.output_dir,
                 checkpoint_metadata=metadata,
@@ -571,6 +578,7 @@ def main() -> int:
                     z_radius=z_radius,
                     batch_size=batch_size,
                     mixed_precision=mixed_precision,
+                    xy_padding=xy_padding,
                     device=device,
                     niter=niter,
                     output_dir=args.output_dir,
@@ -589,6 +597,7 @@ def main() -> int:
             "z_radius": z_radius,
             "batch_size": batch_size,
             "mixed_precision": mixed_precision,
+            "xy_padding": xy_padding,
             "niter": niter,
             "num_synthetic_rows": len(synthetic_rows),
             "num_real_rows": len(real_rows),

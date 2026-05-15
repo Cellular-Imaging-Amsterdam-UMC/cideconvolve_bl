@@ -251,6 +251,22 @@ def make_25d_input(
     return np.stack(channels, axis=0).astype(np.float32), scale_f
 
 
+def _reflect_pad_xy(volume: np.ndarray, padding: int) -> np.ndarray:
+    pad = max(int(padding), 0)
+    if pad <= 0:
+        return np.asarray(volume, dtype=np.float32)
+    arr = np.asarray(volume, dtype=np.float32)
+    mode = "reflect" if arr.shape[-2] > 1 and arr.shape[-1] > 1 else "edge"
+    return np.pad(arr, ((0, 0), (pad, pad), (pad, pad)), mode=mode).astype(np.float32)
+
+
+def _crop_xy_padding(volume: np.ndarray, padding: int) -> np.ndarray:
+    pad = max(int(padding), 0)
+    if pad <= 0:
+        return np.asarray(volume, dtype=np.float32)
+    return np.asarray(volume, dtype=np.float32)[:, pad:-pad, pad:-pad]
+
+
 def psf_sigma_summary(psf: np.ndarray) -> tuple[float, float]:
     arr = np.asarray(psf, dtype=np.float32)
     if arr.size == 0 or float(arr.sum()) <= 0:
@@ -386,6 +402,7 @@ def apply_dl_refinement_25d(
     clamp_nonnegative: bool = True,
     mixed_precision: bool = True,
     residual_strength: float = 1.0,
+    xy_padding: int = 0,
     conditioning_values: Optional[Sequence[float]] = None,
 ) -> dict[str, Any]:
     """Apply a trained 2.5D residual model slice by slice."""
@@ -399,16 +416,19 @@ def apply_dl_refinement_25d(
     dev = resolve_torch_device(device)
     model = model.to(dev).eval()
     scale = _robust_scale(raw_zyx, deconv_zyx)
-    residual = np.zeros_like(deconv_zyx, dtype=np.float32)
-    z_values = list(range(raw_zyx.shape[0]))
+    xy_padding_i = max(int(xy_padding), 0)
+    raw_work = _reflect_pad_xy(raw_zyx, xy_padding_i)
+    deconv_work = _reflect_pad_xy(deconv_zyx, xy_padding_i)
+    residual_work = np.zeros_like(deconv_work, dtype=np.float32)
+    z_values = list(range(raw_work.shape[0]))
     autocast_enabled = bool(mixed_precision and dev.type == "cuda")
 
     for start in range(0, len(z_values), max(int(batch_size), 1)):
         batch_z = z_values[start:start + max(int(batch_size), 1)]
         batch = [
             make_25d_input(
-                raw_zyx,
-                deconv_zyx,
+                raw_work,
+                deconv_work,
                 z,
                 z_radius=z_radius,
                 use_residual_channel=use_residual_channel,
@@ -422,9 +442,10 @@ def apply_dl_refinement_25d(
             pred = model(x)
         pred_np = pred.detach().float().cpu().numpy()[:, 0] * scale
         for local_idx, z in enumerate(batch_z):
-            residual[z] = pred_np[local_idx]
+            residual_work[z] = pred_np[local_idx]
 
     residual_strength_f = float(residual_strength)
+    residual = _crop_xy_padding(residual_work, xy_padding_i)
     refined = deconv_zyx + residual_strength_f * residual
     if clamp_nonnegative:
         refined = np.clip(refined, 0, None)
@@ -433,6 +454,7 @@ def apply_dl_refinement_25d(
         "dl_input_channels": input_channel_count(z_radius, use_residual_channel, len(conditioning_values or [])),
         "dl_z_radius": int(z_radius),
         "dl_residual_strength": residual_strength_f,
+        "dl_xy_padding": int(xy_padding_i),
         "dl_conditioning_channels": len(conditioning_values or []),
         "intensity_sum_before_dl": float(np.sum(deconv_zyx)),
         "intensity_sum_after_dl": float(np.sum(refined)),
