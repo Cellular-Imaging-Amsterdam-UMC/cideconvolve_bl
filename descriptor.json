@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --output_format @output_format --streaming @streaming --tile_limits @tile_limits --streaming_threshold_gb @streaming_threshold_gb --scene @scene --hcs_field @hcs_field --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_airy @pinhole_airy --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --output_format @output_format --streaming @streaming --streaming_threshold_gb @streaming_threshold_gb --scene @scene --hcs_field @hcs_field --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "method",
@@ -245,17 +245,6 @@
       ]
     },
     {
-      "id": "tile_limits",
-      "value-key": "@tile_limits",
-      "command-line-flag": "--tile_limits",
-      "name": "(ess) Tile limits",
-      "description": "Streaming tile limits as 'max_xy,max_z'. XY is used for the current streaming implementation; Z is reserved for future axial chunking.",
-      "default-value": "1024,64",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
       "id": "streaming_threshold_gb",
       "value-key": "@streaming_threshold_gb",
       "command-line-flag": "--streaming_threshold_gb",
@@ -351,15 +340,14 @@
       "id": "two_d_mode",
       "value-key": "@two_d_mode",
       "command-line-flag": "--two_d_mode",
-      "name": "(adv) 2D widefield mode",
-      "description": "2D widefield deconvolution mode. 'auto' uses the enhanced collapsed-PSF model for single-plane widefield images. 'legacy_2d' uses plain 2D RL.",
+      "name": "(ess) 2D widefield mode",
+      "description": "2D widefield deconvolution mode. 'auto' uses the enhanced collapsed-PSF model for single-plane widefield images.",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "auto",
-        "legacy_2d"
+        "auto"
       ]
     },
     {
@@ -427,7 +415,7 @@
       "id": "start",
       "value-key": "@start",
       "command-line-flag": "--start",
-      "name": "(adv) Initial estimate",
+      "name": "(ess) Initial estimate",
       "description": "Initial estimate for iterative solvers. 'auto' chooses from image statistics and microscope type; 'flat' uses a uniform mean image; 'percentile_flat' uses a robust median flat image; 'observed' uses the raw observation; 'observed_bgsub' subtracts background first; 'lowpass' uses a strongly smoothed observation; 'lowpass_bgsub' smooths after background subtraction; 'hybrid' blends background-subtracted observed and smoothed structure.",
       "default-value": "auto",
       "set-by-server": false,
@@ -464,16 +452,18 @@
       "id": "two_d_wf_aggressiveness",
       "value-key": "@two_d_wf_aggressiveness",
       "command-line-flag": "--two_d_wf_aggressiveness",
-      "name": "(adv) 2D WF aggressiveness",
+      "name": "(ess) 2D WF aggressiveness",
       "description": "Aggressiveness of the 2D widefield auto deconvolution. Only used when two_d_mode is 'auto' and the image is a single-plane widefield.",
       "default-value": "Balanced",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
+        "Very Conservative",
         "Conservative",
         "Balanced",
-        "Strong"
+        "Strong",
+        "Very Strong"
       ]
     },
     {

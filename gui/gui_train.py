@@ -8,6 +8,7 @@ import multiprocessing
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -69,6 +70,9 @@ except Exception:  # pragma: no cover - GUI gracefully falls back to text only.
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
+EVALUATION_SCRIPT = _REPO_ROOT / "tests" / "evaluate_ci_rl_dl_model.py"
+EVALUATION_REAL_DIR = _REPO_ROOT / "localdata"
+EVALUATION_SYNTHETIC_SAMPLES = 6
 
 
 def _load_app_icon() -> QIcon:
@@ -570,6 +574,70 @@ def prune_training_data(run_dir: Path, keep_per_split: int = 2) -> int:
     return kept
 
 
+def evaluate_training_run(
+    run_dir: Path,
+    *,
+    device: str,
+    progress,
+    stop_requested,
+) -> Path:
+    """Run the heavier evaluation script for a completed training run."""
+    run_dir = Path(run_dir)
+    model_path = run_dir / "checkpoints" / "best_model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Best checkpoint not found: {model_path}")
+    if not EVALUATION_SCRIPT.exists():
+        raise FileNotFoundError(f"Evaluation script not found: {EVALUATION_SCRIPT}")
+
+    output_dir = run_dir / "evaluation"
+    cmd = [
+        sys.executable,
+        str(EVALUATION_SCRIPT),
+        "--model-path",
+        str(model_path),
+        "--training-run",
+        str(run_dir),
+        "--real-dir",
+        str(EVALUATION_REAL_DIR),
+        "--output-dir",
+        str(output_dir),
+        "--num-synthetic",
+        str(EVALUATION_SYNTHETIC_SAMPLES),
+        "--device",
+        device,
+        "--log-level",
+        "INFO",
+    ]
+    progress(f"Starting evaluation for {run_dir.name} on local OME-TIFF data.")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            text = line.strip()
+            if text:
+                progress(text)
+            if stop_requested():
+                proc.terminate()
+                progress(f"Evaluation stop requested for {run_dir.name}.")
+                break
+        return_code = proc.wait()
+    finally:
+        proc.stdout.close()
+    if stop_requested():
+        raise RuntimeError("Evaluation stopped")
+    if return_code != 0:
+        raise RuntimeError(f"Evaluation failed with exit code {return_code}")
+    progress(f"Evaluation finished for {run_dir.name}: {output_dir}")
+    return output_dir
+
+
 class TrainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -796,6 +864,9 @@ class TrainWindow(QMainWindow):
         self.cleanup_data_after_run = QCheckBox("Prune data after each run")
         self.cleanup_data_after_run.setChecked(True)
         self.cleanup_data_after_run.setToolTip("Keep a few synthetic samples for evaluation and remove the rest of data/train, data/val, and data/test.")
+        self.evaluate_after_run = QCheckBox("Evaluate after each run")
+        self.evaluate_after_run.setChecked(True)
+        self.evaluate_after_run.setToolTip("Run the ci_rl_dl evaluator on kept synthetic samples and matching localdata OME-TIFF files after each completed run.")
         self.queue_table = QTableWidget(0, 2)
         self.queue_table.setHorizontalHeaderLabels(["Output folder", "Progress"])
         self.queue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -811,6 +882,7 @@ class TrainWindow(QMainWindow):
         queue_buttons = QHBoxLayout()
         queue_buttons.addWidget(add_run)
         queue_buttons.addWidget(remove_run)
+        queue_layout.addWidget(self.evaluate_after_run)
         queue_layout.addWidget(self.cleanup_data_after_run)
         queue_layout.addWidget(self.queue_table)
         queue_layout.addLayout(queue_buttons)
@@ -1046,6 +1118,7 @@ class TrainWindow(QMainWindow):
         self.run_queue.append({
             "config": config,
             "status": "queued",
+            "evaluate": self.evaluate_after_run.isChecked(),
             "cleanup": self.cleanup_data_after_run.isChecked(),
         })
         self.refresh_queue_table()
@@ -1087,6 +1160,7 @@ class TrainWindow(QMainWindow):
             self.run_queue = [{
                 "config": config,
                 "status": "queued",
+                "evaluate": self.evaluate_after_run.isChecked(),
                 "cleanup": self.cleanup_data_after_run.isChecked(),
             }]
             self.refresh_queue_table()
@@ -1094,7 +1168,6 @@ class TrainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.start_button.setText("Stop training")
         self.statusBar().showMessage("Training started")
-        self._reset_loss_plot()
 
         def run_queue() -> None:
             try:
@@ -1110,6 +1183,7 @@ class TrainWindow(QMainWindow):
                     self.messages.put(("queue", idx, "busy"))
                     config = entry["config"]
                     assert isinstance(config, TrainConfig)
+                    self.messages.put(("plot", "reset", idx))
                     self.messages.put(f"Starting training run: {Path(config.output_dir).name}")
                     try:
                         run_dir = train(config, progress=self.messages.put, stop_requested=self.stop_event.is_set)
@@ -1120,6 +1194,19 @@ class TrainWindow(QMainWindow):
                         if bool(entry.get("cleanup", False)):
                             kept = prune_training_data(run_dir)
                             self.messages.put(f"Pruned data folder for {Path(run_dir).name}; kept {kept} evaluation sample(s).")
+                        if bool(entry.get("evaluate", False)):
+                            entry["status"] = "evaluating"
+                            self.messages.put(("queue", idx, "evaluating"))
+                            evaluate_training_run(
+                                Path(run_dir),
+                                device=config.device,
+                                progress=self.messages.put,
+                                stop_requested=self.stop_event.is_set,
+                            )
+                            if self.stop_event.is_set():
+                                entry["status"] = "stopped"
+                                self.messages.put(("queue", idx, "stopped"))
+                                break
                         entry["status"] = "done"
                         self.messages.put(("queue", idx, "done"))
                     except Exception as exc:
@@ -1150,6 +1237,8 @@ class TrainWindow(QMainWindow):
                 if isinstance(idx, int) and 0 <= idx < len(self.run_queue):
                     self.run_queue[idx]["status"] = str(status)
                     self.refresh_queue_table()
+            elif isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "plot" and msg[1] == "reset":
+                self._reset_loss_plot()
             else:
                 self._record_loss_from_message(msg)
                 self._update_status_from_message(msg)

@@ -6067,7 +6067,8 @@ class DeconvolveCIWindow(QMainWindow):
         app_icon = _load_app_icon()
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
-        self.setMinimumSize(1430, 700)
+        self.setMinimumSize(1645, 700)
+        self.resize(1845, 924)
 
         # State
         self._input_channels: list[np.ndarray] = []
@@ -6183,10 +6184,87 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_rel_thresh.setValue(0.001)
         ml.addRow("Rel. threshold:", self._sp_rel_thresh)
 
+        self._start_combo = NoWheelComboBox()
+        self._start_combo.addItems([
+            "auto",
+            "flat",
+            "percentile_flat",
+            "observed",
+            "observed_bgsub",
+            "lowpass",
+            "lowpass_bgsub",
+            "hybrid",
+        ])
+        ml.addRow("Start:", self._start_combo)
+
         ctrl_layout.addWidget(method_group)
+
+        # --- Essential 2D widefield controls ---
+        wf2d_essential_group = QGroupBox("2D Widefield")
+        wf2d_essential_layout = QFormLayout()
+        wf2d_essential_group.setLayout(wf2d_essential_layout)
+        self._two_d_wf_essential_group = wf2d_essential_group
+
+        self._two_d_mode_combo = NoWheelComboBox()
+        self._two_d_mode_combo.addItems(["Auto", "Legacy 2D"])
+        self._two_d_mode_combo.setCurrentText("Auto")
+        self._two_d_mode_combo.setEnabled(False)
+        self._two_d_mode_combo.currentTextChanged.connect(self._refresh_two_d_wf_expert_state)
+        wf2d_essential_layout.addRow("2D WF model:", self._two_d_mode_combo)
+        self._two_d_mode_label = wf2d_essential_layout.labelForField(self._two_d_mode_combo)  # type: ignore
+
+        self._two_d_wf_aggr_combo = NoWheelComboBox()
+        self._two_d_wf_aggr_combo.addItems(
+            ["Very Conservative", "Conservative", "Balanced", "Strong", "Very Strong"]
+        )
+        self._two_d_wf_aggr_combo.setCurrentText("Balanced")
+        wf2d_essential_layout.addRow("2D WF aggressiveness:", self._two_d_wf_aggr_combo)
+
+        ctrl_layout.addWidget(wf2d_essential_group)
 
         advanced_section = CollapsibleSection("Advanced Parameters", expanded=False)
         advanced_layout = advanced_section.content_layout()
+
+        # --- DL Refinement parameters (hidden unless launched with --dlref) ---
+        self._dl_group = QGroupBox("DL Refinement Parameters")
+        dl_group_layout = QFormLayout()
+        self._dl_group.setLayout(dl_group_layout)
+
+        dl_model_widget = QWidget()
+        self._dl_model_widget = dl_model_widget
+        dl_model_row = QHBoxLayout(dl_model_widget)
+        dl_model_row.setContentsMargins(0, 0, 0, 0)
+        self._le_dl_model = QLineEdit("")
+        self._le_dl_model.setPlaceholderText("optional best_model.pt")
+        self._btn_dl_model = QPushButton("Browse")
+        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
+        dl_model_row.addWidget(self._le_dl_model)
+        dl_model_row.addWidget(self._btn_dl_model)
+        dl_group_layout.addRow("DL model:", dl_model_widget)
+
+        self._sp_dl_z_context = NoWheelSpinBox()
+        self._sp_dl_z_context.setRange(0, 8)
+        self._sp_dl_z_context.setValue(2)
+
+        self._sp_dl_batch_size = NoWheelSpinBox()
+        self._sp_dl_batch_size.setRange(1, 128)
+        self._sp_dl_batch_size.setValue(8)
+
+        self._cb_dl_mixed_precision = QCheckBox()
+        self._cb_dl_mixed_precision.setChecked(True)
+
+        self._sp_dl_residual_strength = NoWheelDoubleSpinBox()
+        self._sp_dl_residual_strength.setRange(0.0, 2.0)
+        self._sp_dl_residual_strength.setDecimals(2)
+        self._sp_dl_residual_strength.setSingleStep(0.05)
+        self._sp_dl_residual_strength.setValue(1.0)
+        self._sp_dl_residual_strength.setToolTip(
+            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
+        )
+        dl_group_layout.addRow("DL residual strength:", self._sp_dl_residual_strength)
+
+        self._dl_group.setVisible(self._dlref_available)
+        advanced_layout.addWidget(self._dl_group)
 
         # --- Method tuning ---
         method_adv_group = QGroupBox("Method Tuning")
@@ -6215,12 +6293,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_damping.setEnabled(False)
         aml.addRow("Damping value:", self._sp_damping)
         self._damping_value_label = aml.labelForField(self._sp_damping)  # type: ignore
-
-        self._two_d_mode_combo = NoWheelComboBox()
-        self._two_d_mode_combo.addItems(["Auto", "Legacy 2D"])
-        self._two_d_mode_combo.currentTextChanged.connect(self._refresh_two_d_wf_expert_state)
-        aml.addRow("2D WF model:", self._two_d_mode_combo)
-        self._two_d_mode_label = aml.labelForField(self._two_d_mode_combo)  # type: ignore
 
         self._sp_sparse_weight = NoWheelDoubleSpinBox()
         self._sp_sparse_weight.setRange(0.0, 1.0)
@@ -6270,19 +6342,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_prefilter.setValue(0.0)
         aml.addRow("Prefilter sigma:", self._sp_prefilter)
 
-        self._start_combo = NoWheelComboBox()
-        self._start_combo.addItems([
-            "auto",
-            "flat",
-            "percentile_flat",
-            "observed",
-            "observed_bgsub",
-            "lowpass",
-            "lowpass_bgsub",
-            "hybrid",
-        ])
-        aml.addRow("Start:", self._start_combo)
-
         self._sp_check_every = NoWheelSpinBox()
         self._sp_check_every.setRange(1, 1000)
         self._sp_check_every.setValue(5)
@@ -6301,13 +6360,6 @@ class DeconvolveCIWindow(QMainWindow):
         wf2d_layout = QFormLayout()
         wf2d_group.setLayout(wf2d_layout)
         self._two_d_wf_group = wf2d_group
-
-        self._two_d_wf_aggr_combo = NoWheelComboBox()
-        self._two_d_wf_aggr_combo.addItems(
-            ["Very Conservative", "Conservative", "Balanced", "Strong", "Very Strong"]
-        )
-        self._two_d_wf_aggr_combo.setCurrentText("Balanced")
-        wf2d_layout.addRow("2D WF aggressiveness:", self._two_d_wf_aggr_combo)
 
         self._sp_two_d_wf_bg_radius = NoWheelDoubleSpinBox()
         self._sp_two_d_wf_bg_radius.setRange(0.05, 10.0)
@@ -6597,50 +6649,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._movie_group.setVisible(self._movie_available)
         advanced_layout.addWidget(self._movie_group)
 
-        # --- DL Refinement parameters (hidden unless launched with --dlref) ---
-        self._dl_group = QGroupBox("DL Refinement Parameters")
-        dl_group_layout = QFormLayout()
-        self._dl_group.setLayout(dl_group_layout)
-
-        dl_model_widget = QWidget()
-        self._dl_model_widget = dl_model_widget
-        dl_model_row = QHBoxLayout(dl_model_widget)
-        dl_model_row.setContentsMargins(0, 0, 0, 0)
-        self._le_dl_model = QLineEdit("")
-        self._le_dl_model.setPlaceholderText("optional final_model.pt")
-        self._btn_dl_model = QPushButton("Browse")
-        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
-        dl_model_row.addWidget(self._le_dl_model)
-        dl_model_row.addWidget(self._btn_dl_model)
-        dl_group_layout.addRow("DL model:", dl_model_widget)
-
-        self._sp_dl_z_context = NoWheelSpinBox()
-        self._sp_dl_z_context.setRange(0, 8)
-        self._sp_dl_z_context.setValue(2)
-        dl_group_layout.addRow("DL z-context:", self._sp_dl_z_context)
-
-        self._sp_dl_batch_size = NoWheelSpinBox()
-        self._sp_dl_batch_size.setRange(1, 128)
-        self._sp_dl_batch_size.setValue(8)
-        dl_group_layout.addRow("DL batch size:", self._sp_dl_batch_size)
-
-        self._cb_dl_mixed_precision = QCheckBox()
-        self._cb_dl_mixed_precision.setChecked(True)
-        dl_group_layout.addRow("DL mixed precision:", self._cb_dl_mixed_precision)
-
-        self._sp_dl_residual_strength = QDoubleSpinBox()
-        self._sp_dl_residual_strength.setRange(0.0, 2.0)
-        self._sp_dl_residual_strength.setDecimals(2)
-        self._sp_dl_residual_strength.setSingleStep(0.05)
-        self._sp_dl_residual_strength.setValue(1.0)
-        self._sp_dl_residual_strength.setToolTip(
-            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
-        )
-        dl_group_layout.addRow("DL residual strength:", self._sp_dl_residual_strength)
-
-        self._dl_group.setVisible(self._dlref_available)
-        advanced_layout.addWidget(self._dl_group)
-
         advanced_layout.addStretch()
         ctrl_layout.addWidget(advanced_section)
 
@@ -6671,6 +6679,13 @@ class DeconvolveCIWindow(QMainWindow):
             "Relative improvement threshold used by `auto` convergence. Smaller values run "
             "longer before stopping; larger values stop earlier.",
         )
+        _set_field_tooltip(
+            ml,
+            self._start_combo,
+            "Initial estimate for iterative deconvolution. `auto` chooses from image statistics "
+            "and microscope type; `flat` is robust, `_bgsub` modes subtract background first, "
+            "and `hybrid` blends background-subtracted observed and smoothed structure.",
+        )
 
         _set_field_tooltip(
             aml,
@@ -6691,10 +6706,10 @@ class DeconvolveCIWindow(QMainWindow):
             "near-background regions; lower values make RL more aggressive.",
         )
         _set_field_tooltip(
-            aml,
+            wf2d_essential_layout,
             self._two_d_mode_combo,
-            "How 2D widefield images are handled. `Auto` uses the widefield-aware collapsed-PSF "
-            "model, while `Legacy 2D` keeps the older simpler behavior.",
+            "2D widefield images use the widefield-aware collapsed-PSF auto model. "
+            "Model metadata and saved settings cannot switch this back to legacy behavior.",
         )
         _set_field_tooltip(
             aml,
@@ -6740,13 +6755,6 @@ class DeconvolveCIWindow(QMainWindow):
         )
         _set_field_tooltip(
             aml,
-            self._start_combo,
-            "Initial estimate for iterative deconvolution. `auto` chooses from image statistics "
-            "and microscope type; `flat` is robust, `_bgsub` modes subtract background first, "
-            "and `hybrid` blends background-subtracted observed and smoothed structure.",
-        )
-        _set_field_tooltip(
-            aml,
             self._sp_check_every,
             "How often convergence is evaluated when `Convergence` is set to `auto`. Lower "
             "values check more frequently but add a little overhead.",
@@ -6759,7 +6767,7 @@ class DeconvolveCIWindow(QMainWindow):
         )
 
         _set_field_tooltip(
-            wf2d_layout,
+            wf2d_essential_layout,
             self._two_d_wf_aggr_combo,
             "Controls how aggressively the 3D widefield PSF is collapsed for 2D RL. "
             "`Very Conservative` keeps weighting close to the focal plane, while `Very Strong` "
@@ -7100,7 +7108,6 @@ class DeconvolveCIWindow(QMainWindow):
             (self._tv_lambda_label, self._sp_tv_lambda),
             (self._damping_label, self._damping_combo),
             (self._damping_value_label, self._sp_damping),
-            (self._two_d_mode_label, self._two_d_mode_combo),
             (self._sparse_weight_label, self._sp_sparse_weight),
             (self._sparse_reg_label, self._sp_sparse_reg),
         ):
@@ -7118,9 +7125,7 @@ class DeconvolveCIWindow(QMainWindow):
         if self._damping_value_label is not None:
             self._damping_value_label.setVisible(is_rl_family)
         self._sp_damping.setVisible(is_rl_family)
-        if self._two_d_mode_label is not None:
-            self._two_d_mode_label.setVisible(is_rl_family)
-        self._two_d_mode_combo.setVisible(is_rl_family)
+        self._two_d_wf_essential_group.setVisible(is_rl_family)
         self._two_d_wf_group.setVisible(is_rl_family)
 
         if self._sparse_weight_label is not None:
@@ -7170,7 +7175,15 @@ class DeconvolveCIWindow(QMainWindow):
         rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
         widefield = self._micro_combo.currentText() == "widefield"
         auto_mode = self._two_d_mode_combo.currentText() == "Auto"
-        enabled = rl_family and widefield and auto_mode
+        try:
+            size_z = max(int(self._metadata.get("size_z", 1) or 1), 1)
+        except (TypeError, ValueError):
+            size_z = 1
+        two_d_relevant = rl_family and widefield and size_z <= 1
+        enabled = two_d_relevant and auto_mode
+        self._two_d_wf_essential_group.setEnabled(two_d_relevant)
+        self._two_d_mode_combo.setEnabled(False)
+        self._two_d_wf_aggr_combo.setEnabled(two_d_relevant)
         self._two_d_wf_group.setEnabled(enabled)
 
     def _on_medium_changed(self, text: str):
@@ -7227,11 +7240,9 @@ class DeconvolveCIWindow(QMainWindow):
         convergence = rl_kwargs.get("convergence")
         if convergence:
             self._conv_combo.setCurrentText(str(convergence))
-        two_d_mode = rl_kwargs.get("two_d_mode")
-        if str(two_d_mode).lower() == "legacy_2d":
-            self._two_d_mode_combo.setCurrentText("Legacy 2D")
-        elif str(two_d_mode).lower() == "auto":
-            self._two_d_mode_combo.setCurrentText("Auto")
+        if rl_kwargs.get("two_d_mode") and str(rl_kwargs.get("two_d_mode")).lower() != "auto":
+            self._log("Ignoring ci_rl_dl model metadata two_d_mode; 2D WF model stays on Auto.")
+        self._two_d_mode_combo.setCurrentText("Auto")
 
         best = metadata.get("best_epoch") or {}
         best_text = ""
@@ -7479,6 +7490,8 @@ class DeconvolveCIWindow(QMainWindow):
         self._le_pinhole_na.setStyleSheet(
             _bg("pinhole_airy_units" in from_file))
 
+        self._refresh_two_d_wf_expert_state()
+
         sample_ri = meta.get("sample_refractive_index")
         if sample_ri:
             self._sp_ri_sample.setValue(float(sample_ri))
@@ -7695,7 +7708,7 @@ class DeconvolveCIWindow(QMainWindow):
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": damping,
-            "two_d_mode": "auto" if self._two_d_mode_combo.currentText() == "Auto" else "legacy_2d",
+            "two_d_mode": "auto",
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText().strip().lower(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
@@ -8631,12 +8644,7 @@ class DeconvolveCIWindow(QMainWindow):
         _spin(self._sp_tv_lambda, "tv_lambda")
         _combo(self._damping_combo, "damping")
         _spin(self._sp_damping, "damping_value")
-        two_d_mode = data.get("two_d_mode")
-        if two_d_mode is not None:
-            if str(two_d_mode).strip().lower() == "auto":
-                self._two_d_mode_combo.setCurrentText("Auto")
-            elif str(two_d_mode).strip().lower() in {"legacy_2d", "legacy 2d"}:
-                self._two_d_mode_combo.setCurrentText("Legacy 2D")
+        self._two_d_mode_combo.setCurrentText("Auto")
         aggr = data.get("two_d_wf_aggressiveness")
         if aggr is not None:
             lookup = {
@@ -8650,11 +8658,10 @@ class DeconvolveCIWindow(QMainWindow):
         _spin(self._sp_two_d_wf_bg_radius, "two_d_wf_bg_radius_um")
         _spin(self._sp_two_d_wf_bg_scale, "two_d_wf_bg_scale")
         _line(self._le_dl_model, "dl_model_path")
-        _spin(self._sp_dl_z_context, "dl_z_context")
-        _spin(self._sp_dl_batch_size, "dl_batch_size")
+        dl_model_path = self._le_dl_model.text().strip()
+        if dl_model_path and Path(dl_model_path).exists():
+            self._apply_dl_model_metadata(Path(dl_model_path))
         _spin(self._sp_dl_residual_strength, "dl_residual_strength")
-        if "dl_mixed_precision" in data:
-            self._cb_dl_mixed_precision.setChecked(bool(data.get("dl_mixed_precision")))
         _combo(self._bg_combo, "background")
         _spin(self._sp_bg_value, "background_value")
         _combo(self._offset_combo, "offset")

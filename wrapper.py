@@ -58,6 +58,7 @@ from core.streaming import (
     open_region_source,
     save_streaming_provenance,
     should_stream_source,
+    suggest_streaming_tile_size,
 )
 
 import numpy as np
@@ -155,10 +156,10 @@ def _parse_float_list_or_default(raw, default: str) -> list[float]:
     return values or [float(default)]
 
 
-def _parse_tile_limits(raw, default: tuple[int, int] = (1024, 64)) -> tuple[int, int]:
-    """Parse tile limits as ``max_xy,max_z``; Z is retained for future use."""
+def _parse_tile_limits(raw, default: tuple[int, int] = (0, 64)) -> tuple[int, int]:
+    """Parse tile limits as ``max_xy,max_z``; XY <= 0 means auto tile sizing."""
     text = str(raw or "").strip()
-    if not text:
+    if not text or text.lower() == "auto":
         return default
     parts = [p.strip() for p in text.replace("x", ",").split(",") if p.strip()]
     try:
@@ -166,7 +167,9 @@ def _parse_tile_limits(raw, default: tuple[int, int] = (1024, 64)) -> tuple[int,
         max_z = int(parts[1]) if len(parts) > 1 else default[1]
     except ValueError:
         return default
-    return max(max_xy, 64), max(max_z, 1)
+    if max_xy <= 0:
+        max_xy = 0
+    return (max_xy if max_xy == 0 else max(max_xy, 64)), max(max_z, 1)
 
 
 def _metadata_use_value(current, value, overrule_metadata: bool) -> bool:
@@ -1231,6 +1234,15 @@ def _run_streaming_regular_image(
         pixel_size_z=pixel_size_z,
         overrule_metadata=overrule_metadata,
     )
+    tile_xy = int(tile_limits[0])
+    if tile_xy <= 0:
+        tile_xy = suggest_streaming_tile_size(
+            source.shape,
+            psf_xy_est=65,
+            method=method,
+            device=device,
+        )
+    tile_limits = (tile_xy, int(tile_limits[1]))
     out_zarr = Path(out_path) / f"{stem}_decon.ome.zarr"
     sink = ZarrPyramidSink(
         out_zarr,
@@ -1452,7 +1464,7 @@ def main(argv):
         if output_format in ("ome_zarr", "zarr"):
             output_format = "ome-zarr"
         streaming_mode = str(getattr(parameters, "streaming", "auto")).strip().lower()
-        tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "1024,64"))
+        tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "auto"))
         streaming_threshold_gb = float(getattr(parameters, "streaming_threshold_gb", 2.0))
         scene = getattr(parameters, "scene", None)
         scene = None if scene in (None, "", "auto") else scene
@@ -1477,7 +1489,8 @@ def main(argv):
         print(f"  Device       : {device_param}")
         print(f"  Projection   : {projection}")
         print(f"  Output format: {output_format}")
-        print(f"  Streaming    : {streaming_mode} (threshold={streaming_threshold_gb:g} GB, tile={tile_limits[0]} px)")
+        tile_text = "auto" if int(tile_limits[0]) <= 0 else f"{tile_limits[0]} px"
+        print(f"  Streaming    : {streaming_mode} (threshold={streaming_threshold_gb:g} GB, tile={tile_text})")
         print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'use image metadata'}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")

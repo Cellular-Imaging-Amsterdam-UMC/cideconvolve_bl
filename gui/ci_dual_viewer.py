@@ -7,6 +7,7 @@ embeddable widget with fixed Original / Deconvolved panes and shared controls.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 import numpy as np
@@ -14,7 +15,6 @@ from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -97,6 +97,14 @@ _MAX_HIST_SAMPLES = 1_000_000
 _MAX_VIEW_PIXELS = 2_000_000
 
 
+@dataclass(slots=True)
+class _ScaleBarSpec:
+    image_pixels: float
+    screen_pixels: float
+    label: str
+    physical_um: float
+
+
 def _sample_flat_for_hist(arr: np.ndarray, max_samples: int = _MAX_HIST_SAMPLES) -> np.ndarray:
     """Return a cheap representative 1-D sample for histogram/percentile work."""
     flat = np.asarray(arr).ravel()
@@ -118,6 +126,58 @@ def _display_stride(shape: tuple[int, int], max_pixels: int = _MAX_VIEW_PIXELS) 
     if pixels <= max_pixels:
         return 1
     return max(1, int(np.ceil(np.sqrt(pixels / max_pixels))))
+
+
+def _format_physical_length(physical_um: float) -> str:
+    if physical_um >= 1000:
+        mm = physical_um / 1000.0
+        if mm >= 10:
+            return f"{mm:.0f} mm"
+        if mm >= 1:
+            return f"{mm:.1f} mm"
+        return f"{mm:.2f} mm"
+    if physical_um >= 10:
+        return f"{physical_um:.0f} um"
+    if physical_um >= 1:
+        return f"{physical_um:.1f} um"
+    return f"{physical_um:.2f} um"
+
+
+def _compute_scale_bar(
+    um_per_image_pixel: Optional[float],
+    screen_pixels_per_image_pixel: float,
+    *,
+    target_screen_px: float = 120.0,
+    min_screen_px: float = 70.0,
+    max_screen_px: float = 180.0,
+) -> Optional[_ScaleBarSpec]:
+    if (
+        um_per_image_pixel is None
+        or um_per_image_pixel <= 0
+        or screen_pixels_per_image_pixel <= 0
+    ):
+        return None
+
+    raw_um = target_screen_px * um_per_image_pixel / screen_pixels_per_image_pixel
+    if raw_um <= 0:
+        return None
+
+    magnitude = 10 ** math.floor(math.log10(raw_um))
+    for factor in (1, 2, 5, 10):
+        physical_um = factor * magnitude
+        screen_px = physical_um / um_per_image_pixel * screen_pixels_per_image_pixel
+        if min_screen_px <= screen_px <= max_screen_px:
+            break
+    else:
+        physical_um = raw_um
+        screen_px = target_screen_px
+
+    return _ScaleBarSpec(
+        image_pixels=physical_um / um_per_image_pixel,
+        screen_pixels=screen_px,
+        label=_format_physical_length(physical_um),
+        physical_um=physical_um,
+    )
 
 
 def _emission_to_rgb(wavelength_nm: Optional[float]) -> tuple[int, int, int]:
@@ -282,11 +342,11 @@ class ZoomableImageView(QGraphicsView):
         self._custom_item = None
         self._linked: list["ZoomableImageView"] = []
         self._syncing = False
-        self.setRenderHints(
-            self.renderHints()
-            | QPainter.RenderHint.Antialiasing
-            | QPainter.RenderHint.SmoothPixmapTransform
-        )
+        self._smooth_zoom = False
+        self._scale_bar_enabled = True
+        self._scale_bar_um_per_pixel: Optional[float] = None
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -302,12 +362,31 @@ class ZoomableImageView(QGraphicsView):
         if self not in other._linked:
             other._linked.append(self)
 
+    def set_smooth_zoom(self, enabled: bool) -> None:
+        self._smooth_zoom = bool(enabled)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._smooth_zoom)
+        self._apply_pixmap_transformation_mode()
+        self.viewport().update()
+
+    def set_scale_bar_enabled(self, enabled: bool) -> None:
+        self._scale_bar_enabled = bool(enabled)
+        self.viewport().update()
+
+    def set_scale_bar_um_per_pixel(self, value: Optional[float]) -> None:
+        try:
+            value_f = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value_f = None
+        self._scale_bar_um_per_pixel = value_f if value_f is not None and value_f > 0 else None
+        self.viewport().update()
+
     def set_pixmap(self, pixmap: Optional[QPixmap]) -> None:
         self._scene.clear()
         self._pix_item = None
         self._custom_item = None
         if pixmap is not None and not pixmap.isNull():
             self._pix_item = self._scene.addPixmap(pixmap)
+            self._apply_pixmap_transformation_mode()
             self._scene.setSceneRect(QRectF(pixmap.rect()))
 
     def set_graphics_item(self, item) -> None:
@@ -322,6 +401,16 @@ class ZoomableImageView(QGraphicsView):
         if item is not None:
             self._scene.addItem(item)
             self._scene.setSceneRect(item.boundingRect())
+
+    def _apply_pixmap_transformation_mode(self) -> None:
+        if self._pix_item is None:
+            return
+        mode = (
+            Qt.TransformationMode.SmoothTransformation
+            if self._smooth_zoom
+            else Qt.TransformationMode.FastTransformation
+        )
+        self._pix_item.setTransformationMode(mode)
 
     def clear(self) -> None:
         self._scene.clear()
@@ -363,8 +452,51 @@ class ZoomableImageView(QGraphicsView):
             other.setTransform(transform)
             other.horizontalScrollBar().setValue(x_value)
             other.verticalScrollBar().setValue(y_value)
+            other.viewport().update()
             other._syncing = False
         self._syncing = False
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        self._draw_scale_bar()
+
+    def _draw_scale_bar(self) -> None:
+        if not self._scale_bar_enabled:
+            return
+        spec = _compute_scale_bar(self._scale_bar_um_per_pixel, self.transform().m11())
+        if spec is None:
+            return
+
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        margin = 18
+        bar_x = margin
+        bar_y = self.viewport().height() - margin
+        text_rect = painter.fontMetrics().boundingRect(spec.label)
+        bg_width = int(max(spec.screen_pixels + 16, text_rect.width() + 20))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(2, 6, 23, 190))
+        painter.drawRoundedRect(bar_x - 8, bar_y - 34, bg_width, 38, 8, 8)
+
+        painter.setPen(QPen(QColor("#f8fafc"), 2))
+        painter.drawLine(int(bar_x), int(bar_y - 10), int(bar_x + spec.screen_pixels), int(bar_y - 10))
+        painter.drawLine(int(bar_x), int(bar_y - 14), int(bar_x), int(bar_y - 6))
+        painter.drawLine(
+            int(bar_x + spec.screen_pixels),
+            int(bar_y - 14),
+            int(bar_x + spec.screen_pixels),
+            int(bar_y - 6),
+        )
+        painter.drawText(
+            int(bar_x),
+            int(bar_y - 30),
+            max(int(spec.screen_pixels), text_rect.width() + 4),
+            16,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            spec.label,
+        )
+        painter.end()
 
 
 @dataclass
@@ -455,6 +587,13 @@ class _PaneWidget(QWidget):
 
     def copy_2d_view_from(self, other: "_PaneWidget") -> None:
         self.view2d.copy_view_state_from(other.view2d)
+
+    def set_smooth_zoom(self, enabled: bool) -> None:
+        self.view2d.set_smooth_zoom(enabled)
+
+    def set_scale_bar(self, enabled: bool, um_per_pixel: Optional[float]) -> None:
+        self.view2d.set_scale_bar_enabled(enabled)
+        self.view2d.set_scale_bar_um_per_pixel(um_per_pixel)
 
     def grab_3d_image(self) -> QImage:
         if not _HAS_VISPY or self._vispy_canvas is None:
@@ -909,45 +1048,45 @@ class _HistogramWidget(QWidget):
 
 
 class _ChannelButton(QPushButton):
-    """Channel toggle button that opens a colour picker on double-click."""
+    """Channel toggle button: left click toggles, right click picks colour."""
 
     colorPickRequested = pyqtSignal(int)   # emits the channel index
 
     def __init__(self, label: str, channel_index: int, parent=None):
         super().__init__(label, parent)
         self._channel_index = channel_index
-        self._ignore_next_release = False
-        self._click_timer = QTimer(self)
-        self._click_timer.setSingleShot(True)
-        self._click_timer.timeout.connect(self._apply_deferred_toggle)
 
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() != Qt.MouseButton.LeftButton:
-            super().mouseReleaseEvent(event)
-            return
-        self.setDown(False)
-        if self._ignore_next_release:
-            self._ignore_next_release = False
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.rect().contains(event.position().toPoint()):
+                self.setDown(False)
+                self.colorPickRequested.emit(self._channel_index)
             event.accept()
             return
-        if self.rect().contains(event.position().toPoint()):
-            self._click_timer.start(QApplication.doubleClickInterval())
-        event.accept()
+        super().mousePressEvent(event)
 
-    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() != Qt.MouseButton.LeftButton:
-            super().mouseDoubleClickEvent(event)
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            self.setDown(False)
+            event.accept()
             return
-        self._click_timer.stop()
-        self._ignore_next_release = True
-        self.setDown(False)
-        self.colorPickRequested.emit(self._channel_index)
-        event.accept()
+        super().mouseReleaseEvent(event)
 
-    def _apply_deferred_toggle(self) -> None:
-        if not self.isEnabled() or not self.isCheckable():
+
+class _ChannelTable(QTableWidget):
+    """Channel table where right-click requests a colour picker."""
+
+    colorPickRequested = pyqtSignal(int)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            row = self.rowAt(event.position().toPoint().y())
+            if row >= 0:
+                self.selectRow(row)
+                self.colorPickRequested.emit(row)
+            event.accept()
             return
-        self.setChecked(not self.isChecked())
+        super().mousePressEvent(event)
 
 
 class _AdvancedScalingWindow(QWidget):
@@ -983,7 +1122,7 @@ class _AdvancedScalingWindow(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
 
-        self._table = QTableWidget(0, 2)
+        self._table = _ChannelTable(0, 2)
         self._table.setHorizontalHeaderLabels(["Channel", "Show"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -993,7 +1132,7 @@ class _AdvancedScalingWindow(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.itemChanged.connect(self._on_item_changed)
-        self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        self._table.colorPickRequested.connect(self._on_channel_color_requested)
         root.addWidget(self._table, stretch=1)
 
         self._log_hist_check = QCheckBox("Log histogram")
@@ -1414,8 +1553,8 @@ class _AdvancedScalingWindow(QWidget):
             self._channel_visible[row] = visible
         self.channelVisibilityChanged.emit(row, visible)
 
-    def _on_cell_double_clicked(self, row: int, column: int) -> None:
-        if column != 0 or row < 0 or row >= len(self._channel_colors):
+    def _on_channel_color_requested(self, row: int) -> None:
+        if row < 0 or row >= len(self._channel_colors):
             return
         color = QColorDialog.getColor(QColor(*self._channel_colors[row]), self, "Select channel color")
         if not color.isValid():
@@ -1527,6 +1666,8 @@ class DualViewerWidget(QWidget):
         self._syncing_camera = False
         self._reset_3d_on_next_render = False
         self._fit_on_next_render = False
+        self._smooth_zoom_enabled = False
+        self._scale_bar_enabled = True
         # Histogram cache: id(numpy_array) -> (bin_edges, counts).
         # Cleared when new image data is loaded so stale entries don't accumulate.
         self._hist_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -1600,6 +1741,16 @@ class DualViewerWidget(QWidget):
         self._fit_button.clicked.connect(self.fit_views)
         top.addWidget(self._fit_button)
 
+        self._smooth_zoom_check = QCheckBox("Smooth zoom")
+        self._smooth_zoom_check.setChecked(False)
+        self._smooth_zoom_check.toggled.connect(self._on_smooth_zoom_toggled)
+        top.addWidget(self._smooth_zoom_check)
+
+        self._scale_bar_check = QCheckBox("Scale bar")
+        self._scale_bar_check.setChecked(True)
+        self._scale_bar_check.toggled.connect(self._on_scale_bar_toggled)
+        top.addWidget(self._scale_bar_check)
+
         self._lo_group = QWidget()
         lo_layout = QHBoxLayout(self._lo_group)
         lo_layout.setContentsMargins(0, 0, 0, 0)
@@ -1628,7 +1779,7 @@ class DualViewerWidget(QWidget):
         hi_layout.addWidget(self._hi_spin)
         top.addWidget(self._hi_group)
 
-        self._advanced_scaling_button = QPushButton("Advanced Scaling")
+        self._advanced_scaling_button = QPushButton("Adv. Scaling")
         self._advanced_scaling_button.clicked.connect(self._open_advanced_scaling)
         top.addWidget(self._advanced_scaling_button)
         self._log_button = QPushButton("Log")
@@ -1881,6 +2032,59 @@ class DualViewerWidget(QWidget):
 
     def set_hi_percentile(self, value: float) -> None:
         self._hi_spin.setValue(value)
+
+    def _on_smooth_zoom_toggled(self, enabled: bool) -> None:
+        self._smooth_zoom_enabled = bool(enabled)
+        self._input_pane.set_smooth_zoom(self._smooth_zoom_enabled)
+        self._output_pane.set_smooth_zoom(self._smooth_zoom_enabled)
+
+    def _on_scale_bar_toggled(self, enabled: bool) -> None:
+        self._scale_bar_enabled = bool(enabled)
+        self._refresh_scale_bar_state()
+
+    def _pixel_size_x_um(self) -> Optional[float]:
+        for key in ("pixel_size_x", "pixel_size_y"):
+            value = self._metadata.get(key)
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value_f > 0:
+                return value_f
+        for key in ("pixel_size_xy_nm", "pixel_size_nm"):
+            value = self._metadata.get(key)
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value_f > 0:
+                return value_f / 1000.0
+        return None
+
+    def _display_um_per_scene_pixel(self, channels_zyx: Optional[list[np.ndarray]]) -> Optional[float]:
+        px_um = self._pixel_size_x_um()
+        if px_um is None or not channels_zyx:
+            return None
+        for idx in self._active_channel_indices():
+            if 0 <= idx < len(channels_zyx):
+                stack = channels_zyx[idx]
+                if stack.ndim >= 2:
+                    return px_um * _display_stride(tuple(int(v) for v in stack.shape[-2:]))
+        for stack in channels_zyx:
+            if stack.ndim >= 2:
+                return px_um * _display_stride(tuple(int(v) for v in stack.shape[-2:]))
+        return px_um
+
+    def _refresh_scale_bar_state(self) -> None:
+        input_um = (
+            self._pixel_size_x_um()
+            if self._tiled_item is not None
+            else self._display_um_per_scene_pixel(self._input_channels)
+        )
+        preview = self._preview_by_t.get(self.current_timepoint())
+        output_um = self._display_um_per_scene_pixel(preview)
+        self._input_pane.set_scale_bar(self._scale_bar_enabled, input_um)
+        self._output_pane.set_scale_bar(self._scale_bar_enabled, output_um)
 
     def fit_views(self) -> None:
         if self._mode_combo.currentText() == _THREE_D_MODE:
@@ -2147,7 +2351,7 @@ class DualViewerWidget(QWidget):
         self._refresh_view()
 
     def _on_channel_button_color_pick(self, index: int) -> None:
-        """Open a colour dialog to change the channel colour (double-click on the button)."""
+        """Open a colour dialog to change the channel colour."""
         if index < 0 or index >= len(self._channel_colors):
             return
         current = QColor(*self._channel_colors[index])
@@ -2182,6 +2386,8 @@ class DualViewerWidget(QWidget):
             self._reset_3d_on_next_render = True
         self._bar_3d.setVisible(mode == _THREE_D_MODE)
         self._projection_combo.setEnabled(mode == _TWO_D_MODE)
+        self._smooth_zoom_check.setEnabled(mode == _TWO_D_MODE)
+        self._scale_bar_check.setEnabled(mode == _TWO_D_MODE)
         self._z_slider.setEnabled(mode == _TWO_D_MODE and self._z_slider.maximum() > 0 and self._projection_combo.currentText() == "Slice")
         self._refresh_view()
 
@@ -2443,6 +2649,8 @@ class DualViewerWidget(QWidget):
             self._output_pane.show_placeholder(
                 f"No deconvolved preview for T={timepoint}.\nRun Deconvolution to preview this timepoint."
             )
+
+        self._refresh_scale_bar_state()
 
         if self._fit_on_next_render:
             self.fit_views()

@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.deconvolve import deconvolve_image
+from core.deconvolve import deconvolve, generate_psf, load_image
 from core.deconvolve_ci_dl import (
     apply_dl_refinement_25d,
     conditioning_vector,
@@ -39,16 +39,39 @@ log = logging.getLogger("evaluate_ci_rl_dl_model")
 
 
 DEFAULT_STRENGTHS = [0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0]
-DEFAULT_REAL_FILES = [
+LEGACY_REAL_FILES = [
     "Dendrites_Crop.ome.tiff",
     "DividingCellcrop.ome.tiff",
     "DNAcrop.ome.tiff",
     "U2OS.ome.tiff",
 ]
+REAL_IMAGE_SUFFIXES = (".ome.tiff", ".ome.tif")
+DERIVED_REAL_MARKERS = (
+    "_decon.ome.",
+    "_ci_rl.ome.",
+    "_ci_rl_dl.ome.",
+    "_deconvolved.ome.",
+)
+KEY_STRENGTHS = (0.25, 0.5, 1.0)
+DEFAULT_REAL_CROP_SHAPE = (96, 512, 512)
 
 
 def parse_strengths(text: str) -> list[float]:
     return [float(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def parse_crop_shape(text: str) -> tuple[int, int, int] | None:
+    cleaned = text.strip().lower()
+    if cleaned in {"", "0", "none", "full"}:
+        return None
+    parts = [
+        int(part.strip())
+        for part in cleaned.replace("x", ",").split(",")
+        if part.strip()
+    ]
+    if len(parts) != 3 or any(part <= 0 for part in parts):
+        raise argparse.ArgumentTypeError("Crop shape must be Z,Y,X, for example 96,512,512, or 'full'.")
+    return parts[0], parts[1], parts[2]
 
 
 def robust_mip(volume: np.ndarray) -> np.ndarray:
@@ -153,6 +176,17 @@ def load_checkpoint_settings(model_path: Path) -> dict[str, Any]:
     return {}
 
 
+def checkpoint_microscope_scope(metadata: dict[str, Any], requested_scope: str = "auto") -> str:
+    requested = requested_scope.strip().lower()
+    if requested in {"widefield", "confocal", "mixed", "all"}:
+        return requested
+    training_config = metadata.get("training_config", {})
+    scope = str(training_config.get("microscope_type", "mixed")).strip().lower()
+    if scope in {"widefield", "confocal"}:
+        return scope
+    return "mixed"
+
+
 def infer_model_settings(metadata: dict[str, Any]) -> tuple[int, int, bool, int]:
     recommended = metadata.get("recommended_inference", {})
     dl_kwargs = recommended.get("dl_kwargs", {})
@@ -161,6 +195,70 @@ def infer_model_settings(metadata: dict[str, Any]) -> tuple[int, int, bool, int]
     mixed_precision = bool(dl_kwargs.get("mixed_precision", recommended.get("dl_mixed_precision", True)))
     xy_padding = int(dl_kwargs.get("xy_padding", 0))
     return z_radius, max(batch_size, 1), mixed_precision, max(xy_padding, 0)
+
+
+def _is_candidate_real_file(path: Path) -> bool:
+    name = path.name.lower()
+    if not name.endswith(REAL_IMAGE_SUFFIXES):
+        return False
+    return not any(marker in name for marker in DERIVED_REAL_MARKERS)
+
+
+def discover_real_files(
+    real_dir: Path,
+    *,
+    microscope_scope: str,
+    recursive: bool = False,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    """Discover raw-ish local OME-TIFF files matching the checkpoint domain."""
+    patterns = ("**/*.ome.tiff", "**/*.ome.tif") if recursive else ("*.ome.tiff", "*.ome.tif")
+    candidates: list[Path] = []
+    for pattern in patterns:
+        candidates.extend(real_dir.glob(pattern))
+    files = sorted({path for path in candidates if path.is_file() and _is_candidate_real_file(path)})
+    selected: list[Path] = []
+    discovery: list[dict[str, Any]] = []
+    allowed = {"widefield", "confocal"} if microscope_scope in {"mixed", "all"} else {microscope_scope}
+    for path in files:
+        row: dict[str, Any] = {"file": str(path), "selected": False}
+        try:
+            loaded = load_image(path, overrule_metadata=False)
+            metadata = loaded.get("metadata", {})
+            images = loaded.get("images", [])
+            microscope = str(metadata.get("microscope_type", "widefield")).strip().lower()
+            row.update(
+                {
+                    "microscope_type": microscope,
+                    "n_channels": len(images),
+                    "shape": "x".join(str(v) for v in images[0].shape) if images else "",
+                }
+            )
+        except Exception as exc:
+            row["error"] = str(exc)
+            discovery.append(row)
+            log.warning("Skipping unreadable real file %s: %s", path, exc)
+            continue
+        if microscope in allowed:
+            row["selected"] = True
+            selected.append(path)
+        else:
+            row["skip_reason"] = f"microscope_type={microscope} outside scope={microscope_scope}"
+        discovery.append(row)
+    return selected, discovery
+
+
+def resolve_real_files(
+    *,
+    real_dir: Path,
+    real_files: list[str] | None,
+    microscope_scope: str,
+    recursive: bool,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    if real_files:
+        return [real_dir / name for name in real_files], [
+            {"file": str(real_dir / name), "selected": True, "source": "explicit"} for name in real_files
+        ]
+    return discover_real_files(real_dir, microscope_scope=microscope_scope, recursive=recursive)
 
 
 def synthetic_sample_dirs(data_dir: Path, num_synthetic: int) -> list[Path]:
@@ -294,6 +392,52 @@ def save_strength_montage(path: Path, rows: list[tuple[str, list[tuple[str, np.n
     plt.close(fig)
 
 
+def center_crop_volume(arr: np.ndarray, crop_shape: tuple[int, int, int] | None) -> tuple[np.ndarray, str]:
+    if crop_shape is None:
+        return arr, "full"
+    data = np.asarray(arr)
+    if data.ndim == 3:
+        limits = crop_shape
+    elif data.ndim == 2:
+        limits = crop_shape[-2:]
+    else:
+        return data, "full"
+    slices = []
+    cropped = False
+    for size, limit in zip(data.shape, limits, strict=False):
+        if size <= limit:
+            slices.append(slice(None))
+            continue
+        start = (size - limit) // 2
+        slices.append(slice(start, start + limit))
+        cropped = True
+    if not cropped:
+        return data, "full"
+    out = data[tuple(slices)]
+    return out, "center:" + "x".join(str(v) for v in out.shape)
+
+
+def crop_psf_to_image(psf: np.ndarray, image: np.ndarray) -> np.ndarray:
+    psf = np.asarray(psf, dtype=np.float32)
+    if image.ndim == 2 and psf.ndim == 3:
+        psf = psf[psf.shape[0] // 2]
+    elif image.ndim == 3 and psf.ndim == 2:
+        psf = psf[np.newaxis, :, :]
+    if image.ndim == 3 and psf.ndim == 3 and psf.shape[0] > image.shape[0]:
+        start = (psf.shape[0] - image.shape[0]) // 2
+        psf = psf[start:start + image.shape[0]]
+    if psf.ndim >= 2 and image.ndim >= 2:
+        y_axis = -2
+        x_axis = -1
+        if psf.shape[y_axis] > image.shape[-2]:
+            start = (psf.shape[y_axis] - image.shape[-2]) // 2
+            psf = np.take(psf, indices=range(start, start + image.shape[-2]), axis=y_axis)
+        if psf.shape[x_axis] > image.shape[-1]:
+            start = (psf.shape[x_axis] - image.shape[-1]) // 2
+            psf = np.take(psf, indices=range(start, start + image.shape[-1]), axis=x_axis)
+    return psf
+
+
 def evaluate_real_file(
     *,
     path: Path,
@@ -307,33 +451,45 @@ def evaluate_real_file(
     niter: int,
     output_dir: Path,
     checkpoint_metadata: dict[str, Any],
+    real_crop_shape: tuple[int, int, int] | None,
 ) -> list[dict[str, Any]]:
     log.info("Real file %s: running ci_rl baseline once", path)
-    baseline = deconvolve_image(
+    loaded = load_image(
         path,
-        method="ci_rl",
-        niter=niter,
-        background="auto",
-        offset="auto",
-        start="observed",
-        convergence="fixed",
-        two_d_mode="legacy_2d",
-        device=device,
+        overrule_metadata=False,
     )
     rows: list[dict[str, Any]] = []
     all_montages: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
 
-    metadata = baseline.get("metadata", {})
-    for ch_idx, (raw, ci_rl, psf) in enumerate(
-        zip(baseline["source_channels"], baseline["channels"], baseline["psfs"], strict=False)
-    ):
-        raw = np.asarray(raw, dtype=np.float32)
-        ci_rl = np.asarray(ci_rl, dtype=np.float32)
-        psf = np.asarray(psf, dtype=np.float32)
-        if raw.ndim == 2 and psf.ndim == 3:
-            psf_for_recon = psf[psf.shape[0] // 2]
-        else:
-            psf_for_recon = psf
+    metadata = dict(loaded.get("metadata", {}))
+    images = loaded.get("images", [])
+    for ch_idx, raw_source in enumerate(images):
+        raw, crop_label = center_crop_volume(np.asarray(raw_source, dtype=np.float32), real_crop_shape)
+        if crop_label != "full":
+            log.info("Real file %s channel %d: using evaluation crop %s", path, ch_idx, crop_label)
+        crop_metadata = dict(metadata)
+        if raw.ndim == 3:
+            crop_metadata["size_z"], crop_metadata["size_y"], crop_metadata["size_x"] = raw.shape
+        elif raw.ndim == 2:
+            crop_metadata["size_z"], crop_metadata["size_y"], crop_metadata["size_x"] = 1, raw.shape[0], raw.shape[1]
+        psf = generate_psf(crop_metadata, channel_idx=ch_idx, two_d_mode="legacy_2d")
+        psf_for_recon = crop_psf_to_image(psf, raw)
+        ci_rl = deconvolve(
+            raw,
+            psf_for_recon,
+            method="ci_rl",
+            niter=niter,
+            background="auto",
+            offset="auto",
+            start="observed",
+            convergence="fixed",
+            two_d_mode="legacy_2d",
+            device=device,
+            tv_lambda=0.0,
+            pixel_size_xy=crop_metadata.get("pixel_size_x"),
+            pixel_size_z=crop_metadata.get("pixel_size_z"),
+            microscope_type=crop_metadata.get("microscope_type", "widefield"),
+        ).astype(np.float32)
         raw_bgsub = np.clip(raw - np.percentile(raw, 1), 0, None)
         recon_ci = reconvolve_same(ci_rl, psf_for_recon, device=device)
         recon_ci_nmae = normalized_mae(recon_ci, raw_bgsub)
@@ -381,6 +537,7 @@ def evaluate_real_file(
                 "microscope_type": metadata.get("microscope_type", "unknown"),
                 "rl_iterations": niter,
                 "psf_mismatch_mode": "real_unknown",
+                "evaluation_crop": crop_label,
                 **intensity_metrics(result, ci_rl),
                 "reconv_nmae_to_raw_bgsub": recon_nmae,
                 "reconv_delta_vs_ci_rl": recon_nmae - recon_ci_nmae,
@@ -421,7 +578,162 @@ def summarize(rows: Iterable[dict[str, Any]], key_metric: str, group_key: str = 
     return summary
 
 
-def build_recommendations(synthetic_rows: list[dict[str, Any]], real_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_two_keys(
+    rows: Iterable[dict[str, Any]],
+    key_metric: str,
+    first_key: str,
+    second_key: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, Any], list[float]] = defaultdict(list)
+    for row in rows:
+        value = row.get(key_metric)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except Exception:
+            continue
+        if not np.isfinite(numeric):
+            continue
+        first: Any = row.get(first_key, "")
+        second: Any = row.get(second_key, "")
+        try:
+            second = float(second)
+        except Exception:
+            second = str(second)
+        grouped[(first, second)].append(numeric)
+
+    out: list[dict[str, Any]] = []
+    for (first, second), values in sorted(grouped.items(), key=lambda item: (str(item[0][0]), float(item[0][1]) if isinstance(item[0][1], float) else 0.0)):
+        arr = np.asarray(values, dtype=np.float32)
+        out.append(
+            {
+                first_key: first,
+                second_key: second,
+                f"{key_metric}_median": float(np.median(arr)),
+                f"{key_metric}_mean": float(np.mean(arr)),
+                "n": int(arr.size),
+            }
+        )
+    return out
+
+
+def real_per_file_summary(real_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    files = sorted({str(row.get("file", "")) for row in real_rows if row.get("file")})
+    for filename in files:
+        file_rows = [row for row in real_rows if row.get("file") == filename]
+        for strength in KEY_STRENGTHS:
+            rows = [row for row in file_rows if abs(float(row.get("strength", -1)) - strength) < 1e-8]
+            if not rows:
+                continue
+            finite_rows = [
+                row for row in rows
+                if np.isfinite(float(row.get("sum_to_ci_rl", float("nan"))))
+                and np.isfinite(float(row.get("mean_abs_change_to_ci_rl", float("nan"))))
+                and np.isfinite(float(row.get("corr_to_ci_rl", float("nan"))))
+            ]
+            if not finite_rows:
+                out.append(
+                    {
+                        "file": filename,
+                        "microscope_type": rows[0].get("microscope_type", "unknown"),
+                        "strength": strength,
+                        "channels": len(rows),
+                        "finite_channels": 0,
+                        "metric_warning": "non-finite metrics",
+                    }
+                )
+                continue
+            sums = np.asarray([float(row["sum_to_ci_rl"]) for row in finite_rows], dtype=np.float32)
+            changes = np.asarray([float(row["mean_abs_change_to_ci_rl"]) for row in finite_rows], dtype=np.float32)
+            corrs = np.asarray([float(row["corr_to_ci_rl"]) for row in finite_rows], dtype=np.float32)
+            out.append(
+                {
+                    "file": filename,
+                    "microscope_type": rows[0].get("microscope_type", "unknown"),
+                    "strength": strength,
+                    "channels": len(rows),
+                    "finite_channels": len(finite_rows),
+                    "sum_to_ci_rl_mean": float(np.mean(sums)),
+                    "sum_to_ci_rl_median": float(np.median(sums)),
+                    "mean_abs_change_to_ci_rl_mean": float(np.mean(changes)),
+                    "corr_to_ci_rl_mean": float(np.mean(corrs)),
+                }
+            )
+    return out
+
+
+def synthetic_per_sample_summary(synthetic_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for sample in sorted({str(row.get("sample", "")) for row in synthetic_rows if row.get("sample")}):
+        sample_rows = [row for row in synthetic_rows if row.get("sample") == sample]
+        baseline = next((row for row in sample_rows if float(row.get("strength", -1)) == 0.0), None)
+        full = next((row for row in sample_rows if float(row.get("strength", -1)) == 1.0), None)
+        if baseline is None or full is None:
+            continue
+        out.append(
+            {
+                "sample": sample,
+                "synthetic_morphology": baseline.get("synthetic_morphology", "unknown"),
+                "microscope_type": baseline.get("microscope_type", "unknown"),
+                "rl_iterations": baseline.get("rl_iterations", ""),
+                "psf_mismatch_mode": baseline.get("psf_mismatch_mode", "unknown"),
+                "gt_nmae_at_ci_rl": float(baseline["gt_nmae"]),
+                "gt_nmae_at_strength_1": float(full["gt_nmae"]),
+                "gt_nmae_delta_vs_ci_rl": float(full["gt_nmae_delta_vs_ci_rl"]),
+                "sum_to_ci_rl_at_strength_1": float(full["sum_to_ci_rl"]),
+            }
+        )
+    return out
+
+
+def choose_strength_recommendation(
+    *,
+    synthetic_by_strength: list[dict[str, float]],
+    real_intensity: list[dict[str, float]],
+    real_by_scope: list[dict[str, Any]],
+    microscope_scope: str,
+) -> dict[str, Any]:
+    best_synth = min(synthetic_by_strength, key=lambda row: row["gt_nmae_median"]) if synthetic_by_strength else None
+    safe_real = [
+        row for row in real_intensity
+        if 0.9 <= row["sum_to_ci_rl_median"] <= 1.05 and float(row["strength"]) > 0.0
+    ]
+    conservative = min(safe_real, key=lambda row: abs(row["sum_to_ci_rl_median"] - 1.0)) if safe_real else None
+    scope = "mixed" if microscope_scope == "all" else microscope_scope
+    scoped_rows = [
+        row for row in real_by_scope
+        if scope in {"mixed", "all"} or str(row.get("microscope_type", "")).lower() == scope
+    ]
+    full_strength_rows = [row for row in scoped_rows if abs(float(row.get("strength", -1)) - 1.0) < 1e-8]
+    full_strength_retention = None
+    if full_strength_rows:
+        values = np.asarray([float(row["sum_to_ci_rl_mean"]) for row in full_strength_rows], dtype=np.float32)
+        full_strength_retention = float(np.mean(values))
+
+    suggested = conservative or best_synth
+    warning = None
+    if full_strength_retention is not None and full_strength_retention < 0.95:
+        warning = (
+            f"At DL strength 1.0, real {scope} data retain about {full_strength_retention:.3f} "
+            "of CI-RL summed intensity on average; inspect before using full strength as a default."
+        )
+    return {
+        "best_synthetic_strength": best_synth,
+        "conservative_real_strength": conservative,
+        "suggested_default_strength": suggested,
+        "full_strength_real_mean_intensity_retention": full_strength_retention,
+        "energy_warning": warning,
+    }
+
+
+def build_recommendations(
+    synthetic_rows: list[dict[str, Any]],
+    real_rows: list[dict[str, Any]],
+    *,
+    microscope_scope: str,
+) -> dict[str, Any]:
     synthetic_by_strength = summarize(synthetic_rows, "gt_nmae")
     synthetic_ci_to_gt = summarize(
         [row for row in synthetic_rows if float(row.get("strength", -1)) == 0.0],
@@ -437,6 +749,9 @@ def build_recommendations(synthetic_rows: list[dict[str, Any]], real_rows: list[
     )
     real_intensity = summarize(real_rows, "sum_to_ci_rl")
     real_change = summarize(real_rows, "mean_abs_change_to_ci_rl")
+    real_intensity_by_microscope = summarize_two_keys(real_rows, "sum_to_ci_rl", "microscope_type", "strength")
+    real_change_by_microscope = summarize_two_keys(real_rows, "mean_abs_change_to_ci_rl", "microscope_type", "strength")
+    synthetic_negative = summarize(synthetic_rows, "negative_correction_fraction")
     synthetic_grouped = {
         "by_morphology": summarize([row for row in synthetic_rows if float(row.get("strength", -1)) == 1.0], "gt_nmae", "synthetic_morphology"),
         "by_microscope_type": summarize([row for row in synthetic_rows if float(row.get("strength", -1)) == 1.0], "gt_nmae", "microscope_type"),
@@ -453,6 +768,12 @@ def build_recommendations(synthetic_rows: list[dict[str, Any]], real_rows: list[
         if 0.9 <= row["sum_to_ci_rl_median"] <= 1.05 and row["strength"] > 0.0
     ]
     safe_strength = min(safe_real, key=lambda row: abs(row["sum_to_ci_rl_median"] - 1.0)) if safe_real else None
+    strength_recommendation = choose_strength_recommendation(
+        synthetic_by_strength=synthetic_by_strength,
+        real_intensity=real_intensity,
+        real_by_scope=real_intensity_by_microscope,
+        microscope_scope=microscope_scope,
+    )
     return {
         "synthetic_gt_nmae_by_strength": synthetic_by_strength,
         "synthetic_ci_rl_sum_to_gt_at_baseline": synthetic_ci_to_gt,
@@ -460,10 +781,16 @@ def build_recommendations(synthetic_rows: list[dict[str, Any]], real_rows: list[
         "synthetic_raw_sum_to_gt_at_baseline": synthetic_raw_to_gt,
         "real_sum_to_ci_rl_by_strength": real_intensity,
         "real_change_to_ci_rl_by_strength": real_change,
+        "real_sum_to_ci_rl_by_microscope_and_strength": real_intensity_by_microscope,
+        "real_change_to_ci_rl_by_microscope_and_strength": real_change_by_microscope,
+        "real_per_file_at_key_strengths": real_per_file_summary(real_rows),
+        "synthetic_per_sample_at_strength_1": synthetic_per_sample_summary(synthetic_rows),
+        "synthetic_negative_correction_fraction_by_strength": synthetic_negative,
         "synthetic_grouped_at_strength_1": synthetic_grouped,
         "real_grouped_at_strength_1": real_grouped,
         "best_synthetic_strength_by_gt_nmae": best_synth,
         "conservative_real_strength_by_intensity_retention": safe_strength,
+        "practical_strength_recommendation": strength_recommendation,
         "scale_mismatch_warning": _scale_mismatch_warning(synthetic_ci_to_gt, synthetic_ci_to_density),
         "interpretation": (
             "Use synthetic GT metrics to detect whether the model can improve known data. "
@@ -505,12 +832,135 @@ def _scale_mismatch_warning(
     return None
 
 
+def _format_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> list[str]:
+    if not rows:
+        return ["No rows."]
+    header = "| " + " | ".join(title for title, _ in columns) + " |"
+    sep = "| " + " | ".join("---" for _ in columns) + " |"
+    lines = [header, sep]
+    for row in rows:
+        values: list[str] = []
+        for _, key in columns:
+            value = row.get(key, "")
+            if isinstance(value, float):
+                values.append(f"{value:.4g}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return lines
+
+
+def write_markdown_report(path: Path, summary: dict[str, Any]) -> None:
+    rec = summary.get("practical_strength_recommendation") or {}
+    synthetic = summary.get("synthetic_gt_nmae_by_strength") or []
+    real = summary.get("real_sum_to_ci_rl_by_strength") or []
+    by_micro = summary.get("real_sum_to_ci_rl_by_microscope_and_strength") or []
+    per_file = summary.get("real_per_file_at_key_strengths") or []
+    lines = [
+        "# ci_rl_dl Evaluation",
+        "",
+        f"Model: `{summary.get('model_path', '')}`",
+        f"Training run: `{summary.get('training_run', '')}`",
+        f"Real-file scope: `{summary.get('real_microscope_scope', 'unknown')}`",
+        f"Real evaluation crop: `{summary.get('real_crop_shape', 'full')}`",
+        f"Inference: `z_radius={summary.get('z_radius')}`, `xy_padding={summary.get('xy_padding')}`, `niter={summary.get('niter')}`",
+        "",
+        "## Recommendation",
+        "",
+    ]
+    best = rec.get("best_synthetic_strength")
+    conservative = rec.get("conservative_real_strength")
+    suggested = rec.get("suggested_default_strength")
+    if best:
+        lines.append(f"- Best synthetic strength by GT NMAE: `{best.get('strength')}` (`median NMAE {best.get('gt_nmae_median'):.4g}`).")
+    if conservative:
+        lines.append(
+            "- Conservative real-data strength by intensity retention: "
+            f"`{conservative.get('strength')}` (`median sum/CI-RL {conservative.get('sum_to_ci_rl_median'):.4g}`)."
+        )
+    if suggested:
+        lines.append(f"- Suggested first-pass default strength: `{suggested.get('strength')}`.")
+    if rec.get("energy_warning"):
+        lines.append(f"- Energy warning: {rec['energy_warning']}")
+    if summary.get("scale_mismatch_warning"):
+        lines.append(f"- Scale note: {summary['scale_mismatch_warning']}")
+    lines.extend(
+        [
+            "",
+            "## Synthetic GT NMAE",
+            "",
+            *_format_table(
+                synthetic,
+                [
+                    ("strength", "strength"),
+                    ("median", "gt_nmae_median"),
+                    ("mean", "gt_nmae_mean"),
+                    ("n", "n"),
+                ],
+            ),
+            "",
+            "## Real Intensity Retention",
+            "",
+            *_format_table(
+                real,
+                [
+                    ("strength", "strength"),
+                    ("median sum/CI-RL", "sum_to_ci_rl_median"),
+                    ("mean sum/CI-RL", "sum_to_ci_rl_mean"),
+                    ("n", "n"),
+                ],
+            ),
+            "",
+            "## Real Intensity By Microscope",
+            "",
+            *_format_table(
+                by_micro,
+                [
+                    ("microscope", "microscope_type"),
+                    ("strength", "strength"),
+                    ("median sum/CI-RL", "sum_to_ci_rl_median"),
+                    ("mean sum/CI-RL", "sum_to_ci_rl_mean"),
+                    ("n", "n"),
+                ],
+            ),
+            "",
+            "## Real Files At Key Strengths",
+            "",
+            *_format_table(
+                per_file,
+                [
+                    ("file", "file"),
+                    ("microscope", "microscope_type"),
+                    ("strength", "strength"),
+                    ("channels", "channels"),
+                    ("finite", "finite_channels"),
+                    ("mean sum/CI-RL", "sum_to_ci_rl_mean"),
+                    ("mean abs change", "mean_abs_change_to_ci_rl_mean"),
+                    ("mean corr", "corr_to_ci_rl_mean"),
+                    ("warning", "metric_warning"),
+                ],
+            ),
+            "",
+            "## Files",
+            "",
+        ]
+    )
+    for plot in summary.get("plots", []):
+        lines.append(f"- `{plot}`")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, default=Path("training_runs/gui_large_quality_v2_mixed/checkpoints/best_model.pt"))
     parser.add_argument("--training-run", type=Path, default=Path("training_runs/gui_large_quality_v2_mixed"))
     parser.add_argument("--real-dir", type=Path, default=Path("localdata"))
-    parser.add_argument("--real-files", nargs="*", default=DEFAULT_REAL_FILES)
+    parser.add_argument("--real-files", nargs="*", default=None, help="Explicit real OME-TIFF filenames under --real-dir. If omitted, discover all relevant local OME-TIFF files.")
+    parser.add_argument("--real-microscope-scope", choices=["auto", "widefield", "confocal", "mixed", "all"], default="auto")
+    parser.add_argument("--recursive-real", action="store_true", help="Discover real OME-TIFF files recursively under --real-dir.")
+    parser.add_argument("--fail-on-real-error", action="store_true", help="Stop evaluation if one real file fails instead of recording the error and continuing.")
+    parser.add_argument("--legacy-real-files", action="store_true", help="Evaluate the original four hand-picked localdata files instead of auto-discovery.")
+    parser.add_argument("--real-crop-shape", type=parse_crop_shape, default=DEFAULT_REAL_CROP_SHAPE, help="Central Z,Y,X evaluation crop for large real files. Use 'full' to disable.")
     parser.add_argument("--output-dir", type=Path, default=Path("training_runs/gui_large_quality_v2_mixed/evaluation"))
     parser.add_argument("--num-synthetic", type=int, default=10)
     parser.add_argument("--strengths", type=parse_strengths, default=DEFAULT_STRENGTHS)
@@ -526,6 +976,7 @@ def main() -> int:
     device = str(device_obj)
     metadata = load_checkpoint_settings(args.model_path)
     z_radius, batch_size, mixed_precision, xy_padding = infer_model_settings(metadata)
+    microscope_scope = checkpoint_microscope_scope(metadata, args.real_microscope_scope)
     niter = args.niter
     if niter is None:
         niter = int(metadata.get("recommended_inference", {}).get("iterations", 50))
@@ -564,35 +1015,64 @@ def main() -> int:
             write_csv(args.output_dir / "synthetic_metrics.csv", synthetic_rows)
 
     real_rows: list[dict[str, Any]] = []
+    real_errors: list[dict[str, str]] = []
+    real_discovery: list[dict[str, Any]] = []
     if not args.skip_real:
-        for name in args.real_files:
-            real_path = args.real_dir / name
+        explicit_files = LEGACY_REAL_FILES if args.legacy_real_files else args.real_files
+        real_paths, real_discovery = resolve_real_files(
+            real_dir=args.real_dir,
+            real_files=explicit_files,
+            microscope_scope=microscope_scope,
+            recursive=args.recursive_real,
+        )
+        log.info(
+            "Evaluating %d real file(s) from %s with microscope scope %s",
+            len(real_paths),
+            args.real_dir,
+            microscope_scope,
+        )
+        for real_path in real_paths:
             if not real_path.exists():
                 log.warning("Skipping missing real file %s", real_path)
+                real_errors.append({"file": str(real_path), "error": "missing"})
                 continue
-            real_rows.extend(
-                evaluate_real_file(
-                    path=real_path,
-                    model=model,
-                    strengths=args.strengths,
-                    z_radius=z_radius,
-                    batch_size=batch_size,
-                    mixed_precision=mixed_precision,
-                    xy_padding=xy_padding,
-                    device=device,
-                    niter=niter,
-                    output_dir=args.output_dir,
-                    checkpoint_metadata=metadata,
+            try:
+                real_rows.extend(
+                    evaluate_real_file(
+                        path=real_path,
+                        model=model,
+                        strengths=args.strengths,
+                        z_radius=z_radius,
+                        batch_size=batch_size,
+                        mixed_precision=mixed_precision,
+                        xy_padding=xy_padding,
+                        device=device,
+                        niter=niter,
+                        output_dir=args.output_dir,
+                        checkpoint_metadata=metadata,
+                        real_crop_shape=args.real_crop_shape,
+                    )
                 )
-            )
+            except Exception as exc:
+                log.exception("Real file %s failed", real_path)
+                real_errors.append({"file": str(real_path), "error": str(exc)})
+                if args.fail_on_real_error:
+                    raise
         write_csv(args.output_dir / "real_metrics.csv", real_rows)
 
-    summary = build_recommendations(synthetic_rows, real_rows)
+    summary = build_recommendations(synthetic_rows, real_rows, microscope_scope=microscope_scope)
+    plots = sorted(path.name for path in args.output_dir.glob("*.png"))
     summary.update(
         {
             "model_path": str(args.model_path),
             "training_run": str(args.training_run),
             "strengths": args.strengths,
+            "real_dir": str(args.real_dir),
+            "real_microscope_scope": microscope_scope,
+            "real_crop_shape": args.real_crop_shape,
+            "real_file_discovery": real_discovery,
+            "real_files": [str(path) for path in real_paths] if not args.skip_real else [],
+            "real_errors": real_errors,
             "device": device,
             "z_radius": z_radius,
             "batch_size": batch_size,
@@ -601,9 +1081,12 @@ def main() -> int:
             "niter": niter,
             "num_synthetic_rows": len(synthetic_rows),
             "num_real_rows": len(real_rows),
+            "synthetic_samples": [str(path) for path in sample_dirs] if not args.skip_synthetic else [],
+            "plots": plots,
         }
     )
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_markdown_report(args.output_dir / "evaluation_report.md", summary)
     log.info("Wrote evaluation to %s", args.output_dir)
     return 0
 
