@@ -50,7 +50,7 @@ A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.  Combi
 
 `ci_rl_dl` is an experimental research pipeline that runs `ci_rl` deconvolution first, then refines the result with a trained 2.5D residual U-Net. This is not a replacement for physics-based deconvolution — treat trained models as sample- and microscope-specific refiners.
 
-For full details on the DL method, training presets, GPU training tips, API usage, and references see **[READMEDL.md](READMEDL.md)**.
+For full details on the DL method, training presets, GPU training tips, API usage, and references see **[READMEDL.md](docs/READMEDL.md)**.
 
 **Best for:** Exploratory refinement of `ci_rl` output with a trained checkpoint; requires a matching trained model.
 
@@ -66,7 +66,7 @@ For full details on the DL method, training presets, GPU training tips, API usag
 - **Automatic memory tiling** — tiles large volumes with feathered overlap to fit GPU or CPU RAM
 - **Streaming large tilescans** — optional OME-Zarr output path reads halo-extended regions and writes tiles/pyramids without materialising full 40k × 40k arrays
 
-For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
+For full algorithmic details see [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD).
 
 ---
 
@@ -74,12 +74,12 @@ For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
 ![GUI Deconvolution Panel](docs/screenshots/gui_deconvolve_ci.png)
 
-The standalone interactive GUI is the primary tool for exploratory deconvolution.  It provides a full parameter panel on the left and a synchronized dual-pane image viewer on the right.
+The standalone interactive GUI is the primary tool for exploratory deconvolution.  It now uses a top workflow bar for opening data, running jobs, exporting results, managing settings, opening the log/help, and launching batch mode.  The left pane contains deconvolution and optics parameters; the right pane is a synchronized 2D/3D viewer for original and deconvolved data.
 
 ### Running the GUI
 
 ```bash
-python gui_deconvolve_ci.py
+python gui/gui_deconvolve_ci.py
 ```
 
 The title bar shows the detected PyTorch version and GPU (e.g. `CI Deconvolve — torch 2.4.1 | NVIDIA RTX 4090 CUDA 12.6`).
@@ -98,19 +98,33 @@ These flags are understood only by `gui_deconvolve_ci.py` and are **not** part o
 Example — enable movie export and Fit PSF:
 
 ```bash
-python gui_deconvolve_ci.py --movie --fitpsf
+python gui/gui_deconvolve_ci.py --movie --fitpsf
 ```
+
+### Layout
+
+| Area | What it contains |
+|---|---|
+| **Top workflow bar** | **Open…**, source **Recent**, run progress/status, **Save…**, **Save T-Series…**, **Settings…**, settings **Recent**, **Log**, **Help**, **Batch…**, and **Run Deconvolution** |
+| **Left controls** | Loaded-file summary, metadata warning/reset controls, method settings, 2D widefield controls, optics/PSF, refractive indices, advanced parameters, optional Fit PSF / movie controls, and run history |
+| **Right viewer** | Channel buttons, 2D/3D view modes, projection, display scaling, navigator, scale bar, Z/T sliders, and linked original/deconvolved panes |
+| **Status bar** | Cursor readout, messages, and live CPU/RAM/SWAP/GPU/VRAM/SPILL monitor |
+
+Keyboard shortcuts: `Ctrl+O` open, `Ctrl+R` run, `Ctrl+S` save OME-TIFF, `Ctrl+Shift+S` save settings, `Ctrl+L` log, `F1` help.
 
 ### Image loading
 
-| Button | Supported formats |
+Use the **Open…** menu in the top workflow bar:
+
+| Menu item | Supported source |
 |---|---|
-| **Open…** | OME-TIFF, ND2, CZI, LIF, and any format supported by BioIO |
-| **Open Zarr…** | OME-Zarr (local, HCS plates) |
+| **Open File…** | OME-TIFF, TIFF, ND2, CZI, LIF, and any format supported by BioIO |
+| **Open OME-Zarr…** | Local OME-Zarr folders, including HCS plates/fields |
 | **Open Leica…** | Leica LIF / LOF / XLEF containers via `leica-browser-qt` |
 | **Open OMERO…** | OMERO server — browse projects/datasets/images (requires `omero-browser-qt[viewer]`) |
+| **Recent** | Reopen recent local files, Zarr folders, Leica entries, and supported recent sources |
 
-Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader instead of downloading the full plane.  The viewer loads the overview quickly and requests higher-resolution tiles as you zoom, matching the behaviour of the OMERO viewer in `omero-browser-qt`.
+Drag-and-drop uses the same loading path as the Open menu.  Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader instead of downloading the full plane.  The viewer loads the overview quickly and requests higher-resolution tiles as you zoom, matching the behaviour of the OMERO viewer in `omero-browser-qt`.
 
 ### Deconvolution controls (left panel)
 
@@ -126,8 +140,8 @@ Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader in
 #### 2D Widefield
 | Control | Default | Notes |
 |---|---|---|
-| 2D WF model | `Auto` | Kept on auto for 2D widefield model selection |
-| 2D WF aggressiveness | `Balanced` | Main 2D widefield strength control; enabled for 2D widefield images |
+| 2D WF model | `Auto` | Uses the widefield-aware collapsed-PSF model for 2D widefield images; legacy mode is retained for old settings |
+| 2D WF aggressiveness | `Balanced` | `Very Conservative`, `Conservative`, `Balanced`, `Strong`, `Very Strong` |
 
 #### Optics / PSF
 | Control | Default | Notes |
@@ -148,26 +162,24 @@ Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader in
 | RI sample | `1.47` | editable spin box |
 
 #### Advanced parameters (collapsible)
-- **TV lambda** (0.0001) — TV regularisation strength for `ci_rl_tv`
-- **Damping** (`none` / `auto` / numeric) — noise-gated correction attenuation
-- **Sparse weight / reg** — `ci_sparse_hessian` tuning
-- **DL model path / z-context / batch size / mixed precision / residual strength** — `ci_rl_dl` refinement controls in a dedicated **DL Refinement Parameters** panel
-- **Background** (`auto` / numeric / `0`) — background subtraction floor
-- **Offset** (`auto` / `none` / numeric) — positive processing shift
-- **Prefilter sigma** — Anscombe-domain Gaussian prefilter
-- **Device** (`auto` / `cpu` / `cuda`)
-- **2D Widefield Expert** sub-panel — background radius (µm) and background scale for 2D widefield auto mode
+- **DL Refinement Parameters** — visible model checkpoint picker and residual strength for `ci_rl_dl`; compatible model JSON/settings can supply z-context, batch size, and mixed-precision inference settings.
+- **Method Tuning** — TV lambda, damping mode/value, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and device (`auto`, `cuda`, `cpu`).
+- **2D Widefield Expert** — background estimator radius (`0.50 µm`) and auto background scale (`1.00`) for 2D widefield auto mode.
+- **Coverslip / Depth** — actual/design coverslip thickness, design immersion thickness, and particle depth.
+- **PSF Advanced** — pixel integration toggle, sub-pixel count, and pupil sampling density.
+- **Iteration Movie** — shown only with `--movie`; exports MP4 and optional half-size GIF recordings of the iteration sequence.
 
-#### PSF advanced (collapsible)
-Coverslip thickness, design immersion thickness, particle depth, sub-pixel integration toggle, sub-pixel count, pupil sampling density.
+#### Optional Fit PSF panel
+
+When launched with `--fitpsf`, the GUI shows a **Fit PSF** panel with a fit-iteration count and **Fit PSF…** button.  It searches the sample refractive index using the currently selected viewer channels, with a rough scan followed by a fine scan.
 
 ### Dual-pane viewer (right panel)
 
 | Control | Description |
 |---|---|
 | Channel buttons | Left-click toggles visibility; right-click changes channel colour |
-| View Mode | 2D original/deconvolved, side-by-side, linked split, blink, difference, ratio, and available 3D views |
-| Projection | Slice / MIP / SUM for Z data |
+| View mode | `2D Both`, `2D Original`, `2D Deconvolved`, `2D Linked split`, `2D Blink`, `2D Difference`, `2D Ratio`, `3D Both`, `3D Original`, `3D Deconvolved` |
+| Projection | `Slice`, `MIP`, or `SUM` for Z data |
 | Fit | `fitInView` on both panes simultaneously |
 | Smooth zoom | Preview interpolation toggle; does not alter image data |
 | Navigator | Small interactive overview/minimap for zoomed 2D views |
@@ -175,7 +187,7 @@ Coverslip thickness, design immersion thickness, particle depth, sub-pixel integ
 | Lo% / Hi% | Percentile-based contrast (defaults 0.1 % / 100 %) |
 | Adv. Scaling | Opens dedicated scaling dialog |
 | Z slider | Vertical slider for plane navigation |
-| Log / Help | `Ctrl+L` opens the log; `F1` opens the searchable in-app help |
+| Log / Help | Top-bar buttons and shortcuts: `Ctrl+L` opens the log; `F1` opens the searchable in-app help |
 
 In 3D mode additional controls appear:
 - **Render method:** MIP, Attenuated MIP, MinIP, Translucent, Average, Isosurface, Additive
@@ -200,13 +212,23 @@ A live status bar shows **CPU | RAM | SWAP | GPU | VRAM | SPILL** updated every 
 
 ### Saving results
 
-| Button | Action |
+Use the **Save…** menu in the top workflow bar:
+
+| Menu item | Action |
 |---|---|
-| **Save… → Save as OME-TIFF** | Save current timepoint deconvolution result as LZW-compressed OME-TIFF |
-| **Save… → Save as OME-Zarr** | Save current timepoint deconvolution result as OME-Zarr |
-| **Save… → Save views as PNG** | Export the current visual original/deconvolved preview |
-| **Save… → Save comparison as PNG** | Export the active comparison mode with display settings and scale bar |
+| **Save as OME-TIFF…** | Save the current timepoint deconvolution result as LZW-compressed OME-TIFF |
+| **Save as OME-Zarr…** | Save the current timepoint deconvolution result as chunked OME-Zarr |
+| **Save Views as PNG…** | Export the current visual original/deconvolved preview |
+| **Save Comparison as PNG…** | Export the active comparison mode with display settings and scale bar |
 | **Save T-Series…** | Export full T-series using memory-mapped staging |
+
+For full-resolution streamed OMERO pyramid jobs, **Run Deconvolution** asks for an OME-Zarr output path and writes tiles directly to that directory.  Streamed OMERO output currently supports `ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`; `ci_rl_dl` should be run as a preview/non-streamed job.  OME-TIFF and OME-Zarr exports preserve physical pixel metadata where available; PNG exports are display/rendering snapshots for reports.
+
+### Settings and run history
+
+The **Settings…** menu can restore the last GUI settings, save the current parameter set to JSON, or load a saved settings JSON.  The adjacent settings **Recent** menu reopens recently used settings files.
+
+The **Run History** section records recent runs with time, image, method, status, and output path.  From there you can restore parameters, open the output folder, copy a run summary, or remove an entry.
 
 ### Batch Deconvolver
 
@@ -301,7 +323,7 @@ python wrapper.py \
 ```
 
 Runs the three classical benchmark methods (`ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`), writes `benchmark_metrics_*.csv` with per-method timing and quality metrics, and generates MIP montage comparison images. `ci_rl_dl` is not included by default because it depends on a trained checkpoint.
-See [metrics.md](metrics.md) for metric formulas and interpretation.
+See [metrics.md](docs/metrics.md) for metric formulas and interpretation.
 
 ### Parameters
 
@@ -553,7 +575,7 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 - **SHB Acceleration:** Wang, Y. & Miller, E. L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* **23**(12), 5284–5297.
 - **TV Regularisation:** Dey, N. et al. (2006). "Richardson-Lucy Algorithm With Total Variation Regularization for 3D Confocal Microscope Deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266.
-- **DL Refinement (U-Net, Residual Learning):** see [READMEDL.md](READMEDL.md#references)
+- **DL Refinement (U-Net, Residual Learning):** see [READMEDL.md](docs/READMEDL.md#references)
 - **Content-Aware Image Restoration:** Weigert, M. et al. (2018). "Content-aware image restoration: pushing the limits of fluorescence microscopy." *Nat Methods* **15**, 1090–1097. [doi:10.1038/s41592-018-0216-7](https://doi.org/10.1038/s41592-018-0216-7)
 - **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
 - **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
@@ -565,8 +587,8 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 ## Further Reading
 
-- [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, experimental `ci_rl_dl` refinement, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
-- [metrics.md](metrics.md) — benchmark metric formulas and interpretation: timing CSV columns, FFT detail energy, edge strength, signal sparsity, and robust range.
+- [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, experimental `ci_rl_dl` refinement, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
+- [metrics.md](docs/metrics.md) — benchmark metric formulas and interpretation: timing CSV columns, FFT detail energy, edge strength, signal sparsity, and robust range.
 
 ---
 
