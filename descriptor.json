@@ -295,7 +295,7 @@
       "value-key": "@bench_crop",
       "command-line-flag": "--bench_crop",
       "name": "Benchmark crop",
-      "description": "When benchmark mode is active, centre-crop the image to tile-size limits before deconvolution. Speeds up the benchmark significantly for large images.",
+      "description": "When benchmark mode is active, centre-crop the image before deconvolution to at most 512 x 512 pixels in XY and 64 Z slices. Speeds up the benchmark significantly for large images.",
       "default-value": false,
       "set-by-server": false,
       "optional": true,

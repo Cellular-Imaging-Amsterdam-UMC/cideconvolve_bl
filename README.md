@@ -327,7 +327,7 @@ See [metrics.md](docs/metrics.md) for metric formulas and interpretation.
 
 ### Parameters
 
-All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
+The public CLI parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 
 #### Core parameters
 
@@ -339,9 +339,8 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
 | `--projection` | `none` | Z-projection: `none`, `mip`, or `sum` |
-| `--output_format` | `ome-tiff` | `ome-tiff` for eager saves, `ome-zarr` for streamed chunked output with pyramids |
+| `--output_format` | `ome-tiff` | `ome-tiff` for eager saves; `ome-zarr` forces streamed chunked output with pyramids |
 | `--streaming` | `auto` | `auto`, `always`, or `never`; auto enables region reads above `--streaming_threshold_gb` |
-| `--tile_limits` | `1024,64` | Streaming tile limit `max_xy,max_z`; XY is active, Z is reserved for future axial chunking |
 | `--streaming_threshold_gb` | `2.0` | Estimated full source-array size that triggers streaming auto mode |
 | `--scene` | `auto` | Optional BioIO scene index/name for multi-scene files |
 | `--hcs_field` | `auto` | Optional OME-Zarr HCS field path, for example `A/1/0` |
@@ -388,7 +387,7 @@ All parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--benchmark` | `false` | Run the three classical benchmark methods and write timing CSV + MIP montages |
-| `--bench_crop` | `false` | Centre-crop to tile limits before benchmarking |
+| `--bench_crop` | `false` | Centre-crop to at most 512 × 512 pixels in XY and 64 Z slices before benchmarking |
 | `--compute_metrics` | `false` | Compute optional FFT / gradient quality metrics |
 
 ---
@@ -405,16 +404,20 @@ OME-TIFF output.
 python wrapper.py \
     --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
     --method ci_rl --iterations 50 \
-    --output_format ome-zarr --streaming always --tile_limits 1024,64
+    --output_format ome-zarr --streaming always
 ```
 
 Streaming mode reads halo-extended XY regions, deconvolves each tile with the
 existing CI solver, writes the tile core directly to level 0, then builds XY
-pyramid levels in the output.  `--streaming auto` enables this path when the
-estimated full source array exceeds `--streaming_threshold_gb`.
-The current streaming implementation keeps the full Z extent per tile to avoid
-axial boundary artefacts; the `max_z` value in `--tile_limits` is retained for
-future Z chunking.
+pyramid levels in the output.  Tile size is selected automatically from the
+source shape, method, device, and available memory.  For 3D data the current
+streaming implementation keeps the full Z extent per tile to avoid axial
+boundary artefacts.
+
+`--streaming auto` enables this path when the estimated full source array
+exceeds `--streaming_threshold_gb`.  Choosing `--output_format ome-zarr` also
+uses the streaming writer directly.  Streaming output currently writes full Z
+data, so use `--projection none` with OME-Zarr streaming.
 
 ---
 
