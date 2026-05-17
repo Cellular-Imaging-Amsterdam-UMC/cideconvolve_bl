@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v1.5.0 |
+| **Version** | v2.2.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
 | **Methods** | `ci_rl` · `ci_rl_dl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
