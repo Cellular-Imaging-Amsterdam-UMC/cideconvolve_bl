@@ -92,12 +92,13 @@ These flags are understood only by `gui_deconvolve_ci.py` and are **not** part o
 |---|---|
 | `--movie` | Reveals the **Iteration Movie** panel in Advanced Parameters for exporting per-iteration MP4 / GIF recordings. |
 | `--fitpsf` | Reveals the **Fit PSF** panel for experimental refractive-index fitting from the loaded image. |
-| `--dlref` | Adds **`ci_rl_dl`** to the Method selector and reveals the **DL Refinement Parameters** panel (model path, z-context, batch size, mixed precision, residual strength) in Advanced Parameters. |
 
-Example — enable both movie export and DL refinement:
+`ci_rl_dl` and its DL refinement controls are always available in the GUI. When a matching `models/defaultwidefield` or `models/defaultconfocal` folder exists, the GUI can load the default checkpoint automatically after an image is loaded and `ci_rl_dl` is selected.
+
+Example — enable movie export and Fit PSF:
 
 ```bash
-python gui_deconvolve_ci.py --movie --dlref
+python gui_deconvolve_ci.py --movie --fitpsf
 ```
 
 ### Image loading
@@ -116,10 +117,17 @@ Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader in
 #### Method
 | Control | Default | Options |
 |---|---|---|
-| Method | `ci_rl` | `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian` (+ `ci_rl_dl` when `--dlref` is active) |
-| Iterations | `50` | comma-separated per-channel |
+| Method | `ci_rl` | `ci_rl`, `ci_rl_dl`, `ci_rl_tv`, `ci_sparse_hessian` |
+| Iterations | `80` widefield / `50` confocal | comma-separated per-channel |
 | Convergence | `auto` | `auto`, `fixed` |
 | Rel. threshold | `0.001` | 1×10⁻⁸ – 1.0 |
+| Start | `auto` | `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, `hybrid` |
+
+#### 2D Widefield
+| Control | Default | Notes |
+|---|---|---|
+| 2D WF model | `Auto` | Kept on auto for 2D widefield model selection |
+| 2D WF aggressiveness | `Balanced` | Main 2D widefield strength control; enabled for 2D widefield images |
 
 #### Optics / PSF
 | Control | Default | Notes |
@@ -142,15 +150,13 @@ Large pyramidal OMERO images are opened through the OMERO tile/pyramid reader in
 #### Advanced parameters (collapsible)
 - **TV lambda** (0.0001) — TV regularisation strength for `ci_rl_tv`
 - **Damping** (`none` / `auto` / numeric) — noise-gated correction attenuation
-- **2D WF model** (Auto / Legacy) — widefield-aware 2D PSF collapse mode
 - **Sparse weight / reg** — `ci_sparse_hessian` tuning
-- **DL model path / z-context / batch size / mixed precision / residual strength** — `ci_rl_dl` refinement controls (visible only with `--dlref`; in a dedicated **DL Refinement Parameters** panel)
+- **DL model path / z-context / batch size / mixed precision / residual strength** — `ci_rl_dl` refinement controls in a dedicated **DL Refinement Parameters** panel
 - **Background** (`auto` / numeric / `0`) — background subtraction floor
 - **Offset** (`auto` / `none` / numeric) — positive processing shift
 - **Prefilter sigma** — Anscombe-domain Gaussian prefilter
-- **Start** (`auto` / `flat` / `percentile_flat` / `observed` / `observed_bgsub` / `lowpass` / `lowpass_bgsub` / `hybrid`) — initial estimate
 - **Device** (`auto` / `cpu` / `cuda`)
-- **2D Widefield Expert** sub-panel — aggressiveness (Very Conservative → Very Strong), background radius (µm), background scale
+- **2D Widefield Expert** sub-panel — background radius (µm) and background scale for 2D widefield auto mode
 
 #### PSF advanced (collapsible)
 Coverslip thickness, design immersion thickness, particle depth, sub-pixel integration toggle, sub-pixel count, pupil sampling density.
@@ -159,14 +165,17 @@ Coverslip thickness, design immersion thickness, particle depth, sub-pixel integ
 
 | Control | Description |
 |---|---|
-| Channel buttons | Per-channel toggle with colour dots |
-| Mode | 2D / 3D (Vispy) |
-| Show | Both / Original / Deconvolved |
-| View | Slice / MIP / SUM |
+| Channel buttons | Left-click toggles visibility; right-click changes channel colour |
+| View Mode | 2D original/deconvolved, side-by-side, linked split, blink, difference, ratio, and available 3D views |
+| Projection | Slice / MIP / SUM for Z data |
 | Fit | `fitInView` on both panes simultaneously |
+| Smooth zoom | Preview interpolation toggle; does not alter image data |
+| Navigator | Small interactive overview/minimap for zoomed 2D views |
+| Scale bar | Physical scale overlay when pixel size is known |
 | Lo% / Hi% | Percentile-based contrast (defaults 0.1 % / 100 %) |
-| Advanced Scaling | Opens dedicated scaling dialog |
+| Adv. Scaling | Opens dedicated scaling dialog |
 | Z slider | Vertical slider for plane navigation |
+| Log / Help | `Ctrl+L` opens the log; `F1` opens the searchable in-app help |
 
 In 3D mode additional controls appear:
 - **Render method:** MIP, Attenuated MIP, MinIP, Translucent, Average, Isosurface, Additive
@@ -174,12 +183,12 @@ In 3D mode additional controls appear:
 - **Downsample** (1×, 2×, 4×) and **Smooth** toggle
 - **Reset View** (resets arcball camera)
 
-Both 2D panes are linked for synchronized pan and zoom.
+Both 2D panes are linked for synchronized pan and zoom. In **Linked split** mode, left-drag moves the split position and right-drag pans the image. Difference and ratio modes are display-normalized previews for visual comparison, not quantitative output.
 
 ### Advanced scaling dialog
 
 A detached 420×680 window with:
-- Per-channel visibility checkboxes and colour pickers (double-click channel name)
+- Per-channel visibility checkboxes and colour pickers
 - Per-pane (Original + Deconvolved) min/max sliders and spinboxes
 - Gamma (0.10–5.00, default 1.0)
 - Auto / Reset buttons
@@ -193,8 +202,11 @@ A live status bar shows **CPU | RAM | SWAP | GPU | VRAM | SPILL** updated every 
 
 | Button | Action |
 |---|---|
-| **Save…** | Save current timepoint deconvolution result as OME-TIFF |
-| **Save T-Series…** | Export full T-series to OME-TIFF using memory-mapped staging |
+| **Save… → Save as OME-TIFF** | Save current timepoint deconvolution result as LZW-compressed OME-TIFF |
+| **Save… → Save as OME-Zarr** | Save current timepoint deconvolution result as OME-Zarr |
+| **Save… → Save views as PNG** | Export the current visual original/deconvolved preview |
+| **Save… → Save comparison as PNG** | Export the active comparison mode with display settings and scale bar |
+| **Save T-Series…** | Export full T-series using memory-mapped staging |
 
 ### Batch Deconvolver
 
@@ -525,8 +537,8 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
 | `deconvolve_ci_dl.py` | Experimental `ci_rl_dl` wrapper and 2.5D residual U-Net inference |
-| `train.py` | Synthetic-data generation and training loop for `ci_rl_dl` checkpoints |
-| `gui_train.py` | Simple PyQt6 launcher for `ci_rl_dl` training presets |
+| `training/train.py` | Synthetic-data generation and training loop for `ci_rl_dl` checkpoints |
+| `gui/gui_train.py` | PyQt6 launcher for the two default-model `ci_rl_dl` training presets |
 | `descriptor.json` | BIAFLOWS / BIOMERO parameter descriptor (single source of truth) |
 | `bioflows_local.py` | Local BIAFLOWS compatibility shim |
 | `Dockerfile` | Docker build (NVIDIA CUDA 12.6 runtime + Python 3.11) |

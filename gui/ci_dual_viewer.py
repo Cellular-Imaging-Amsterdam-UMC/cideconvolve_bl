@@ -11,8 +11,8 @@ import math
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QWheelEvent
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -95,6 +95,32 @@ _VOLUME_METHOD_UI = {
 _INTERPOLATION_TOGGLE_METHODS = set(_VOLUME_METHODS) - {"iso"}
 _MAX_HIST_SAMPLES = 1_000_000
 _MAX_VIEW_PIXELS = 2_000_000
+
+
+def _toolbar_icon(kind: str, color: str = "#9cc8ff", size: int = 18) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color), 1.8)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    s = float(size)
+    if kind == "eye":
+        painter.drawEllipse(QRectF(2.5, 5.2, s - 5.0, s - 10.4))
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QPointF(s / 2.0, s / 2.0), 2.5, 2.5)
+    elif kind == "projection":
+        painter.drawRect(QRectF(3.0, 3.0, s - 8.0, s - 8.0))
+        painter.drawRect(QRectF(6.5, 6.5, s - 8.0, s - 8.0))
+    elif kind == "display":
+        for y, x in ((4.5, 4.0), (9.0, 2.5), (13.5, 5.5)):
+            painter.drawLine(QPointF(2.0, y), QPointF(s - 2.0, y))
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(QPointF(x + 7.0, y), 2.0, 2.0)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.end()
+    return pixmap
 
 
 @dataclass(slots=True)
@@ -332,6 +358,11 @@ def _composite_to_pixmap(
 class ZoomableImageView(QGraphicsView):
     """Simple pannable / zoomable QGraphicsView with optional linking."""
 
+    cursorMoved = pyqtSignal(float, float, bool)
+    rightSplitDragged = pyqtSignal(float)
+    panDragStarted = pyqtSignal()
+    panDragFinished = pyqtSignal()
+
     _ZOOM_FACTOR = 1.15
 
     def __init__(self, parent=None):
@@ -345,6 +376,11 @@ class ZoomableImageView(QGraphicsView):
         self._smooth_zoom = False
         self._scale_bar_enabled = True
         self._scale_bar_um_per_pixel: Optional[float] = None
+        self._navigator_enabled = True
+        self._right_dragging_split = False
+        self._navigator_dragging = False
+        self._navigator_rect = QRectF()
+        self._right_dragging_pan = False
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -352,6 +388,8 @@ class ZoomableImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setMinimumSize(260, 260)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.setStyleSheet(
             "QGraphicsView { background: #17191c; border: 1px solid #343a40; border-radius: 8px; }"
         )
@@ -379,6 +417,14 @@ class ZoomableImageView(QGraphicsView):
             value_f = None
         self._scale_bar_um_per_pixel = value_f if value_f is not None and value_f > 0 else None
         self.viewport().update()
+
+    def set_navigator_enabled(self, enabled: bool) -> None:
+        self._navigator_enabled = bool(enabled)
+        self.viewport().update()
+
+    def set_interaction_cursor(self, shape: Qt.CursorShape) -> None:
+        self.setCursor(shape)
+        self.viewport().setCursor(shape)
 
     def set_pixmap(self, pixmap: Optional[QPixmap]) -> None:
         self._scene.clear()
@@ -458,7 +504,163 @@ class ZoomableImageView(QGraphicsView):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
+        self._draw_minimap()
         self._draw_scale_bar()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._pix_item is not None:
+            self._emit_split_ratio(event.position().x())
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton and self._navigator_contains(event.position()):
+            self._navigator_dragging = True
+            self._pan_from_navigator(event.position())
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton and self._pix_item is not None:
+            self._right_dragging_pan = True
+            self.set_interaction_cursor(Qt.CursorShape.ClosedHandCursor)
+            self.panDragStarted.emit()
+            mapped = QMouseEvent(
+                event.type(),
+                event.position(),
+                event.globalPosition(),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                event.modifiers(),
+            )
+            super().mousePressEvent(mapped)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._navigator_dragging:
+            self._pan_from_navigator(event.position())
+            event.accept()
+            return
+        if event.buttons() & Qt.MouseButton.LeftButton and self._pix_item is not None:
+            self._emit_split_ratio(event.position().x())
+            event.accept()
+            return
+        if self._right_dragging_pan:
+            mapped = QMouseEvent(
+                event.type(),
+                event.position(),
+                event.globalPosition(),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                event.modifiers(),
+            )
+            super().mouseMoveEvent(mapped)
+            event.accept()
+            return
+        scene_pos = self.mapToScene(event.pos())
+        rect = self._scene.sceneRect()
+        inside = rect.contains(scene_pos)
+        self.cursorMoved.emit(float(scene_pos.x()), float(scene_pos.y()), bool(inside))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._navigator_dragging:
+            self._navigator_dragging = False
+            self._pan_from_navigator(event.position())
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton and self._right_dragging_split:
+            self._right_dragging_split = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton and self._right_dragging_pan:
+            self._right_dragging_pan = False
+            mapped = QMouseEvent(
+                event.type(),
+                event.position(),
+                event.globalPosition(),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+                event.modifiers(),
+            )
+            super().mouseReleaseEvent(mapped)
+            self.panDragFinished.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.cursorMoved.emit(0.0, 0.0, False)
+        super().leaveEvent(event)
+
+    def _draw_minimap(self) -> None:
+        if not self._navigator_enabled:
+            return
+        if self._pix_item is None or self._pix_item.pixmap().isNull():
+            return
+        if self.transform().m11() <= 1.25 and self.transform().m22() <= 1.25:
+            self._navigator_rect = QRectF()
+            return
+        pixmap = self._pix_item.pixmap()
+        max_w = min(150, max(80, self.viewport().width() // 5))
+        max_h = min(110, max(60, self.viewport().height() // 5))
+        overview = pixmap.scaled(
+            max_w,
+            max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if overview.isNull():
+            return
+        margin = 14
+        x = self.viewport().width() - overview.width() - margin
+        y = margin
+        self._navigator_rect = QRectF(float(x), float(y), float(overview.width()), float(overview.height()))
+        sx = overview.width() / max(float(pixmap.width()), 1.0)
+        sy = overview.height() / max(float(pixmap.height()), 1.0)
+        visible = self.mapToScene(self.viewport().rect()).boundingRect().intersected(self._scene.sceneRect())
+        visible_rect = QRectF(
+            x + visible.x() * sx,
+            y + visible.y() * sy,
+            visible.width() * sx,
+            visible.height() * sy,
+        )
+
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(2, 6, 23, 180))
+        painter.drawRoundedRect(x - 5, y - 5, overview.width() + 10, overview.height() + 10, 7, 7)
+        painter.drawPixmap(x, y, overview)
+        painter.setPen(QPen(QColor("#f8fafc"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(visible_rect)
+        painter.end()
+
+    def _emit_split_ratio(self, viewport_x: float) -> None:
+        width = max(float(self.viewport().width()), 1.0)
+        ratio = max(0.05, min(0.95, float(viewport_x) / width))
+        self.rightSplitDragged.emit(ratio)
+
+    def _navigator_contains(self, pos: QPointF) -> bool:
+        return (
+            self._navigator_enabled
+            and self._pix_item is not None
+            and not self._navigator_rect.isNull()
+            and self._navigator_rect.contains(pos)
+        )
+
+    def _pan_from_navigator(self, pos: QPointF) -> None:
+        if self._pix_item is None or self._navigator_rect.isNull():
+            return
+        rect = self._scene.sceneRect()
+        if rect.isEmpty():
+            return
+        rx = (float(pos.x()) - self._navigator_rect.x()) / max(self._navigator_rect.width(), 1.0)
+        ry = (float(pos.y()) - self._navigator_rect.y()) / max(self._navigator_rect.height(), 1.0)
+        scene_x = rect.left() + max(0.0, min(1.0, rx)) * rect.width()
+        scene_y = rect.top() + max(0.0, min(1.0, ry)) * rect.height()
+        self.centerOn(scene_x, scene_y)
+        self._sync_transform()
+        self.viewport().update()
 
     def _draw_scale_bar(self) -> None:
         if not self._scale_bar_enabled:
@@ -594,6 +796,9 @@ class _PaneWidget(QWidget):
     def set_scale_bar(self, enabled: bool, um_per_pixel: Optional[float]) -> None:
         self.view2d.set_scale_bar_enabled(enabled)
         self.view2d.set_scale_bar_um_per_pixel(um_per_pixel)
+
+    def set_navigator_enabled(self, enabled: bool) -> None:
+        self.view2d.set_navigator_enabled(enabled)
 
     def grab_3d_image(self) -> QImage:
         if not _HAS_VISPY or self._vispy_canvas is None:
@@ -1643,6 +1848,7 @@ class _AdvancedScalingWindow(QWidget):
 class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
     logRequested = pyqtSignal()
+    cursorInfoChanged = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1668,6 +1874,11 @@ class DualViewerWidget(QWidget):
         self._fit_on_next_render = False
         self._smooth_zoom_enabled = False
         self._scale_bar_enabled = True
+        self._navigator_enabled = True
+        self._blink_show_deconvolved = False
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(550)
+        self._blink_timer.timeout.connect(self._on_blink_timer)
         # Histogram cache: id(numpy_array) -> (bin_edges, counts).
         # Cleared when new image data is loaded so stale entries don't accumulate.
         self._hist_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -1703,53 +1914,95 @@ class DualViewerWidget(QWidget):
         root.addLayout(self._channel_bar)
 
         top = QHBoxLayout()
-        top.setSpacing(8)
-        mode_group = QWidget()
-        mode_layout = QHBoxLayout(mode_group)
-        mode_layout.setContentsMargins(0, 0, 0, 0)
-        mode_layout.setSpacing(6)
-        mode_layout.addWidget(QLabel("Mode:"))
+        top.setSpacing(10)
+
+        def _group(icon_kind: str, tooltip: str) -> QWidget:
+            group = QFrame()
+            group.setFrameShape(QFrame.Shape.StyledPanel)
+            group.setStyleSheet(
+                "QFrame { border: 1px solid #343a40; border-radius: 4px; } "
+                "QLabel { border: none; color: #bfc5cc; font-weight: 700; } "
+                "QComboBox, QPushButton { border: 1px solid #3d4248; }"
+            )
+            layout = QHBoxLayout(group)
+            layout.setContentsMargins(6, 3, 6, 3)
+            layout.setSpacing(6)
+            icon = QLabel()
+            icon.setPixmap(_toolbar_icon(icon_kind))
+            icon.setToolTip(tooltip)
+            layout.addWidget(icon)
+            return group
+
+        view_section = _group("eye", "View mode")
+        top.addWidget(view_section)
+        view_section_layout = view_section.layout()
         self._mode_combo = QComboBox()
         self._mode_combo.addItems([_TWO_D_MODE, _THREE_D_MODE])
         self._mode_combo.currentTextChanged.connect(self._on_mode_changed)
-        mode_layout.addWidget(self._mode_combo)
-        top.addWidget(mode_group)
+        self._mode_combo.hide()
 
         show_group = QWidget()
         show_layout = QHBoxLayout(show_group)
         show_layout.setContentsMargins(0, 0, 0, 0)
         show_layout.setSpacing(6)
-        show_layout.addWidget(QLabel("Show:"))
         self._view_selector = QComboBox()
-        self._view_selector.addItems(_VIEW_SELECTOR_MODES)
-        self._view_selector.currentTextChanged.connect(self._apply_view_selector)
+        self._view_selector.addItems([
+            "2D Both",
+            "2D Original",
+            "2D Deconvolved",
+            "2D Linked split",
+            "2D Blink",
+            "2D Difference",
+            "2D Ratio",
+            "3D Both",
+            "3D Original",
+            "3D Deconvolved",
+        ])
+        self._view_selector.currentTextChanged.connect(self._on_view_mode_changed)
+        self._view_selector.setMinimumContentsLength(16)
+        self._view_selector.setStyleSheet("QComboBox { padding-left: 5px; padding-right: 8px; }")
         show_layout.addWidget(self._view_selector)
-        top.addWidget(show_group)
+        self._compare_combo = self._view_selector
+        view_section_layout.addWidget(show_group)
 
         view_group = QWidget()
         view_layout = QHBoxLayout(view_group)
         view_layout.setContentsMargins(0, 0, 0, 0)
         view_layout.setSpacing(6)
-        view_layout.addWidget(QLabel("View:"))
+        projection_icon = QLabel()
+        projection_icon.setPixmap(_toolbar_icon("projection"))
+        projection_icon.setToolTip("2D projection")
+        view_layout.addWidget(projection_icon)
         self._projection_combo = QComboBox()
         self._projection_combo.addItems(_PROJECTION_MODES)
         self._projection_combo.currentTextChanged.connect(self._on_projection_changed)
+        self._projection_combo.setMinimumContentsLength(6)
+        self._projection_combo.setStyleSheet("QComboBox { padding-left: 5px; padding-right: 8px; }")
         view_layout.addWidget(self._projection_combo)
-        top.addWidget(view_group)
+        view_section_layout.addWidget(view_group)
 
         self._fit_button = QPushButton("Fit")
+        self._fit_button.setMinimumWidth(54)
         self._fit_button.clicked.connect(self.fit_views)
-        top.addWidget(self._fit_button)
+        view_section_layout.addWidget(self._fit_button)
 
+        display_section = _group("display", "Display")
+        top.addWidget(display_section)
+        display_layout = display_section.layout()
         self._smooth_zoom_check = QCheckBox("Smooth zoom")
         self._smooth_zoom_check.setChecked(False)
         self._smooth_zoom_check.toggled.connect(self._on_smooth_zoom_toggled)
-        top.addWidget(self._smooth_zoom_check)
+        display_layout.addWidget(self._smooth_zoom_check)
+
+        self._navigator_check = QCheckBox("Navigator")
+        self._navigator_check.setChecked(True)
+        self._navigator_check.toggled.connect(self._on_navigator_toggled)
+        display_layout.addWidget(self._navigator_check)
 
         self._scale_bar_check = QCheckBox("Scale bar")
         self._scale_bar_check.setChecked(True)
         self._scale_bar_check.toggled.connect(self._on_scale_bar_toggled)
-        top.addWidget(self._scale_bar_check)
+        display_layout.addWidget(self._scale_bar_check)
 
         self._lo_group = QWidget()
         lo_layout = QHBoxLayout(self._lo_group)
@@ -1761,9 +2014,10 @@ class DualViewerWidget(QWidget):
         self._lo_spin.setDecimals(3)
         self._lo_spin.setSingleStep(0.01)
         self._lo_spin.setValue(0.1)
+        self._lo_spin.setMinimumWidth(95)
         self._lo_spin.valueChanged.connect(self._on_contrast_changed)
         lo_layout.addWidget(self._lo_spin)
-        top.addWidget(self._lo_group)
+        display_layout.addWidget(self._lo_group)
 
         self._hi_group = QWidget()
         hi_layout = QHBoxLayout(self._hi_group)
@@ -1773,18 +2027,26 @@ class DualViewerWidget(QWidget):
         self._hi_spin = QDoubleSpinBox()
         self._hi_spin.setRange(50.0, 100.0)
         self._hi_spin.setDecimals(3)
-        self._hi_spin.setSingleStep(0.01)
+        self._hi_spin.setSingleStep(0.001)
         self._hi_spin.setValue(100.0)
+        self._hi_spin.setMinimumWidth(95)
         self._hi_spin.valueChanged.connect(self._on_contrast_changed)
         hi_layout.addWidget(self._hi_spin)
-        top.addWidget(self._hi_group)
+        display_layout.addWidget(self._hi_group)
 
         self._advanced_scaling_button = QPushButton("Adv. Scaling")
+        self._advanced_scaling_button.setMinimumWidth(96)
         self._advanced_scaling_button.clicked.connect(self._open_advanced_scaling)
-        top.addWidget(self._advanced_scaling_button)
-        self._log_button = QPushButton("Log")
-        self._log_button.clicked.connect(self.logRequested.emit)
-        top.addWidget(self._log_button)
+        display_layout.addWidget(self._advanced_scaling_button)
+
+        self._compare_split_slider = QSlider(Qt.Orientation.Horizontal)
+        self._compare_split_slider.setRange(5, 95)
+        self._compare_split_slider.setValue(50)
+        self._compare_split_slider.setFixedWidth(90)
+        self._compare_split_slider.valueChanged.connect(self._refresh_view)
+        self._compare_split_slider.setVisible(False)
+        view_section_layout.addWidget(self._compare_split_slider)
+
         top.addStretch()
 
         root.addLayout(top)
@@ -1832,6 +2094,18 @@ class DualViewerWidget(QWidget):
         self._input_pane = _PaneWidget("Original")
         self._output_pane = _PaneWidget("Deconvolved")
         self._input_pane.view2d.link_to(self._output_pane.view2d)
+        self._input_pane.view2d.cursorMoved.connect(
+            lambda x, y, inside: self._on_cursor_moved("Original", x, y, inside)
+        )
+        self._input_pane.view2d.rightSplitDragged.connect(self._on_split_dragged)
+        self._input_pane.view2d.panDragStarted.connect(self._set_pan_drag_cursor)
+        self._input_pane.view2d.panDragFinished.connect(self._refresh_split_cursor)
+        self._output_pane.view2d.cursorMoved.connect(
+            lambda x, y, inside: self._on_cursor_moved("Deconvolved", x, y, inside)
+        )
+        self._output_pane.view2d.rightSplitDragged.connect(self._on_split_dragged)
+        self._output_pane.view2d.panDragStarted.connect(self._set_pan_drag_cursor)
+        self._output_pane.view2d.panDragFinished.connect(self._refresh_split_cursor)
         self._input_pane.cameraStateChanged.connect(self._sync_3d_from_input)
         self._output_pane.cameraStateChanged.connect(self._sync_3d_from_output)
         panes.addWidget(self._input_pane, stretch=1)
@@ -2027,6 +2301,20 @@ class DualViewerWidget(QWidget):
             "deconvolved": deconvolved,
         }
 
+    def current_comparison_image(self) -> QImage:
+        """Return the active display-normalized comparison image."""
+        self._ensure_channel_scaling_defaults()
+        if self._mode_combo.currentText() == _THREE_D_MODE:
+            images = self.current_view_images()
+            deconvolved = images.get("deconvolved") or QImage()
+            if not deconvolved.isNull():
+                return deconvolved
+            return images.get("original") or QImage()
+        preview = self._preview_by_t.get(self.current_timepoint())
+        if not preview:
+            return QImage()
+        return _rgb_to_qimage(self._build_compare_rgb(preview, self._projection_combo.currentText()))
+
     def set_lo_percentile(self, value: float) -> None:
         self._lo_spin.setValue(value)
 
@@ -2041,6 +2329,75 @@ class DualViewerWidget(QWidget):
     def _on_scale_bar_toggled(self, enabled: bool) -> None:
         self._scale_bar_enabled = bool(enabled)
         self._refresh_scale_bar_state()
+
+    def _on_navigator_toggled(self, enabled: bool) -> None:
+        self._navigator_enabled = bool(enabled)
+        self._refresh_navigator_state()
+
+    def _view_mode_text(self) -> str:
+        text = self._view_selector.currentText() if hasattr(self, "_view_selector") else "2D Both"
+        if text.startswith("2D "):
+            return text[3:]
+        if text.startswith("3D "):
+            return text[3:]
+        return text
+
+    def _view_dimension_text(self) -> str:
+        text = self._view_selector.currentText() if hasattr(self, "_view_selector") else "2D Both"
+        return _THREE_D_MODE if text.startswith("3D ") else _TWO_D_MODE
+
+    def _on_view_mode_changed(self, text: str) -> None:
+        requested_mode = _THREE_D_MODE if str(text).startswith("3D ") else _TWO_D_MODE
+        if requested_mode == _THREE_D_MODE and not self._can_show_3d():
+            self._view_selector.blockSignals(True)
+            self._view_selector.setCurrentText("2D Both")
+            self._view_selector.blockSignals(False)
+            requested_mode = _TWO_D_MODE
+        if self._mode_combo.currentText() != requested_mode:
+            self._mode_combo.setCurrentText(requested_mode)
+        self._on_compare_mode_changed(self._view_mode_text())
+        self._apply_view_selector()
+        self._refresh_split_cursor()
+        self._refresh_view()
+
+    def _on_compare_mode_changed(self, mode: str) -> None:
+        mode = mode[3:] if mode.startswith(("2D ", "3D ")) else mode
+        self._compare_split_slider.setVisible(mode == "Linked split")
+        if mode == "Blink":
+            self._blink_timer.start()
+        else:
+            self._blink_timer.stop()
+            self._blink_show_deconvolved = False
+        self._refresh_split_cursor()
+        self._refresh_view()
+
+    def _on_split_dragged(self, ratio: float) -> None:
+        if self._mode_combo.currentText() != _TWO_D_MODE:
+            return
+        if self._view_mode_text() != "Linked split":
+            return
+        value = max(5, min(95, int(round(float(ratio) * 100.0))))
+        if self._compare_split_slider.value() == value:
+            return
+        self._compare_split_slider.setValue(value)
+
+    def _refresh_split_cursor(self) -> None:
+        cursor = (
+            Qt.CursorShape.SplitHCursor
+            if self._mode_combo.currentText() == _TWO_D_MODE and self._view_mode_text() == "Linked split"
+            else Qt.CursorShape.ArrowCursor
+        )
+        self._input_pane.view2d.set_interaction_cursor(cursor)
+        self._output_pane.view2d.set_interaction_cursor(cursor)
+
+    def _set_pan_drag_cursor(self) -> None:
+        self._input_pane.view2d.set_interaction_cursor(Qt.CursorShape.ClosedHandCursor)
+        self._output_pane.view2d.set_interaction_cursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _on_blink_timer(self) -> None:
+        self._blink_show_deconvolved = not self._blink_show_deconvolved
+        if self._mode_combo.currentText() == _TWO_D_MODE:
+            self._refresh_view()
 
     def _pixel_size_x_um(self) -> Optional[float]:
         for key in ("pixel_size_x", "pixel_size_y"):
@@ -2387,8 +2744,10 @@ class DualViewerWidget(QWidget):
         self._bar_3d.setVisible(mode == _THREE_D_MODE)
         self._projection_combo.setEnabled(mode == _TWO_D_MODE)
         self._smooth_zoom_check.setEnabled(mode == _TWO_D_MODE)
+        self._navigator_check.setEnabled(mode == _TWO_D_MODE)
         self._scale_bar_check.setEnabled(mode == _TWO_D_MODE)
         self._z_slider.setEnabled(mode == _TWO_D_MODE and self._z_slider.maximum() > 0 and self._projection_combo.currentText() == "Slice")
+        self._refresh_navigator_state()
         self._refresh_view()
 
     def _on_projection_changed(self, _projection: str) -> None:
@@ -2562,15 +2921,32 @@ class DualViewerWidget(QWidget):
         self._smooth_check.setVisible(method in _INTERPOLATION_TOGGLE_METHODS)
 
     def _apply_view_selector(self) -> None:
-        mode = self._view_selector.currentText()
+        mode = self._view_mode_text()
+        if self._mode_combo.currentText() == _TWO_D_MODE and mode not in ("Both", "Original", "Deconvolved"):
+            self._input_pane.setVisible(True)
+            self._output_pane.setVisible(False)
+            self._refresh_navigator_state()
+            return
         self._input_pane.setVisible(mode in ("Both", "Original"))
         self._output_pane.setVisible(mode in ("Both", "Deconvolved"))
+        self._refresh_navigator_state()
+
+    def _refresh_navigator_state(self) -> None:
+        enabled = bool(self._navigator_enabled)
+        mode = self._view_mode_text()
+        compare_mode = mode not in ("Both", "Original", "Deconvolved")
+        input_enabled = enabled and self._mode_combo.currentText() == _TWO_D_MODE
+        output_enabled = input_enabled and mode == "Deconvolved" and not compare_mode
+        self._input_pane.set_navigator_enabled(input_enabled)
+        self._output_pane.set_navigator_enabled(output_enabled)
 
     def _update_labels(self) -> None:
         t = self._t_slider.value()
         z = self._z_slider.value()
         self._t_label.setText(f"{t}/{max(self._t_slider.maximum(), 0)}")
-        self._z_label.setText(f"{z}/{max(self._z_slider.maximum(), 0)}")
+        z_max = max(self._z_slider.maximum(), 0)
+        z_width = max(1, len(str(z_max)))
+        self._z_label.setText(f"{z:0{z_width}d}/{z_max}")
 
     def _ensure_mode_valid(self) -> None:
         can_show_3d = self._can_show_3d()
@@ -2612,6 +2988,18 @@ class DualViewerWidget(QWidget):
         self._z_slider.setEnabled(self._z_slider.maximum() > 0 and projection == "Slice")
         self._input_pane.set_mode(_TWO_D_MODE)
         self._output_pane.set_mode(_TWO_D_MODE)
+        preview = self._preview_by_t.get(timepoint)
+        compare_mode = self._view_mode_text()
+
+        if preview and compare_mode not in ("Both", "Original", "Deconvolved"):
+            self._input_pane.set_pixmap(QPixmap.fromImage(self.current_comparison_image()))
+            self._output_pane.setVisible(False)
+            self._input_pane.setVisible(True)
+            self._refresh_scale_bar_state()
+            if self._fit_on_next_render:
+                self.fit_views()
+                self._fit_on_next_render = False
+            return
 
         if self._tiled_provider is not None and self._tiled_item is not None:
             input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
@@ -2638,7 +3026,6 @@ class DualViewerWidget(QWidget):
             input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
             self._input_pane.set_pixmap(input_pixmap)
 
-        preview = self._preview_by_t.get(timepoint)
         if preview:
             output_was_placeholder = self._output_pane._display_stack.currentIndex() == 1
             output_pixmap = self._build_2d_pixmap(preview, projection, pane="deconvolved")
@@ -2765,6 +3152,102 @@ class DualViewerWidget(QWidget):
             plane = _project_stack(stack, projection, self._z_slider.value())
             slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         return _rgb_to_qimage(_composite_to_rgb(slices))
+
+    def _build_2d_rgb(
+        self,
+        channels_zyx: list[np.ndarray],
+        projection: str,
+        *,
+        pane: str,
+    ) -> np.ndarray:
+        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]] = []
+        for idx in self._active_channel_indices():
+            if idx >= len(channels_zyx):
+                continue
+            stack = channels_zyx[idx]
+            plane = _project_stack(stack, projection, self._z_slider.value())
+            slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
+        if not slices:
+            return np.zeros((0, 0, 3), dtype=np.uint8)
+        stride = _display_stride(slices[0][0].shape)
+        if stride > 1:
+            slices = [(arr[::stride, ::stride], color, contrast) for arr, color, contrast in slices]
+        return _composite_to_rgb(slices)
+
+    def _build_compare_rgb(self, preview: list[np.ndarray], projection: str) -> np.ndarray:
+        original = self._build_2d_rgb(self._input_channels, projection, pane="original")
+        deconvolved = self._build_2d_rgb(preview, projection, pane="deconvolved")
+        if original.size == 0:
+            return deconvolved
+        if deconvolved.size == 0:
+            return original
+        h = min(original.shape[0], deconvolved.shape[0])
+        w = min(original.shape[1], deconvolved.shape[1])
+        original = original[:h, :w]
+        deconvolved = deconvolved[:h, :w]
+        mode = self._view_mode_text()
+        if mode == "Linked split":
+            split = int(round(w * self._compare_split_slider.value() / 100.0))
+            out = deconvolved.copy()
+            out[:, :split] = original[:, :split]
+            return out
+        if mode == "Blink":
+            return deconvolved if self._blink_show_deconvolved else original
+        if mode == "Difference":
+            diff = np.abs(deconvolved.astype(np.int16) - original.astype(np.int16)).astype(np.float32)
+            diff *= 2.0
+            return np.clip(diff, 0, 255).astype(np.uint8)
+        if mode == "Ratio":
+            orig_lum = original.astype(np.float32).mean(axis=2) + 1.0
+            deconv_lum = deconvolved.astype(np.float32).mean(axis=2) + 1.0
+            log_ratio = np.log2(deconv_lum / orig_lum)
+            scaled = np.clip(log_ratio / 2.0, -1.0, 1.0)
+            out = np.zeros_like(original, dtype=np.float32)
+            positive = scaled > 0
+            negative = scaled < 0
+            out[..., 0] = np.where(positive, scaled * 255.0, 0.0)
+            out[..., 2] = np.where(negative, -scaled * 255.0, 0.0)
+            out[..., 1] = np.clip((1.0 - np.abs(scaled)) * 70.0, 0.0, 70.0)
+            return out.astype(np.uint8)
+        if mode == "Original":
+            return original
+        return deconvolved
+
+    def _on_cursor_moved(self, pane: str, scene_x: float, scene_y: float, inside: bool) -> None:
+        if not inside:
+            self.cursorInfoChanged.emit("")
+            return
+        channels = self._input_channels if pane == "Original" else self._preview_by_t.get(self.current_timepoint(), [])
+        if not channels:
+            self.cursorInfoChanged.emit("")
+            return
+        projection = self._projection_combo.currentText()
+        stride = 1
+        for idx in self._active_channel_indices():
+            if 0 <= idx < len(channels):
+                stride = _display_stride(tuple(int(v) for v in channels[idx].shape[-2:]))
+                break
+        x = int(round(scene_x * stride))
+        y = int(round(scene_y * stride))
+        z = int(self._z_slider.value()) if projection == "Slice" else -1
+        values: list[str] = []
+        for idx in self._active_channel_indices():
+            if idx >= len(channels):
+                continue
+            stack = channels[idx]
+            try:
+                plane = _project_stack(stack, projection, self._z_slider.value())
+                if 0 <= y < plane.shape[0] and 0 <= x < plane.shape[1]:
+                    values.append(f"Ch{idx + 1}={float(plane[y, x]):.4g}")
+            except Exception:
+                continue
+        px_um = self._pixel_size_x_um()
+        physical = f" | {x * px_um:.2f} um, {y * px_um:.2f} um" if px_um else ""
+        z_text = f" Z={z}" if z >= 0 else ""
+        value_text = " | " + ", ".join(values) if values else ""
+        self.cursorInfoChanged.emit(
+            f"{pane} X={x} Y={y}{z_text} T={self.current_timepoint()}{physical}{value_text}"
+        )
 
     def _build_3d_channel_payload(
         self,

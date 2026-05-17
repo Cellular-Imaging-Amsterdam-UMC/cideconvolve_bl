@@ -85,7 +85,7 @@ checkpoint is supplied, `ci_rl_dl` returns the normal `ci_rl` result unchanged.
 - Single-channel 2D: `Y, X`
 - Single-channel 3D: `Z, Y, X`
 - Multichannel API: `C, Z, Y, X`
-- The GUI and wrapper still process channels independently, matching the
+- The GUI and high-level deconvolution API still process channels independently, matching the
   existing PSF-per-channel workflow.
 
 **2.5D input channels**:
@@ -114,7 +114,7 @@ learned correction more conservative:
 x_final = clamp(x_ci_rl + residual_scale * gate * bounded_residual, min=0)
 ```
 
-**Training source**: `train.py` creates synthetic microscopy-like volumes,
+**Training source**: `training/train.py` creates synthetic microscopy-like volumes,
 convolves them with CIDeconvolve PSFs, adds Poisson shot noise, Gaussian read
 noise, background, hot pixels, and optional clipping, then runs the existing
 `ci_rl` solver to form the network input. Synthetic volumes are split by whole
@@ -519,13 +519,13 @@ U-Net from `deconvolve_ci_dl.py`.
 |-----------|------|---------|-------------|
 | `image` | ndarray | required | Input image, either `Y,X`, `Z,Y,X`, or multichannel `C,Z,Y,X` |
 | `psf` | ndarray/list | required | PSF for all channels, a `C,...` PSF stack, or one PSF reused for every channel |
-| `model_path` | str/Path/None | None | Trained `final_model.pt`; when None, returns normal `ci_rl` unchanged |
+| `model_path` | str/Path/None | None | Trained `best_model.pt` checkpoint; when None, returns normal `ci_rl` unchanged |
 | `device` | str | "auto" | `"auto"`, `"cuda"`, or `"cpu"` |
 | `rl_kwargs` | dict/None | None | Passed through to `ci_rl_deconvolve` |
 | `dl_kwargs` | dict/None | None | DL options such as `z_radius`, `batch_size`, `mixed_precision`, and `residual_scale` |
 | `return_diagnostics` | bool | False | Return raw, `ci_rl`, refined output, residual, reconvolution prediction, and diagnostics |
 
-The high-level `deconvolve(..., method="ci_rl_dl")`, `wrapper.py`, and
+The high-level `deconvolve(..., method="ci_rl_dl")` API and
 `gui_deconvolve_ci.py` expose the same method through:
 - `dl_model_path`
 - `dl_z_context`
@@ -533,16 +533,19 @@ The high-level `deconvolve(..., method="ci_rl_dl")`, `wrapper.py`, and
 - `dl_mixed_precision`
 - `dl_residual_strength`
 
-`gui_train.py` provides V2/V4 training presets for smoke tests, medium/large
-widefield, medium/large confocal, and a large mixed comparison run. The current
-medium/large presets are strong-restoration presets: high-RL weighted sampling
-(`50,80,100`), strong artifacts, mild PSF mismatch with 50% moderate cases,
-larger model capacity, looser residual bounds, reduced negative-residual guard,
-foreground intensity-retention loss, gradient loss, and reconvolution
-consistency. The `Large widefield strong XY2` preset enables the first
-lateral 2x supersampled experiment. New checkpoints write a JSON
-sidecar containing `model_type`, conditioning channel names, residual-bound
-settings, and recommended inference settings.
+In the interactive GUI, `ci_rl_dl` is always present in the Method selector.
+The GUI can auto-load matching default checkpoints from `models/defaultwidefield`
+or `models/defaultconfocal` when image metadata identifies the microscope type.
+
+`gui/gui_train.py` now exposes only the two default-model recipes:
+`Large widefield standard long` and `Large confocal standard long`. They match
+the bundled `models/defaultwidefield` and `models/defaultconfocal` checkpoints.
+Both use standard artifact severity, high-RL weighted sampling (`50,80,100`),
+mild PSF mismatch with 20% moderate cases, XY supersampling, tighter
+foreground/global intensity losses, background-offset loss, and training-time
+XY padding. New checkpoints write a JSON sidecar containing `model_type`,
+conditioning channel names, residual-bound settings, training config, and
+recommended inference settings.
 
 ### `ci_sparse_hessian_deconvolve(image, psf, **kwargs) → dict`
 
@@ -716,7 +719,7 @@ deconvolve_ci_dl.py
 ├── GatedResidualUNet25D           — bounded residual proposal + gate model
 └── reconvolve_same()              — PSF consistency diagnostic helper
 
-train.py
+training/train.py
 ├── generate_synthetic_gt()        — synthetic microscopy-like GT volumes
 ├── generate_training_data()       — GT -> PSF mismatch/noise -> cached ci_rl data
 ├── SyntheticVolumeDataset         — random 2.5D patches split by volume

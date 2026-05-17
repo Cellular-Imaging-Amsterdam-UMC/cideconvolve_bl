@@ -45,8 +45,8 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
-from PyQt6.QtCore import QObject, QEvent, Qt, QRectF, QSize, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QImage, QPainter, QPixmap, QTextCursor, QWheelEvent
+from PyQt6.QtCore import QObject, QEvent, QPointF, Qt, QRectF, QSize, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -65,6 +65,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListView,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QAbstractItemView,
     QPlainTextEdit,
@@ -77,10 +78,14 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QStyle,
     QHeaderView,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -98,7 +103,11 @@ log = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
+GUI_STATE_PATH = SCRIPT_DIR / ".gui_deconvolve_state.json"
 OMERO_SESSION_REUSE_S = 10 * 60
+MAX_RECENT_ITEMS = 12
+MAX_RUN_HISTORY_ITEMS = 20
+GITHUB_DOCS_BASE_URL = "https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve/blob/main"
 
 
 class _GuiLogEmitter(QObject):
@@ -180,6 +189,41 @@ def _safe_filename_stem(text: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text.strip())
     cleaned = cleaned.strip("._")
     return cleaned or "deconvolution"
+
+
+def _play_icon_pixmap(size: int = 18, color: str = "#7dd3fc") -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QPen(QColor(color), 1.5))
+    painter.setBrush(QColor(color))
+    points = QPolygonF([
+        QPointF(size * 0.34, size * 0.24),
+        QPointF(size * 0.34, size * 0.76),
+        QPointF(size * 0.76, size * 0.50),
+    ])
+    painter.drawPolygon(points)
+    painter.end()
+    return pixmap
+
+
+def _split_icon_pixmap(size: int = 18, color: str = "#7dd3fc") -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color), max(2, size // 7))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    center = size // 2
+    painter.drawLine(center, 3, center, size - 4)
+    painter.drawLine(4, center - 4, center - 3, center - 4)
+    painter.drawLine(4, center + 4, center - 3, center + 4)
+    painter.drawLine(center + 3, center - 4, size - 5, center - 4)
+    painter.drawLine(center + 3, center + 4, size - 5, center + 4)
+    painter.end()
+    return pixmap
 
 
 from core._meta_helpers import (
@@ -2016,6 +2060,446 @@ class _MetricWidget(QWidget):
             else self._COLORS["ok"]
         )
         self._bar.setStyleSheet(self._style(color))
+
+
+_HELP_TOPICS: list[dict[str, Any]] = [
+    {
+        "section": "Workflow",
+        "topics": [
+            {
+                "id": "getting-started",
+                "title": "Getting Started",
+                "keywords": ["start", "workflow", "quick"],
+                "html": f"""
+                    <h2>Getting Started</h2>
+                    <ol>
+                    <li>Open an image, Zarr folder, Leica source, or OMERO image from the Open menu.</li>
+                    <li>Check highlighted metadata fields. Green fields are loaded or confident; red fields need attention.</li>
+                    <li>Choose a method. Start with <code>ci_rl</code>, or <code>ci_rl_dl</code> when a matching DL model is available.</li>
+                    <li>Inspect Original and Deconvolved views with channels, projection, scale bar, navigator, and linked zoom.</li>
+                    <li>Save deconvolved data as OME-TIFF or OME-Zarr, or save the current visual view as PNG.</li>
+                    </ol>
+                    <p><b>Good first run:</b> keep convergence on <code>auto</code>, verify NA/emission/pixel size, and only change advanced parameters for a specific artifact.</p>
+                """,
+            },
+            {
+                "id": "menus",
+                "title": "Open, Recent, Settings, Run, And Save Menus",
+                "keywords": ["open", "recent", "settings", "run", "save", "batch", "log"],
+                "html": f"""
+                    <h2>Open, Recent, Settings, Run, And Save Menus</h2>
+                    <ul>
+                    <li><b>Open</b> loads local OME-TIFF, TIFF, Zarr, Leica, or OMERO sources. Drag-and-drop uses the same loading path.</li>
+                    <li><b>Recent</b> reopens recent image sources. The settings pane has a separate recent settings menu.</li>
+                    <li><b>Settings</b> restores, saves, or loads GUI parameter presets.</li>
+                    <li><b>Log</b> opens the live run log with convergence charts and optional image metrics.</li>
+                    <li><b>Batch</b> opens queued processing.</li>
+                    <li><b>Run Deconvolution</b> starts the current method and becomes the stop/cancel control when available.</li>
+                    <li><b>Save</b> exports deconvolved data or the current visual view.</li>
+                    </ul>
+                    <p>Shortcuts: <code>Ctrl+O</code> open, <code>Ctrl+R</code> run, <code>Ctrl+S</code> save, <code>Ctrl+Shift+S</code> save settings, <code>Ctrl+L</code> log, <code>F1</code> help.</p>
+                """,
+            },
+            {
+                "id": "run-history",
+                "title": "Run History",
+                "keywords": ["history", "restore", "summary", "output"],
+                "html": f"""
+                    <h2>Run History</h2>
+                    <p>The Run History drawer stores recent GUI runs with timestamp, method, status, elapsed time, image name, output path, and key parameters.</p>
+                    <ul>
+                    <li><b>Restore params</b> reloads the settings used for a previous run.</li>
+                    <li><b>Open output folder</b> opens the result location.</li>
+                    <li><b>Copy summary</b> copies a compact run summary for notes or reports.</li>
+                    <li><b>Remove</b> deletes only the history entry, not the output data.</li>
+                    </ul>
+                """,
+            },
+            {
+                "id": "documentation-links",
+                "title": "Documentation Links",
+                "keywords": ["github", "documentation", "readme", "manual", "metrics", "training", "dl"],
+                "html": f"""
+                    <h2>Documentation Links</h2>
+                    <p>The in-app help is a quick reference. The GitHub documentation has deeper algorithm and training detail.</p>
+                    <ul>
+                    <li><a href="{GITHUB_DOCS_BASE_URL}/README.md">README</a> - installation, GUI overview, command-line examples, and parameter tables.</li>
+                    <li><a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">Algorithm documentation</a> - RL, TV, sparse-Hessian, PSF model, tiling, convergence, and implementation notes.</li>
+                    <li><a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL refinement documentation</a> - training and use of <code>ci_rl_dl</code> residual models.</li>
+                    <li><a href="{GITHUB_DOCS_BASE_URL}/docs/metrics.md">Metrics documentation</a> - image quality and evaluation metric definitions.</li>
+                    </ul>
+                """,
+            },
+        ],
+    },
+    {
+        "section": "Viewer",
+        "topics": [
+            {
+                "id": "viewer-controls",
+                "title": "Viewer Controls",
+                "keywords": ["viewer", "view mode", "projection", "channels", "mip", "slice", "scale bar", "navigator"],
+                "html": """
+                    <h2>Viewer Controls</h2>
+                    <ul>
+                    <li><b>View Mode</b> switches between 2D original, 2D deconvolved, side-by-side, linked split, blink, difference, ratio, and available 3D views.</li>
+                    <li><b>Projection</b> chooses slice, MIP, or sum previews for Z data.</li>
+                    <li><b>Channels</b> left-click toggles visibility; right-click changes color.</li>
+                    <li><b>Fit</b> resets zoom and pan to show the whole image.</li>
+                    <li><b>Smooth zoom</b> changes display interpolation only. It does not alter saved image data.</li>
+                    <li><b>Scale bar</b> overlays a physical scale when pixel size is known.</li>
+                    <li><b>Navigator</b> shows the zoomed viewport in a small overview. Disable it when screen space matters.</li>
+                    </ul>
+                    <p>The status bar reports cursor X/Y/Z/T, physical position when available, and visible channel intensities.</p>
+                """,
+            },
+            {
+                "id": "compare-modes",
+                "title": "Comparison Modes",
+                "keywords": ["linked split", "blink", "difference", "ratio", "compare", "split"],
+                "html": """
+                    <h2>Comparison Modes</h2>
+                    <ul>
+                    <li><b>Side-by-side</b> shows original and deconvolved panes with linked navigation.</li>
+                    <li><b>Linked split</b> overlays original and deconvolved in one pane with a draggable split line. Left-drag moves the split; right-drag pans.</li>
+                    <li><b>Blink</b> alternates original and deconvolved for quick artifact checks.</li>
+                    <li><b>Difference</b> and <b>Ratio</b> are display-normalized visual previews, not quantitative output.</li>
+                    </ul>
+                    <p><b>Save comparison as PNG</b> exports the active comparison view including display settings and scale bar.</p>
+                """,
+            },
+            {
+                "id": "advanced-scaling",
+                "title": "Display Scaling",
+                "keywords": ["advanced scaling", "lo", "hi", "log", "lut", "contrast"],
+                "html": """
+                    <h2>Display Scaling</h2>
+                    <p><b>Lo%</b> and <b>Hi%</b> set robust display percentiles. They change only preview contrast.</p>
+                    <ul>
+                    <li>Lower Hi% values reveal dim structure but can saturate bright spots.</li>
+                    <li>Higher Lo% values suppress background but can hide weak signal.</li>
+                    <li><b>Log</b> display helps inspect low-intensity detail in high dynamic range data.</li>
+                    <li><b>Adv. Scaling</b> opens per-channel and advanced display controls.</li>
+                    </ul>
+                """,
+            },
+        ],
+    },
+    {
+        "section": "Methods",
+        "topics": [
+            {
+                "id": "method-ci-rl",
+                "title": "ci_rl",
+                "keywords": ["ci_rl", "richardson", "lucy", "rl"],
+                "html": f"""
+                    <h2><code>ci_rl</code></h2>
+                    <p>Core Richardson-Lucy deconvolution using the generated or selected PSF. This is the most predictable starting point and preserves image energy when metadata and background settings are reasonable.</p>
+                    <ul>
+                    <li><b>Strengths:</b> transparent physics-based behavior, good default for both widefield and confocal, and easy comparison to reconvolved raw data.</li>
+                    <li><b>Watch for:</b> noise amplification at high iteration counts, edge artifacts with very small tiles, and wrong Z behavior when pixel Z or RI metadata is off.</li>
+                    <li><b>Typical tuning:</b> adjust iterations and convergence first, then background/offset/damping only if the log or preview shows a clear problem.</li>
+                    </ul>
+                    <p>Use it for a conservative, explainable result or when no matching DL refinement model is available. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
+                """,
+            },
+            {
+                "id": "method-ci-rl-dl",
+                "title": "ci_rl_dl",
+                "keywords": ["ci_rl_dl", "dl", "model", "residual", "widefield", "confocal"],
+                "html": f"""
+                    <h2><code>ci_rl_dl</code></h2>
+                    <p>Runs CI-RL and then applies a trained DL residual refinement. The DL model path, model JSON, and residual strength are high-impact settings.</p>
+                    <ul>
+                    <li>Use a model trained for the same microscope class: widefield, confocal, or mixed.</li>
+                    <li>Keep residual strength modest when preserving background and total intensity is critical.</li>
+                    <li>The GUI can auto-load default widefield/confocal models when the method and image metadata match.</li>
+                    <li>Prefer <code>best_model.pt</code> plus its model JSON so inference settings match the trained checkpoint.</li>
+                    <li>If the DL output shifts the background or total sum, lower residual strength before changing optical metadata.</li>
+                    </ul>
+                    <p>Training and model details: <a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL refinement documentation</a>.</p>
+                """,
+            },
+            {
+                "id": "method-tv-sparse",
+                "title": "ci_rl_tv And ci_sparse_hessian",
+                "keywords": ["ci_rl_tv", "tv", "sparse hessian", "regularization"],
+                "html": f"""
+                    <h2><code>ci_rl_tv</code> And <code>ci_sparse_hessian</code></h2>
+                    <p>These methods add regularization to suppress noise or favor smoother/sparser structure.</p>
+                    <ul>
+                    <li><b>TV</b> can reduce noise but may flatten fine texture when too strong.</li>
+                    <li><b>Sparse Hessian</b> can sharpen curvilinear or punctate structure, but aggressive settings may create artificial-looking detail.</li>
+                    <li>Use these methods when plain RL is plausible but the sample needs explicit regularization rather than learned refinement.</li>
+                    <li>Keep a matched <code>ci_rl</code> run as a reference so you can see what the regularizer changed.</li>
+                    </ul>
+                    <p>Mathematical background: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
+                """,
+            },
+        ],
+    },
+    {
+        "section": "Parameters",
+        "topics": [
+            {
+                "id": "essential-parameters",
+                "title": "Essential Parameters",
+                "keywords": ["iterations", "convergence", "na", "emission", "pixel", "ri", "2d widefield"],
+                "html": f"""
+                    <h2>Essential Parameters</h2>
+                    <p>These settings define the physical model and the stopping behavior. If the result looks wrong, check these before reaching for advanced tuning.</p>
+                    <ul>
+                    <li><b>Method</b> chooses the solver. Use <code>ci_rl</code> as the reference run; use <code>ci_rl_dl</code> only with a matching trained model; use TV or sparse-Hessian when you explicitly want regularization.</li>
+                    <li><b>Iterations</b> is the maximum number of RL or optimization updates. Low values may leave blur; high values can amplify noise, ringing, or small PSF errors. Comma-separated values allow per-channel tuning.</li>
+                    <li><b>Convergence</b> set to <code>auto</code> stops when relative improvement is small. <code>fixed</code> is useful for controlled comparisons because every channel runs the requested count.</li>
+                    <li><b>Relative threshold</b> is the early-stop sensitivity. Smaller thresholds run longer; larger thresholds stop sooner. If a run stops too early, lower this value before simply raising iterations.</li>
+                    <li><b>Start</b> controls the initial estimate. <code>auto</code> chooses a robust start from the image and microscope type. <code>observed</code> can preserve strong structure but may carry noise; flat starts are more neutral but slower to settle.</li>
+                    <li><b>NA</b> strongly affects lateral resolution and brightness concentration. A wrong NA can make the PSF too broad or too sharp.</li>
+                    <li><b>Emission wavelength</b> is per channel in nm. Channel order must match the loaded image channels; mismatches produce wrong PSFs and color-dependent artifacts.</li>
+                    <li><b>Pixel XY and Pixel Z</b> define sampling in nm. XY mainly affects lateral resolution; Z spacing is especially important for 3D widefield and confocal stacks.</li>
+                    <li><b>Microscope type</b> selects widefield or confocal PSF behavior. Confocal also uses excitation wavelength and pinhole when available.</li>
+                    <li><b>Excitation wavelength</b> and <b>pinhole</b> matter for confocal PSFs. For widefield they are usually not used.</li>
+                    <li><b>RI immersion, embedding medium, and sample RI</b> affect axial blur and spherical aberration. Sample RI is often the least reliable metadata field but can have a large Z impact.</li>
+                    <li><b>2D Widefield model</b> is forced to auto for 2D widefield use. <b>2D WF aggressiveness</b> changes how strongly the 2D model removes widefield haze; increase carefully if background or total intensity must stay stable.</li>
+                    </ul>
+                    <p>Full parameter tables: <a href="{GITHUB_DOCS_BASE_URL}/README.md">README</a>. PSF and convergence details: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
+                """,
+            },
+            {
+                "id": "advanced-parameters",
+                "title": "Advanced Parameters",
+                "keywords": ["damping", "background", "offset", "prefilter", "tv", "sparse", "hessian", "dl residual strength"],
+                "html": f"""
+                    <h2>Advanced Parameters</h2>
+                    <p>Advanced settings are useful, but they can also hide metadata problems. Change one family at a time and compare against a plain <code>ci_rl</code> run.</p>
+                    <ul>
+                    <li><b>Damping</b> attenuates RL corrections in low-signal/noisy regions while preserving brighter structure. <code>auto</code> is a good trial when background noise is being over-sharpened; <code>0</code> or <code>none</code> disables it.</li>
+                    <li><b>Background</b> defines the floor used for subtraction and stable division. <code>auto</code> estimates it from the image. Numeric values are useful when you know the camera/background level. A value that is too high removes weak signal.</li>
+                    <li><b>Offset</b> adds a positive processing shift and removes it afterward. It reduces division-by-near-zero instability, but poor offset/background combinations can cause visible background shifts.</li>
+                    <li><b>Prefilter sigma</b> applies Anscombe-domain Gaussian smoothing before deconvolution. Small values can calm noisy data; large values erase fine structure before the solver sees it.</li>
+                    <li><b>TV lambda</b> controls Total Variation strength for <code>ci_rl_tv</code>. Increase gradually; too much TV gives flat, piecewise-smooth images.</li>
+                    <li><b>Sparse Hessian weight</b> balances Hessian smoothing versus sparsity in <code>ci_sparse_hessian</code>. Higher values emphasize the Hessian prior; lower values allow more sparse-detail behavior.</li>
+                    <li><b>Sparse Hessian reg</b> controls the data-vs-regularizer balance. Higher values stay closer to the observed image; lower values let the regularizer dominate more.</li>
+                    <li><b>DL model path / JSON</b> must match the trained model. When a model JSON supplies inference parameters, the GUI hides or locks fields that should not be edited manually.</li>
+                    <li><b>DL residual strength</b> blends learned correction on top of CI-RL. Values below 1.0 are often better when preserving total energy and avoiding background offsets is more important than maximum visual refinement.</li>
+                    <li><b>DL tiling, z-context, batch size, and mixed precision</b> affect inference speed, VRAM use, and border behavior. Prefer model defaults unless you are diagnosing memory limits or tile artifacts.</li>
+                    <li><b>2D WF expert background radius/scale</b> controls local background estimation for 2D widefield auto mode. Larger radius follows slower background trends; higher scale subtracts more haze.</li>
+                    </ul>
+                    <p>If a parameter is defined by the model JSON and locked in the GUI, treat it as part of the trained model contract. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a> and <a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL documentation</a>.</p>
+                """,
+            },
+            {
+                "id": "metadata-warnings",
+                "title": "Metadata Warnings And Defaults",
+                "keywords": ["metadata", "warnings", "missing", "sample RI", "default", "approve"],
+                "html": """
+                    <h2>Metadata Warnings And Defaults</h2>
+                    <p>Warning chips are reserved for high-impact metadata issues: missing pixel size, missing emission wavelength, unknown microscope type, missing sample RI, suspicious Z spacing, or channel-list mismatch.</p>
+                    <ul>
+                    <li>Changing a warned field or accepting a reasonable default clears that warning.</li>
+                    <li><b>Reset to image metadata</b> restores values from the loaded image when available.</li>
+                    <li>When metadata is absent, enter values from the microscope configuration or acquisition notes.</li>
+                    </ul>
+                """,
+            },
+        ],
+    },
+    {
+        "section": "Export And Troubleshooting",
+        "topics": [
+            {
+                "id": "export-formats",
+                "title": "Export Formats",
+                "keywords": ["export", "save", "ome-tiff", "ome-zarr", "png", "metadata", "lzw"],
+                "html": """
+                    <h2>Export Formats</h2>
+                    <ul>
+                    <li><b>Save as OME-TIFF</b> writes deconvolved image data with OME metadata and LZW compression.</li>
+                    <li><b>Save as OME-Zarr</b> writes chunked image data for large workflows with metadata where available.</li>
+                    <li><b>Save views as PNG</b> writes the current original/deconvolved visual preview.</li>
+                    <li><b>Save comparison as PNG</b> writes the active comparison mode with display overlays such as the scale bar.</li>
+                    </ul>
+                    <p>PNG exports are for reporting and visual inspection. Use OME-TIFF or OME-Zarr for quantitative downstream analysis.</p>
+                """,
+            },
+            {
+                "id": "troubleshooting",
+                "title": "Troubleshooting And Starting Points",
+                "keywords": ["troubleshooting", "artifacts", "border", "background", "noise", "slow", "gpu", "starting"],
+                "html": """
+                    <h2>Troubleshooting And Starting Points</h2>
+                    <ul>
+                    <li><b>Background offset:</b> verify background/offset settings and sample RI, then compare total intensity before changing DL strength.</li>
+                    <li><b>Border artifacts:</b> inspect edges in linked views and consider larger tiles or padding-aware inference settings when available.</li>
+                    <li><b>Too much sharpening:</b> reduce iterations, regularization strength, or DL residual strength.</li>
+                    <li><b>Too little refinement:</b> verify microscope type, PSF metadata, and that the DL model matches widefield or confocal data.</li>
+                    <li><b>Slow runs:</b> check the resource meters for VRAM spill, CPU/RAM pressure, or overly large tiles.</li>
+                    </ul>
+                    <p>For widefield, start with accurate pixel size and emission wavelengths. For confocal, also verify excitation and pinhole metadata.</p>
+                """,
+            },
+        ],
+    },
+]
+
+
+class _HelpDialog(QDialog):
+    """Searchable, indexed help for the deconvolution GUI."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CI Deconvolve Help")
+        self.resize(980, 680)
+        self._topics_by_id: dict[str, dict[str, Any]] = {}
+        self._topic_items: dict[str, QTreeWidgetItem] = {}
+        self._section_items: list[QTreeWidgetItem] = []
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search help...")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._apply_filter)
+        left_layout.addWidget(self._search)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setUniformRowHeights(True)
+        self._tree.currentItemChanged.connect(self._on_topic_changed)
+        left_layout.addWidget(self._tree, stretch=1)
+
+        self._browser = QTextBrowser()
+        self._browser.setOpenExternalLinks(True)
+        self._browser.setStyleSheet("QTextBrowser { padding: 10px; }")
+
+        root.addWidget(left, stretch=0)
+        root.addWidget(self._browser, stretch=1)
+        left.setMinimumWidth(270)
+        left.setMaximumWidth(360)
+
+        self._build_tree()
+        self.show_topic("getting-started")
+
+    def _build_tree(self) -> None:
+        self._tree.clear()
+        self._topics_by_id.clear()
+        self._topic_items.clear()
+        self._section_items.clear()
+        style = self.style()
+        app_icon = _load_app_icon()
+        section_icons = {
+            "Workflow": style.standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon),
+            "Viewer": style.standardIcon(QStyle.StandardPixmap.SP_ComputerIcon),
+            "Methods": QIcon(_play_icon_pixmap(16, "#7dd3fc")),
+            "Parameters": style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView),
+            "Export And Troubleshooting": style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton),
+        }
+        topic_icons = {
+            "documentation-links": app_icon if not app_icon.isNull() else style.standardIcon(QStyle.StandardPixmap.SP_DialogHelpButton),
+            "getting-started": QIcon(_play_icon_pixmap(16, "#7dd3fc")),
+            "menus": style.standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
+            "run-history": style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView),
+            "viewer-controls": style.standardIcon(QStyle.StandardPixmap.SP_DesktopIcon),
+            "compare-modes": QIcon(_split_icon_pixmap(16, "#7dd3fc")),
+            "advanced-scaling": style.standardIcon(QStyle.StandardPixmap.SP_ComputerIcon),
+            "method-ci-rl": QIcon(_play_icon_pixmap(16, "#7dd3fc")),
+            "method-ci-rl-dl": QIcon(_play_icon_pixmap(16, "#c084fc")),
+            "method-tv-sparse": style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "essential-parameters": style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "advanced-parameters": style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView),
+            "metadata-warnings": style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning),
+            "export-formats": style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton),
+            "troubleshooting": style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion),
+        }
+        for section in _HELP_TOPICS:
+            section_item = QTreeWidgetItem([str(section["section"])])
+            section_item.setFlags(section_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            section_icon = section_icons.get(str(section["section"]), style.standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+            section_item.setIcon(0, section_icon)
+            self._tree.addTopLevelItem(section_item)
+            self._section_items.append(section_item)
+            for topic in section["topics"]:
+                topic_id = str(topic["id"])
+                topic_item = QTreeWidgetItem([str(topic["title"])])
+                topic_item.setData(0, Qt.ItemDataRole.UserRole, topic_id)
+                topic_icon = topic_icons.get(topic_id, style.standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+                topic_item.setIcon(0, topic_icon)
+                section_item.addChild(topic_item)
+                self._topics_by_id[topic_id] = topic
+                self._topic_items[topic_id] = topic_item
+            section_item.setExpanded(True)
+
+    def show_topic(self, topic_id: str) -> None:
+        item = self._topic_items.get(topic_id)
+        if item is not None:
+            self._tree.setCurrentItem(item)
+            self._tree.scrollToItem(item)
+            self._set_article(topic_id)
+
+    def _set_article(self, topic_id: str) -> None:
+        topic = self._topics_by_id.get(topic_id)
+        if not topic:
+            return
+        self._browser.setHtml(
+            """
+            <html><head><style>
+            body { font-family: Segoe UI, Arial, sans-serif; font-size: 10.5pt; color: #f0f0f0; }
+            h2 { margin-top: 0; color: #ffffff; }
+            code { background: #2b2b2b; padding: 1px 4px; border-radius: 3px; }
+            a { color: #7dd3fc; }
+            li { margin-bottom: 6px; }
+            </style></head><body>
+            """
+            + str(topic["html"])
+            + "</body></html>"
+        )
+
+    def _on_topic_changed(self, current: Optional[QTreeWidgetItem], _previous: Optional[QTreeWidgetItem]) -> None:
+        if current is None:
+            return
+        topic_id = current.data(0, Qt.ItemDataRole.UserRole)
+        if topic_id:
+            self._set_article(str(topic_id))
+
+    def _apply_filter(self, text: str) -> None:
+        query = text.strip().lower()
+        first_visible: Optional[QTreeWidgetItem] = None
+        for section_item in self._section_items:
+            any_visible = False
+            for idx in range(section_item.childCount()):
+                child = section_item.child(idx)
+                topic_id = str(child.data(0, Qt.ItemDataRole.UserRole))
+                topic = self._topics_by_id[topic_id]
+                visible = not query or self._topic_matches(topic, query)
+                child.setHidden(not visible)
+                any_visible = any_visible or visible
+                if visible and first_visible is None:
+                    first_visible = child
+            section_item.setHidden(not any_visible)
+            section_item.setExpanded(bool(query) or any_visible)
+        current = self._tree.currentItem()
+        if first_visible is not None and (current is None or current.isHidden()):
+            self._tree.setCurrentItem(first_visible)
+        elif first_visible is None:
+            self._browser.setHtml("<h2>No Help Topics Found</h2><p>Clear the search box to show all topics.</p>")
+
+    @staticmethod
+    def _topic_matches(topic: dict[str, Any], query: str) -> bool:
+        haystack = " ".join(
+            [
+                str(topic.get("title", "")),
+                str(topic.get("html", "")),
+                " ".join(str(k) for k in topic.get("keywords", [])),
+            ]
+        ).lower()
+        return all(part in haystack for part in query.split())
 
 
 class _LogDialog(QDialog):
@@ -4030,25 +4514,66 @@ def _deconvolve_channel_stacks(
 
 
 def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict) -> None:
-    from bioio.writers import OmeTiffWriter
+    from core.streaming import TiledOmeTiffSink
 
-    physical_pixel_sizes = None
-    px_x = metadata.get("pixel_size_x")
-    px_z = metadata.get("pixel_size_z")
-    if px_x or px_z:
-        from bioio_base.types import PhysicalPixelSizes
-        physical_pixel_sizes = PhysicalPixelSizes(
-            Z=px_z or 1.0, Y=px_x or 1.0, X=px_x or 1.0
-        )
-
-    channel_names = _current_channel_names(metadata, data.shape[1])
-    OmeTiffWriter.save(
-        data.astype(np.float32),
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 5:
+        raise ValueError(f"Expected TCZYX data for OME-TIFF export, got {arr.shape}")
+    meta = dict(metadata or {})
+    meta.setdefault("channel_names", _current_channel_names(meta, arr.shape[1]))
+    sink = TiledOmeTiffSink(
         path,
-        dim_order="TCZYX",
-        physical_pixel_sizes=physical_pixel_sizes,
-        channel_names=channel_names,
+        shape=tuple(int(v) for v in arr.shape),
+        metadata=meta,
+        levels=1,
+        compression="lzw",
     )
+    try:
+        for t in range(arr.shape[0]):
+            for c in range(arr.shape[1]):
+                sink.write_tile(
+                    t=t,
+                    c=c,
+                    z=slice(0, arr.shape[2]),
+                    y=slice(0, arr.shape[3]),
+                    x=slice(0, arr.shape[4]),
+                    data=arr[t, c],
+                )
+        sink.build_pyramids()
+        sink.validate()
+        sink.close()
+    except Exception:
+        sink.abort()
+        raise
+
+
+def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict) -> None:
+    from core.streaming import ZarrPyramidSink
+
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 5:
+        raise ValueError(f"Expected TCZYX data for OME-Zarr export, got {arr.shape}")
+    meta = dict(metadata or {})
+    meta.setdefault("channel_names", _current_channel_names(meta, arr.shape[1]))
+    sink = ZarrPyramidSink(
+        path,
+        shape=tuple(int(v) for v in arr.shape),
+        metadata=meta,
+        resume=False,
+    )
+    for t in range(arr.shape[0]):
+        for c in range(arr.shape[1]):
+            sink.write_tile(
+                t=t,
+                c=c,
+                z=slice(0, arr.shape[2]),
+                y=slice(0, arr.shape[3]),
+                x=slice(0, arr.shape[4]),
+                data=arr[t, c],
+            )
+    sink.build_pyramids()
+    sink.validate()
+    sink.close()
 
 
 class _DeconvolveWorker(QThread):
@@ -6060,7 +6585,7 @@ def _detect_gpu_info() -> str:
 
 
 class DeconvolveCIWindow(QMainWindow):
-    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False, dlref_available: bool = False):
+    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
@@ -6083,6 +6608,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._fit_psf_started_at: Optional[float] = None
         self._monitor: Optional[_ResourceMonitor] = None
         self._log_dialog: Optional[_LogDialog] = None
+        self._help_dialog: Optional[_HelpDialog] = None
         self._batch_dialog: Optional[_BatchDeconvolverDialog] = None
         self._log_lines: list[str] = []
         self._log_running = False
@@ -6093,7 +6619,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_final_iteration_payload: Optional[dict] = None
         self._movie_available = bool(movie_available)
         self._fitpsf_available = bool(fitpsf_available)
-        self._dlref_available = bool(dlref_available)
         self._log_emitter = _GuiLogEmitter(self)
         self._log_handler = _QtLogHandler(self._log_emitter)
         self._log_emitter.line.connect(self._log_from_logging)
@@ -6105,11 +6630,21 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir: str = _default_settings_dir()
         self._last_settings_dir: str = _default_settings_dir()
         self._restore_last_browse_dirs()
+        self._gui_state = self._load_gui_state()
+        self._recent_sources: list[dict[str, Any]] = list(self._gui_state.get("recent_sources") or [])
+        self._recent_settings: list[dict[str, Any]] = list(self._gui_state.get("recent_settings") or [])
+        self._run_history: list[dict[str, Any]] = list(self._gui_state.get("run_history") or [])
+        self._current_run_started_at: Optional[float] = None
+        self._current_run_params: dict[str, Any] = {}
+        self._current_run_kind: str = "Preview"
         self._movie_default_path: Optional[str] = None
         self._omero_gw = None  # OmeroGateway instance (lazy)
         self._omero_session_deadline: float = 0.0
         self._excitation_saved: str = "488"  # remembered when field is disabled
         self._pinhole_airy_saved: str = str(_DEFAULT_PINHOLE_AIRY_UNITS)
+        self._metadata_acknowledged_fields: set[str] = set()
+        self._applying_metadata_to_fields = False
+        self.setAcceptDrops(True)
 
         self._build_ui()
 
@@ -6141,10 +6676,28 @@ class DeconvolveCIWindow(QMainWindow):
         scroll.setWidget(ctrl_widget)
         splitter.addWidget(scroll)
 
-        # Title
-        title = QLabel("CI Deconvolve")
-        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        ctrl_layout.addWidget(title)
+        self._file_label = QLabel("No file loaded")
+        self._file_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._file_label.setWordWrap(True)
+        self._file_label.setToolTip("No file loaded")
+        ctrl_layout.addWidget(self._file_label)
+
+        self._metadata_warning_bar = QWidget()
+        warning_layout = QHBoxLayout(self._metadata_warning_bar)
+        warning_layout.setContentsMargins(0, 0, 0, 0)
+        warning_layout.setSpacing(4)
+        self._metadata_warning_labels: list[QLabel] = []
+        self._btn_reset_metadata = QPushButton("Reset to image metadata")
+        self._btn_reset_metadata.setVisible(False)
+        self._btn_reset_metadata.clicked.connect(self._on_reset_fields_to_image_metadata)
+        warning_layout.addWidget(self._btn_reset_metadata)
+        self._btn_accept_metadata = QPushButton("Accept current values")
+        self._btn_accept_metadata.setVisible(False)
+        self._btn_accept_metadata.clicked.connect(self._on_accept_current_metadata_values)
+        warning_layout.addWidget(self._btn_accept_metadata)
+        warning_layout.addStretch()
+        self._metadata_warning_bar.setVisible(False)
+        ctrl_layout.addWidget(self._metadata_warning_bar)
 
         def _set_field_tooltip(form_layout: QFormLayout, widget: QWidget, text: str) -> None:
             widget.setToolTip(text)
@@ -6158,11 +6711,7 @@ class DeconvolveCIWindow(QMainWindow):
         method_group.setLayout(ml)
 
         self._method_combo = NoWheelComboBox()
-        _method_items = ["ci_rl"]
-        if self._dlref_available:
-            _method_items.append("ci_rl_dl")
-        _method_items += ["ci_rl_tv", "ci_sparse_hessian"]
-        self._method_combo.addItems(_method_items)
+        self._method_combo.addItems(["ci_rl", "ci_rl_dl", "ci_rl_tv", "ci_sparse_hessian"])
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
@@ -6225,7 +6774,7 @@ class DeconvolveCIWindow(QMainWindow):
         advanced_section = CollapsibleSection("Advanced Parameters", expanded=False)
         advanced_layout = advanced_section.content_layout()
 
-        # --- DL Refinement parameters (hidden unless launched with --dlref) ---
+        # --- DL Refinement parameters ---
         self._dl_group = QGroupBox("DL Refinement Parameters")
         dl_group_layout = QFormLayout()
         self._dl_group.setLayout(dl_group_layout)
@@ -6263,7 +6812,6 @@ class DeconvolveCIWindow(QMainWindow):
         )
         dl_group_layout.addRow("DL residual strength:", self._sp_dl_residual_strength)
 
-        self._dl_group.setVisible(self._dlref_available)
         advanced_layout.addWidget(self._dl_group)
 
         # --- Method tuning ---
@@ -6472,6 +7020,11 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_ri_sample.setDecimals(4)
         self._sp_ri_sample.setSingleStep(0.001)
         self._sp_ri_sample.setValue(1.47)
+        self._sp_px_xy.valueChanged.connect(lambda _value: self._ack_metadata_field("pixel_size_x"))
+        self._sp_px_z.valueChanged.connect(lambda _value: self._ack_metadata_field("pixel_size_z"))
+        self._le_emission.textEdited.connect(lambda _text: self._ack_metadata_field("emission_wavelength"))
+        self._micro_combo.currentTextChanged.connect(lambda _text: self._ack_metadata_field("microscope_type"))
+        self._sp_ri_sample.valueChanged.connect(lambda _value: self._ack_metadata_field("sample_refractive_index"))
         rl.addRow("RI sample:", self._sp_ri_sample)
 
 
@@ -6885,6 +7438,36 @@ class DeconvolveCIWindow(QMainWindow):
             "improve PSF accuracy but are slower and use more memory.",
         )
 
+        # --- Run history ---
+        self._run_history_section = CollapsibleSection("Run History", expanded=False)
+        history_layout = self._run_history_section.content_layout()
+        self._run_history_table = QTableWidget(0, 5)
+        self._run_history_table.setHorizontalHeaderLabels(["Time", "Image", "Method", "Status", "Output"])
+        self._run_history_table.verticalHeader().setVisible(False)
+        self._run_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._run_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._run_history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._run_history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._run_history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._run_history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._run_history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self._run_history_table.setMaximumHeight(180)
+        history_layout.addWidget(self._run_history_table)
+        history_buttons = QHBoxLayout()
+        self._btn_history_restore = QPushButton("Restore params")
+        self._btn_history_restore.clicked.connect(self._on_history_restore_params)
+        history_buttons.addWidget(self._btn_history_restore)
+        self._btn_history_open = QPushButton("Open output folder")
+        self._btn_history_open.clicked.connect(self._on_history_open_output)
+        history_buttons.addWidget(self._btn_history_open)
+        self._btn_history_copy = QPushButton("Copy summary")
+        self._btn_history_copy.clicked.connect(self._on_history_copy_summary)
+        history_buttons.addWidget(self._btn_history_copy)
+        self._btn_history_remove = QPushButton("Remove")
+        self._btn_history_remove.clicked.connect(self._on_history_remove)
+        history_buttons.addWidget(self._btn_history_remove)
+        history_layout.addLayout(history_buttons)
+        ctrl_layout.addWidget(self._run_history_section)
         ctrl_layout.addStretch()
 
         # ---- Right: image viewer ----
@@ -6894,37 +7477,51 @@ class DeconvolveCIWindow(QMainWindow):
         self._viewer = DualViewerWidget()
         self._viewer.timepointChanged.connect(self._on_viewer_time_changed)
         self._viewer.logRequested.connect(self._open_log_dialog)
+        self._viewer.cursorInfoChanged.connect(self._on_viewer_cursor_info)
         vl.addWidget(self._viewer, stretch=1)
         splitter.addWidget(viewer)
 
-        # --- Top toolbar: Open / Run / Save ---
+        # --- Top workflow bar: Open / Run / Export / Settings ---
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 4)
+        bottom.setSpacing(8)
 
-        btn_open = QPushButton("Open\u2026")
-        btn_open.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_open.clicked.connect(self._on_open)
-        bottom.addWidget(btn_open)
+        def _bar_section(icon_role: QStyle.StandardPixmap | None, tooltip: str, pixmap: QPixmap | None = None) -> QFrame:
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            frame.setStyleSheet(
+                "QFrame { border: 1px solid #343a40; border-radius: 4px; } "
+                "QLabel { border: none; color: #bfc5cc; font-weight: 700; } "
+                "QPushButton, QToolButton { border: 1px solid #3d4248; padding: 3px 8px; }"
+            )
+            layout = QHBoxLayout(frame)
+            layout.setContentsMargins(6, 3, 6, 3)
+            layout.setSpacing(6)
+            label = QLabel()
+            label.setPixmap(pixmap if pixmap is not None else self.style().standardIcon(icon_role).pixmap(18, 18))
+            label.setToolTip(tooltip)
+            layout.addWidget(label)
+            return frame
 
-        btn_open_zarr = QPushButton("Open Zarr\u2026")
-        btn_open_zarr.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_open_zarr.clicked.connect(self._on_open_zarr)
-        bottom.addWidget(btn_open_zarr)
+        open_group = _bar_section(QStyle.StandardPixmap.SP_DirOpenIcon, "Open")
+        open_layout = open_group.layout()
 
-        btn_open_leica = QPushButton("Open Leica\u2026")
-        btn_open_leica.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_open_leica.clicked.connect(self._on_open_leica)
-        bottom.addWidget(btn_open_leica)
+        self._open_button = QToolButton()
+        self._open_button.setText("Open\u2026")
+        self._open_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        open_menu = QMenu(self._open_button)
+        open_menu.addAction("Open File\u2026", self._on_open)
+        open_menu.addAction("Open OME-Zarr\u2026", self._on_open_zarr)
+        open_menu.addAction("Open Leica\u2026", self._on_open_leica)
+        open_menu.addAction("Open OMERO\u2026", self._on_open_omero)
+        self._open_button.setMenu(open_menu)
+        open_layout.addWidget(self._open_button)
 
-        btn_open_omero = QPushButton("Open OMERO\u2026")
-        btn_open_omero.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_open_omero.clicked.connect(self._on_open_omero)
-        bottom.addWidget(btn_open_omero)
-
-        btn_batch = QPushButton("Batch\u2026")
-        btn_batch.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_batch.clicked.connect(self._on_batch_deconvolver)
-        bottom.addWidget(btn_batch)
+        self._recent_button = QToolButton()
+        self._recent_button.setText("Recent")
+        self._recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        open_layout.addWidget(self._recent_button)
+        bottom.addWidget(open_group)
 
         middle_bar = QWidget()
         middle_bar.setSizePolicy(
@@ -6935,15 +7532,6 @@ class DeconvolveCIWindow(QMainWindow):
         middle_layout.setContentsMargins(0, 0, 0, 0)
         middle_layout.setSpacing(8)
 
-        self._file_label = QLabel("No file loaded")
-        self._file_label.setWordWrap(False)
-        self._file_label.setToolTip("No file loaded")
-        self._file_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        middle_layout.addWidget(self._file_label, stretch=1)
-
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)  # indeterminate
         self._progress.setVisible(False)
@@ -6952,9 +7540,78 @@ class DeconvolveCIWindow(QMainWindow):
             QSizePolicy.Policy.Fixed,
         )
         self._progress.setMinimumWidth(180)
-        middle_layout.addWidget(self._progress, stretch=2)
+        middle_layout.addWidget(self._progress, stretch=1)
 
+        self._run_step_label = QLabel("Ready")
+        self._run_step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._run_step_label.setMinimumWidth(300)
+        self._run_step_label.setToolTip("Current run status")
+        middle_layout.addWidget(self._run_step_label)
+        self._run_elapsed_timer = QTimer(self)
+        self._run_elapsed_timer.setInterval(1000)
+        self._run_elapsed_timer.timeout.connect(self._update_run_elapsed_label)
         bottom.addWidget(middle_bar, stretch=1)
+
+        export_group = _bar_section(QStyle.StandardPixmap.SP_DialogSaveButton, "Export")
+        export_layout = export_group.layout()
+
+        self._btn_save = QToolButton()
+        self._btn_save.setText("Save\u2026")
+        self._btn_save.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._btn_save.setEnabled(False)
+        save_menu = QMenu(self._btn_save)
+        self._act_save_ome_tiff = save_menu.addAction("Save as OME-TIFF\u2026", self._on_save)
+        self._act_save_ome_zarr = save_menu.addAction("Save as OME-Zarr\u2026", self._on_save_zarr)
+        save_menu.addSeparator()
+        self._act_save_views = save_menu.addAction("Save Views as PNG\u2026", self._on_save_view)
+        self._act_save_comparison = save_menu.addAction("Save Comparison as PNG\u2026", self._on_save_comparison_view)
+        self._btn_save.setMenu(save_menu)
+        export_layout.addWidget(self._btn_save)
+
+        self._btn_save_series = QPushButton("Save T-Series\u2026")
+        self._btn_save_series.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._btn_save_series.setEnabled(False)
+        self._btn_save_series.setVisible(False)
+        self._btn_save_series.clicked.connect(self._on_save_t_series)
+        export_layout.addWidget(self._btn_save_series)
+        bottom.addWidget(export_group)
+
+        settings_group = _bar_section(QStyle.StandardPixmap.SP_FileDialogDetailedView, "Settings and Log")
+        settings_layout = settings_group.layout()
+        self._settings_button = QToolButton()
+        self._settings_button.setText("Settings\u2026")
+        self._settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        settings_menu = QMenu(self._settings_button)
+        self._act_restore_settings = settings_menu.addAction("Restore Last", self._on_restore_settings)
+        self._act_restore_settings.setEnabled(LAST_SETTINGS_PATH.exists())
+        settings_menu.addSeparator()
+        settings_menu.addAction("Save Settings\u2026", self._on_save_settings)
+        settings_menu.addAction("Load Settings\u2026", self._on_load_settings)
+        self._settings_button.setMenu(settings_menu)
+        settings_layout.addWidget(self._settings_button)
+
+        self._recent_settings_button = QToolButton()
+        self._recent_settings_button.setText("Recent")
+        self._recent_settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        settings_layout.addWidget(self._recent_settings_button)
+        bottom.addWidget(settings_group)
+
+        run_group = _bar_section(None, "Run", _play_icon_pixmap())
+        run_layout = run_group.layout()
+        btn_log = QPushButton("Log")
+        btn_log.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn_log.setToolTip("Open the deconvolution log")
+        btn_log.clicked.connect(self._open_log_dialog)
+        run_layout.addWidget(btn_log)
+        btn_help = QPushButton("Help")
+        btn_help.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn_help.setToolTip("Open GUI help (F1)")
+        btn_help.clicked.connect(self._open_help_dialog)
+        run_layout.addWidget(btn_help)
+        btn_batch = QPushButton("Batch\u2026")
+        btn_batch.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn_batch.clicked.connect(self._on_batch_deconvolver)
+        run_layout.addWidget(btn_batch)
 
         self._btn_run = QPushButton("Run Deconvolution")
         self._btn_run.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -6964,46 +7621,8 @@ class DeconvolveCIWindow(QMainWindow):
         )
         self._btn_run.setEnabled(False)
         self._btn_run.clicked.connect(self._on_run)
-        bottom.addWidget(self._btn_run)
-
-        self._btn_save = QPushButton("Save\u2026")
-        self._btn_save.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._btn_save.setEnabled(False)
-        self._btn_save.clicked.connect(self._on_save)
-        bottom.addWidget(self._btn_save)
-
-        self._btn_save_view = QPushButton("Save View\u2026")
-        self._btn_save_view.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._btn_save_view.setEnabled(False)
-        self._btn_save_view.clicked.connect(self._on_save_view)
-        bottom.addWidget(self._btn_save_view)
-
-        self._btn_save_series = QPushButton("Save T-Series\u2026")
-        self._btn_save_series.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._btn_save_series.setEnabled(False)
-        self._btn_save_series.setVisible(False)
-        self._btn_save_series.clicked.connect(self._on_save_t_series)
-        bottom.addWidget(self._btn_save_series)
-
-        # --- Settings buttons ---
-        self._btn_restore = QPushButton("Restore")
-        self._btn_restore.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._btn_restore.setToolTip("Restore parameter values from the previous run")
-        self._btn_restore.setEnabled(LAST_SETTINGS_PATH.exists())
-        self._btn_restore.clicked.connect(self._on_restore_settings)
-        bottom.addWidget(self._btn_restore)
-
-        btn_save_settings = QPushButton("Save Settings\u2026")
-        btn_save_settings.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_save_settings.setToolTip("Save current parameter values to a JSON file")
-        btn_save_settings.clicked.connect(self._on_save_settings)
-        bottom.addWidget(btn_save_settings)
-
-        btn_load_settings = QPushButton("Load Settings\u2026")
-        btn_load_settings.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_load_settings.setToolTip("Load parameter values from a JSON file")
-        btn_load_settings.clicked.connect(self._on_load_settings)
-        bottom.addWidget(btn_load_settings)
+        run_layout.addWidget(self._btn_run)
+        bottom.addWidget(run_group)
 
         root.insertLayout(0, bottom)
         root.addWidget(splitter, stretch=1)
@@ -7022,6 +7641,341 @@ class DeconvolveCIWindow(QMainWindow):
 
         # Initial method state
         self._on_method_changed(self._method_combo.currentText())
+        self._install_shortcuts()
+        self._refresh_recent_menu()
+        self._refresh_run_history_table()
+
+    # -----------------------------------------------------------------------
+    # Persistent GUI state, recents, metadata confidence, run history
+    # -----------------------------------------------------------------------
+
+    def _load_gui_state(self) -> dict[str, Any]:
+        try:
+            with open(GUI_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_gui_state(self) -> None:
+        data = {
+            "recent_sources": self._recent_sources[:MAX_RECENT_ITEMS],
+            "recent_settings": self._recent_settings[:MAX_RECENT_ITEMS],
+            "run_history": self._run_history[:MAX_RUN_HISTORY_ITEMS],
+        }
+        try:
+            with open(GUI_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+    def _remember_recent_source(self, kind: str, label: str, path: Optional[Path] = None) -> None:
+        entry = {
+            "kind": str(kind),
+            "label": str(label),
+            "path": str(path) if path is not None else "",
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        key = (entry["kind"], entry["path"], entry["label"])
+        self._recent_sources = [
+            item for item in self._recent_sources
+            if (item.get("kind"), item.get("path"), item.get("label")) != key
+        ]
+        self._recent_sources.insert(0, entry)
+        self._recent_sources = self._recent_sources[:MAX_RECENT_ITEMS]
+        self._save_gui_state()
+        if hasattr(self, "_recent_button"):
+            self._refresh_recent_menu()
+
+    def _remember_recent_settings(self, path: Path) -> None:
+        entry = {
+            "label": path.name,
+            "path": str(path),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._recent_settings = [item for item in self._recent_settings if item.get("path") != str(path)]
+        self._recent_settings.insert(0, entry)
+        self._recent_settings = self._recent_settings[:MAX_RECENT_ITEMS]
+        self._save_gui_state()
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self) -> None:
+        source_menu = QMenu(self)
+        if self._recent_sources:
+            for entry in self._recent_sources:
+                label = f"{entry.get('label', 'Recent')} ({entry.get('kind', 'file')})"
+                action = source_menu.addAction(label)
+                action.triggered.connect(lambda _checked=False, item=dict(entry): self._open_recent_source(item))
+        else:
+            action = source_menu.addAction("No recent sources")
+            action.setEnabled(False)
+        self._recent_button.setMenu(source_menu)
+
+        settings_menu = QMenu(self)
+        if self._recent_settings:
+            for entry in self._recent_settings:
+                action = settings_menu.addAction(str(entry.get("label") or Path(str(entry.get("path", ""))).name))
+                action.triggered.connect(lambda _checked=False, item=dict(entry): self._open_recent_settings(item))
+        else:
+            action = settings_menu.addAction("No recent settings")
+            action.setEnabled(False)
+        if hasattr(self, "_recent_settings_button"):
+            self._recent_settings_button.setMenu(settings_menu)
+
+    def _open_recent_source(self, entry: dict[str, Any]) -> None:
+        kind = str(entry.get("kind") or "file")
+        raw_path = str(entry.get("path") or "")
+        if kind == "omero":
+            self._status.showMessage("Open OMERO and select the recent image again", 5000)
+            self._on_open_omero()
+            return
+        path = Path(raw_path)
+        if not raw_path or not path.exists():
+            QMessageBox.warning(self, "Recent Source", f"Source is no longer available:\n{raw_path}")
+            return
+        self._open_dropped_path(path)
+
+    def _open_recent_settings(self, entry: dict[str, Any]) -> None:
+        path = Path(str(entry.get("path") or ""))
+        if not path.exists():
+            QMessageBox.warning(self, "Recent Settings", f"Settings file is no longer available:\n{path}")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Load Error", str(exc))
+            return
+        self._last_settings_dir = str(path.parent)
+        self._apply_settings(data)
+        self._viewer.refresh_view()
+        self._remember_recent_settings(path)
+        self._status.showMessage(f"Settings loaded from {path.name}", 3000)
+
+    def _install_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Ctrl+O"), self, activated=self._on_open)
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._on_run)
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self._on_save)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self._on_save_settings)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self._open_log_dialog)
+        QShortcut(QKeySequence("F1"), self, activated=self._open_help_dialog)
+
+    def _open_dropped_path(self, path: Path) -> None:
+        self._last_open_dir = str(path.parent if path.is_file() else path)
+        if path.is_dir() or str(path).lower().endswith((".zarr", ".ome.zarr")):
+            self._last_zarr_dir = str(path.parent if path.is_dir() else path.parent)
+        self._do_load(str(path))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                self._open_dropped_path(Path(url.toLocalFile()))
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+
+    def _metadata_warning_texts(self, meta: dict) -> list[str]:
+        from_file = set(meta.get("_from_file") or [])
+        acknowledged = set(self._metadata_acknowledged_fields)
+        warnings: list[str] = []
+        size_z = int(meta.get("size_z", 1) or 1)
+        size_c = int(meta.get("size_c", meta.get("n_channels", 0)) or 0)
+        if "pixel_size_x" not in from_file and "pixel_size_x" not in acknowledged:
+            warnings.append("Pixel XY default")
+        if size_z > 1 and "pixel_size_z" not in from_file and "pixel_size_z" not in acknowledged:
+            warnings.append("Pixel Z default")
+        if "emission_wavelength" not in from_file and "emission_wavelength" not in acknowledged:
+            warnings.append("Emission default")
+        if "microscope_type" not in from_file and "microscope_type" not in acknowledged:
+            warnings.append("Microscope default")
+        if "sample_refractive_index" not in from_file and "sample_refractive_index" not in acknowledged:
+            warnings.append("Sample RI missing")
+        channels = meta.get("channels", [])
+        if isinstance(channels, list) and channels and size_c and len(channels) != size_c:
+            warnings.append("Channel metadata mismatch")
+        try:
+            px_xy = float(meta.get("pixel_size_x") or 0)
+            px_z = float(meta.get("pixel_size_z") or 0)
+            if size_z > 1 and px_xy > 0 and px_z > 0 and (px_z / px_xy > 10.0 or px_z / px_xy < 0.25):
+                warnings.append("Suspicious Z spacing")
+        except (TypeError, ValueError):
+            pass
+        return warnings
+
+    def _set_metadata_warnings(self, warnings: list[str]) -> None:
+        layout = self._metadata_warning_bar.layout()
+        for label in self._metadata_warning_labels:
+            layout.removeWidget(label)
+            label.deleteLater()
+        self._metadata_warning_labels = []
+        for text in warnings[:6]:
+            label = QLabel(text)
+            label.setStyleSheet(
+                "QLabel { background: #7c2d12; color: #fff7ed; border-radius: 4px; padding: 2px 6px; }"
+            )
+            layout.insertWidget(max(0, layout.count() - 2), label)
+            self._metadata_warning_labels.append(label)
+        has_warnings = bool(warnings)
+        self._btn_reset_metadata.setVisible(bool(self._metadata))
+        self._btn_accept_metadata.setVisible(has_warnings)
+        self._metadata_warning_bar.setVisible(has_warnings or bool(self._metadata))
+
+    def _ack_metadata_field(self, key: str) -> None:
+        if getattr(self, "_applying_metadata_to_fields", False):
+            return
+        if not self._metadata:
+            return
+        self._metadata_acknowledged_fields.add(key)
+        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+
+    def _on_accept_current_metadata_values(self) -> None:
+        self._metadata_acknowledged_fields.update({
+            "pixel_size_x",
+            "pixel_size_z",
+            "emission_wavelength",
+            "microscope_type",
+            "sample_refractive_index",
+        })
+        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+        self._status.showMessage("Current metadata/default values accepted", 3000)
+
+    def _on_reset_fields_to_image_metadata(self) -> None:
+        if not self._metadata:
+            return
+        source = self._input_source
+        display = self._file_label.text().strip() or "Loaded image"
+        source_path = self._input_path
+        factory = self._input_source_factory
+        channels = list(self._input_channels)
+        previews = dict(self._preview_outputs_by_t)
+        loaded_t = self._loaded_timepoint
+        if source is None:
+            return
+        self._apply_image_source(source, display, source_path=source_path, source_factory=factory)
+        if channels:
+            self._input_channels = channels
+            self._loaded_timepoint = loaded_t
+            self._preview_outputs_by_t = previews
+        self._status.showMessage("Fields reset to image metadata", 3000)
+
+    def _begin_run_timeline(self, kind: str) -> None:
+        self._current_run_started_at = time.time()
+        self._current_run_kind = kind
+        self._run_elapsed_timer.start()
+        self._set_run_step("Prepare")
+        self._update_run_elapsed_label()
+
+    def _set_run_step(self, step: str) -> None:
+        self._current_run_step = str(step)
+        self._update_run_elapsed_label()
+
+    def _update_run_elapsed_label(self) -> None:
+        if self._current_run_started_at is None:
+            self._run_step_label.setText("Ready")
+            return
+        elapsed = _format_duration(time.time() - self._current_run_started_at)
+        step = getattr(self, "_current_run_step", "Running")
+        self._run_step_label.setText(f"{step}... {elapsed}")
+
+    def _finish_run_timeline(self, status: str) -> None:
+        self._run_elapsed_timer.stop()
+        elapsed = _format_duration(time.time() - self._current_run_started_at) if self._current_run_started_at else ""
+        if status == "Done":
+            text = f"Deconvolution complete in {elapsed}" if elapsed else "Deconvolution complete"
+        elif status == "Stopped":
+            text = f"Stopped after {elapsed}" if elapsed else "Stopped"
+        elif status == "Failed":
+            text = f"Failed after {elapsed}" if elapsed else "Failed"
+        elif status == "Idle":
+            text = "Ready"
+        else:
+            text = f"{status} in {elapsed}" if elapsed else status
+        self._run_step_label.setText(text)
+
+    def _add_run_history(self, status: str, output_path: str = "", message: str = "") -> None:
+        elapsed = time.time() - self._current_run_started_at if self._current_run_started_at else 0.0
+        entry = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "image": self._file_label.text().strip() or "Untitled",
+            "method": self._method_combo.currentText(),
+            "status": status,
+            "output_path": output_path,
+            "elapsed_s": elapsed,
+            "message": message,
+            "params": self._current_run_params or self._settings_to_dict(),
+        }
+        self._run_history.insert(0, entry)
+        self._run_history = self._run_history[:MAX_RUN_HISTORY_ITEMS]
+        self._save_gui_state()
+        self._refresh_run_history_table()
+
+    def _refresh_run_history_table(self) -> None:
+        table = self._run_history_table
+        table.setRowCount(len(self._run_history))
+        for row, entry in enumerate(self._run_history):
+            values = [
+                str(entry.get("time", "")),
+                str(entry.get("image", "")),
+                str(entry.get("method", "")),
+                str(entry.get("status", "")),
+                Path(str(entry.get("output_path", ""))).name if entry.get("output_path") else "",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(str(entry.get("output_path", "")) if col == 4 else value)
+                table.setItem(row, col, item)
+
+    def _selected_history_entry(self) -> tuple[int, Optional[dict[str, Any]]]:
+        rows = self._run_history_table.selectionModel().selectedRows()
+        if not rows:
+            return -1, None
+        row = rows[0].row()
+        if row < 0 or row >= len(self._run_history):
+            return -1, None
+        return row, self._run_history[row]
+
+    def _on_history_restore_params(self) -> None:
+        _row, entry = self._selected_history_entry()
+        if not entry:
+            return
+        params = entry.get("params")
+        if isinstance(params, dict):
+            self._apply_settings(params)
+            self._viewer.refresh_view()
+            self._status.showMessage("Run parameters restored", 3000)
+
+    def _on_history_open_output(self) -> None:
+        _row, entry = self._selected_history_entry()
+        if not entry:
+            return
+        raw = str(entry.get("output_path") or "")
+        if not raw:
+            return
+        path = Path(raw)
+        target = path if path.is_dir() else path.parent
+        if target.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _on_history_copy_summary(self) -> None:
+        _row, entry = self._selected_history_entry()
+        if not entry:
+            return
+        QApplication.clipboard().setText(json.dumps(entry, indent=2))
+        self._status.showMessage("Run summary copied", 2500)
+
+    def _on_history_remove(self) -> None:
+        row, entry = self._selected_history_entry()
+        if not entry:
+            return
+        del self._run_history[row]
+        self._save_gui_state()
+        self._refresh_run_history_table()
 
     # -----------------------------------------------------------------------
     # Log window
@@ -7041,6 +7995,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._log_dialog.show()
         self._log_dialog.raise_()
         self._log_dialog.activateWindow()
+
+    def _open_help_dialog(self) -> None:
+        if self._help_dialog is None:
+            self._help_dialog = _HelpDialog(self)
+            self._help_dialog.finished.connect(lambda _code: setattr(self, "_help_dialog", None))
+        self._help_dialog.show()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
 
     def _reset_log(self, title: str) -> None:
         self._log_lines = []
@@ -7089,6 +8051,15 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_worker_progress(self, msg: str) -> None:
         self._status.showMessage(msg)
         self._log(msg)
+        lower = msg.lower()
+        if "psf" in lower:
+            self._set_run_step("PSF")
+        elif "metric" in lower:
+            self._set_run_step("Metrics")
+        elif "save" in lower or "writ" in lower or "export" in lower:
+            self._set_run_step("Save")
+        elif "decon" in lower or "iteration" in lower or "channel" in lower:
+            self._set_run_step("Deconvolve")
 
     # -----------------------------------------------------------------------
     # Slots — control panel
@@ -7137,6 +8108,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._on_damping_changed(self._damping_combo.currentText())
         self._refresh_two_d_wf_expert_state()
+        self._maybe_load_default_ci_rl_dl_model()
 
     def _on_bg_changed(self, text: str):
         self._sp_bg_value.setEnabled(text == "manual")
@@ -7170,6 +8142,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._pinhole_stack.setCurrentWidget(self._le_pinhole_na)
             self._le_niter.setText("80")
         self._refresh_two_d_wf_expert_state()
+        self._maybe_load_default_ci_rl_dl_model()
 
     def _refresh_two_d_wf_expert_state(self, _text: str = ""):
         rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
@@ -7206,6 +8179,32 @@ class DeconvolveCIWindow(QMainWindow):
         if path:
             self._le_dl_model.setText(path)
             self._apply_dl_model_metadata(Path(path))
+
+    def _default_ci_rl_dl_model_path(self) -> Optional[Path]:
+        if self._method_combo.currentText() != "ci_rl_dl":
+            return None
+        if not self._metadata:
+            return None
+        microscope = str(self._micro_combo.currentText() or self._metadata.get("microscope_type") or "").strip().lower()
+        if microscope not in {"confocal", "widefield"}:
+            return None
+        model_dir = _REPO_ROOT / "models" / ("defaultconfocal" if microscope == "confocal" else "defaultwidefield")
+        model_path = model_dir / "best_model.pt"
+        meta_path = model_dir / "best_model.json"
+        if model_dir.is_dir() and model_path.exists() and meta_path.exists():
+            return model_path
+        return None
+
+    def _maybe_load_default_ci_rl_dl_model(self) -> None:
+        model_path = self._default_ci_rl_dl_model_path()
+        if model_path is None:
+            return
+        current = self._le_dl_model.text().strip()
+        if current and Path(current) == model_path:
+            return
+        self._le_dl_model.setText(str(model_path))
+        self._apply_dl_model_metadata(model_path)
+        self._status.showMessage(f"Default ci_rl_dl model loaded: {model_path.parent.name}", 4000)
 
     def _apply_dl_model_metadata(self, model_path: Path):
         meta_path = model_path.with_suffix(".json")
@@ -7424,10 +8423,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._metadata = dict(source.metadata)
         self._preview_outputs_by_t.clear()
         self._input_path = source_path
+        self._metadata_acknowledged_fields.clear()
 
         # Populate UI from metadata
         meta = self._metadata
         from_file = meta.get("_from_file", set())
+        self._applying_metadata_to_fields = True
 
         def _bg(found: bool) -> str:
             """Stylesheet snippet: green if from metadata, orange if default."""
@@ -7435,70 +8436,73 @@ class DeconvolveCIWindow(QMainWindow):
                 return "background-color: #c8e6c9; color: black;"   # soft green
             return "background-color: #ffe0b2; color: black;"       # soft orange
 
-        if meta.get("na"):
-            self._sp_na.setValue(float(meta["na"]))
-        self._sp_na.setStyleSheet(_bg("na" in from_file))
-        px_x = meta.get("pixel_size_x")
-        if px_x:
-            self._sp_px_xy.setValue(float(px_x) * 1000.0)  # µm → nm
-        self._sp_px_xy.setStyleSheet(_bg("pixel_size_x" in from_file))
-        px_z = meta.get("pixel_size_z")
-        if px_z:
-            self._sp_px_z.setValue(float(px_z) * 1000.0)
-        self._sp_px_z.setStyleSheet(_bg("pixel_size_z" in from_file))
-        ri = meta.get("refractive_index")
-        if ri:
-            self._sp_ri_imm.setValue(float(ri))
-        self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
-        micro = meta.get("microscope_type")
-        if micro:
-            idx = self._micro_combo.findText(micro)
-            if idx >= 0:
-                self._micro_combo.setCurrentIndex(idx)
-            # Auto-set iterations based on microscope type
-            if micro == "confocal":
-                self._le_niter.setText("50")
+        try:
+            if meta.get("na"):
+                self._sp_na.setValue(float(meta["na"]))
+            self._sp_na.setStyleSheet(_bg("na" in from_file))
+            px_x = meta.get("pixel_size_x")
+            if px_x:
+                self._sp_px_xy.setValue(float(px_x) * 1000.0)  # µm → nm
+            self._sp_px_xy.setStyleSheet(_bg("pixel_size_x" in from_file))
+            px_z = meta.get("pixel_size_z")
+            if px_z:
+                self._sp_px_z.setValue(float(px_z) * 1000.0)
+            self._sp_px_z.setStyleSheet(_bg("pixel_size_z" in from_file))
+            ri = meta.get("refractive_index")
+            if ri:
+                self._sp_ri_imm.setValue(float(ri))
+            self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
+            micro = meta.get("microscope_type")
+            if micro:
+                idx = self._micro_combo.findText(micro)
+                if idx >= 0:
+                    self._micro_combo.setCurrentIndex(idx)
+                # Auto-set iterations based on microscope type
+                if micro == "confocal":
+                    self._le_niter.setText("50")
+                else:
+                    self._le_niter.setText("80")
+            self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
+
+            # Per-channel wavelengths
+            ch_info = meta.get("channels", [])
+            if ch_info:
+                self._le_emission.setText(
+                    _format_channel_values(ch_info, "emission_wavelength", 520.0)
+                )
+                ex_text = _format_channel_values(ch_info, "excitation_wavelength", 488.0)
+                self._excitation_saved = ex_text
+                if self._micro_combo.currentText() == "confocal":
+                    self._le_excitation.setText(ex_text)
+                    self._le_excitation.setEnabled(True)
+                # (widefield: field stays N/A and disabled)
+            self._le_emission.setStyleSheet(
+                _bg("emission_wavelength" in from_file))
+            self._le_excitation.setStyleSheet(
+                _bg("excitation_wavelength" in from_file))
+            if ch_info:
+                pinhole_text = _format_channel_values(
+                    ch_info, "pinhole_airy_units", _DEFAULT_PINHOLE_AIRY_UNITS, digits=2
+                )
+                self._pinhole_airy_saved = pinhole_text
+                if self._micro_combo.currentText() == "confocal":
+                    self._le_pinhole_airy.setText(pinhole_text)
+            self._le_pinhole_airy.setStyleSheet(
+                _bg("pinhole_airy_units" in from_file))
+            self._le_pinhole_na.setStyleSheet(
+                _bg("pinhole_airy_units" in from_file))
+
+            self._refresh_two_d_wf_expert_state()
+
+            sample_ri = meta.get("sample_refractive_index")
+            if sample_ri:
+                self._sp_ri_sample.setValue(float(sample_ri))
+                self._sp_ri_sample.setStyleSheet(_bg("sample_refractive_index" in from_file))
             else:
-                self._le_niter.setText("80")
-        self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
-
-        # Per-channel wavelengths
-        ch_info = meta.get("channels", [])
-        if ch_info:
-            self._le_emission.setText(
-                _format_channel_values(ch_info, "emission_wavelength", 520.0)
-            )
-            ex_text = _format_channel_values(ch_info, "excitation_wavelength", 488.0)
-            self._excitation_saved = ex_text
-            if self._micro_combo.currentText() == "confocal":
-                self._le_excitation.setText(ex_text)
-                self._le_excitation.setEnabled(True)
-            # (widefield: field stays N/A and disabled)
-        self._le_emission.setStyleSheet(
-            _bg("emission_wavelength" in from_file))
-        self._le_excitation.setStyleSheet(
-            _bg("excitation_wavelength" in from_file))
-        if ch_info:
-            pinhole_text = _format_channel_values(
-                ch_info, "pinhole_airy_units", _DEFAULT_PINHOLE_AIRY_UNITS, digits=2
-            )
-            self._pinhole_airy_saved = pinhole_text
-            if self._micro_combo.currentText() == "confocal":
-                self._le_pinhole_airy.setText(pinhole_text)
-        self._le_pinhole_airy.setStyleSheet(
-            _bg("pinhole_airy_units" in from_file))
-        self._le_pinhole_na.setStyleSheet(
-            _bg("pinhole_airy_units" in from_file))
-
-        self._refresh_two_d_wf_expert_state()
-
-        sample_ri = meta.get("sample_refractive_index")
-        if sample_ri:
-            self._sp_ri_sample.setValue(float(sample_ri))
-            self._sp_ri_sample.setStyleSheet(_bg("sample_refractive_index" in from_file))
-        else:
-            self._sp_ri_sample.setStyleSheet(
-                "background-color: #ffe0e0; color: black;")  # pastel red
+                self._sp_ri_sample.setStyleSheet(
+                    "background-color: #ffe0e0; color: black;")  # pastel red
+        finally:
+            self._applying_metadata_to_fields = False
 
         self._viewer.set_input_data([], self._metadata)
         self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
@@ -7530,11 +8534,18 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save_series.setEnabled(self._viewer.has_time_axis() and not source_is_pyramidal)
         self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
-        self._btn_save_view.setEnabled(False)
+        self._btn_save.setEnabled(False)
         self._sync_preview_buttons()
         if source_is_pyramidal:
             self._btn_fit_psf.setEnabled(False)
         self._viewer.refresh_view()
+        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+        self._maybe_load_default_ci_rl_dl_model()
+        if source_path is not None:
+            kind = "zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file"
+            self._remember_recent_source(kind, display_name, source_path)
+        elif display_name.startswith("OMERO:"):
+            self._remember_recent_source("omero", display_name)
         self._set_default_movie_output_path(display_name, source_path)
         self._status.showMessage(f"Loaded {display_name}", 5000)
 
@@ -7840,9 +8851,11 @@ class DeconvolveCIWindow(QMainWindow):
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_save.setEnabled(False)
-        self._btn_save_view.setEnabled(False)
+        self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._begin_busy_progress("Streaming OMERO deconvolution ...")
+        self._current_run_params = self._settings_to_dict()
+        self._begin_run_timeline("Streaming")
         self._monitor_bar.set_active(True)
         self._set_log_running(True)
         self._log("")
@@ -7891,9 +8904,11 @@ class DeconvolveCIWindow(QMainWindow):
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_save.setEnabled(False)
-        self._btn_save_view.setEnabled(False)
+        self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._begin_busy_progress("Running deconvolution …")
+        self._current_run_params = self._settings_to_dict()
+        self._begin_run_timeline("Preview")
 
         # Signal that deconvolution is active (dot indicator)
         self._monitor_bar.set_active(True)
@@ -7916,6 +8931,7 @@ class DeconvolveCIWindow(QMainWindow):
                 )
                 self._btn_run.setEnabled(True)
                 self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+                self._finish_run_timeline("Idle")
                 QMessageBox.warning(self, "Movie Export", "Choose an MP4 output path before running.")
                 return
             try:
@@ -7931,6 +8947,7 @@ class DeconvolveCIWindow(QMainWindow):
                 )
                 self._btn_run.setEnabled(True)
                 self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+                self._finish_run_timeline("Idle")
                 QMessageBox.warning(
                     self,
                     "Movie Export",
@@ -7984,10 +9001,14 @@ class DeconvolveCIWindow(QMainWindow):
             if "Stopped by user" in msg:
                 self._log("Deconvolution stopped by user.")
                 self._status.showMessage("Deconvolution stopped", 5000)
+                self._finish_run_timeline("Stopped")
+                self._add_run_history("Stopped", message=msg)
             else:
                 self._log(f"Deconvolution failed: {msg}")
                 QMessageBox.critical(self, "Deconvolution Error", msg)
                 self._status.showMessage("Deconvolution failed", 5000)
+                self._finish_run_timeline("Failed")
+                self._add_run_history("Failed", message=msg)
             return
 
         try:
@@ -8003,6 +9024,8 @@ class DeconvolveCIWindow(QMainWindow):
                 if provenance:
                     self._log(f"Provenance: {provenance}")
                 self._status.showMessage(f"Streaming deconvolution complete → {Path(output_path).name}", 8000)
+                self._finish_run_timeline("Done")
+                self._add_run_history("Done", output_path=output_path)
                 return
 
             timepoint = int(result["timepoint"])
@@ -8011,6 +9034,8 @@ class DeconvolveCIWindow(QMainWindow):
             self._sync_preview_buttons()
             self._log("Deconvolution complete.")
             self._status.showMessage(f"Deconvolution complete for T={timepoint + 1}", 5000)
+            self._finish_run_timeline("Done")
+            self._add_run_history("Done", message=f"Preview T={timepoint + 1}")
             # Push final residual to live chart panel if enabled
             if self._log_dialog is not None and self._log_dialog.is_charts_enabled():
                 payload = self._last_final_iteration_payload
@@ -8365,20 +9390,49 @@ class DeconvolveCIWindow(QMainWindow):
     # Save
     # -----------------------------------------------------------------------
 
-    def _on_save(self):
+    def _current_preview_export_data(self) -> tuple[int, np.ndarray, dict]:
         current_t = self._viewer.current_timepoint()
         preview_channels = self._preview_outputs_by_t.get(current_t)
         if not preview_channels:
-            return
+            raise RuntimeError("Run deconvolution for the current timepoint before saving.")
+        stack = np.stack(preview_channels, axis=0)
+        data = stack[np.newaxis, ...].astype(np.float32)
+        params = self._collect_params()
+        source_name = self._input_path.name if self._input_path else self._file_label.text().strip()
+        metadata = _streaming_output_metadata(self._metadata, params, source_name=source_name)
+        metadata["size_t"] = 1
+        metadata["size_c"] = int(data.shape[1])
+        metadata["size_z"] = int(data.shape[2])
+        metadata["size_y"] = int(data.shape[3])
+        metadata["size_x"] = int(data.shape[4])
+        metadata["default_t"] = 0
+        try:
+            default_z = int(self._metadata.get("default_z", 0) or 0)
+        except (TypeError, ValueError):
+            default_z = 0
+        metadata["default_z"] = int(min(max(default_z, 0), max(data.shape[2] - 1, 0)))
+        metadata["cideconvolve_processing"] = dict(metadata.get("cideconvolve_processing") or {})
+        metadata["cideconvolve_processing"]["tile_streaming"] = False
+        metadata["cideconvolve_processing"]["preview_timepoint"] = int(current_t)
+        return current_t, data, metadata
 
+    def _preview_export_stem(self, current_t: int) -> str:
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
-        suggested = f"{stem}_{method}_{niter_text}i_T{current_t:03d}.ome.tiff"
+        return f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t:03d}"
+
+    def _on_save(self):
+        try:
+            current_t, data, metadata = self._current_preview_export_data()
+        except RuntimeError as exc:
+            QMessageBox.information(self, "No deconvolved result", str(exc))
+            return
+        suggested = f"{self._preview_export_stem(current_t)}.ome.tiff"
 
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Deconvolved Preview",
+            "Save Deconvolved Preview as OME-TIFF",
             str(Path(self._last_save_dir) / suggested),
             "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
         )
@@ -8388,16 +9442,57 @@ class DeconvolveCIWindow(QMainWindow):
 
         try:
             t_save = time.time()
-            self._log(f"Saving preview to {path}")
-            stack = np.stack(preview_channels, axis=0)
-            data = stack[np.newaxis, ...].astype(np.float32)
-            _write_ome_tiff(data, path, self._metadata)
+            self._log(f"Saving OME-TIFF preview to {path}")
+            _write_ome_tiff(data, path, metadata)
             size = Path(path).stat().st_size / (1024 * 1024) if Path(path).exists() else 0.0
-            self._log(f"Saved preview in {_format_duration(time.time() - t_save)} ({_format_bytes(size)})")
+            self._log(f"Saved OME-TIFF preview in {_format_duration(time.time() - t_save)} ({_format_bytes(size)})")
             self._status.showMessage(f"Saved → {Path(path).name}", 5000)
         except Exception as exc:
             self._log(f"Save failed: {exc}")
             QMessageBox.critical(self, "Save Error", str(exc))
+
+    def _on_save_zarr(self) -> None:
+        try:
+            current_t, data, metadata = self._current_preview_export_data()
+        except RuntimeError as exc:
+            QMessageBox.information(self, "No deconvolved result", str(exc))
+            return
+        suggested = f"{self._preview_export_stem(current_t)}.ome.zarr"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Deconvolved Preview as OME-Zarr",
+            str(Path(self._last_save_dir) / suggested),
+            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
+        )
+        if not path:
+            return
+        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+            path += ".ome.zarr"
+        out = Path(path)
+        if out.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace OME-Zarr",
+                f"Replace existing folder?\n{out}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            if out.is_dir():
+                shutil.rmtree(out)
+            else:
+                out.unlink()
+        self._last_save_dir = str(out.parent)
+        try:
+            t_save = time.time()
+            self._log(f"Saving OME-Zarr preview to {out}")
+            _write_ome_zarr(data, out, metadata)
+            self._log(f"Saved OME-Zarr preview in {_format_duration(time.time() - t_save)}")
+            self._status.showMessage(f"Saved → {out.name}", 5000)
+        except Exception as exc:
+            self._log(f"OME-Zarr save failed: {exc}")
+            QMessageBox.critical(self, "Save OME-Zarr Error", str(exc))
 
     def _on_save_view(self):
         current_t = self._viewer.current_timepoint()
@@ -8448,6 +9543,40 @@ class DeconvolveCIWindow(QMainWindow):
             self._log(f"Save view failed: {exc}")
             QMessageBox.critical(self, "Save View Error", str(exc))
 
+    def _on_save_comparison_view(self) -> None:
+        current_t = self._viewer.current_timepoint()
+        if current_t not in self._preview_outputs_by_t:
+            QMessageBox.information(
+                self,
+                "No comparison view",
+                "Run deconvolution for the current timepoint before saving a comparison view.",
+            )
+            return
+        image = self._viewer.current_comparison_image()
+        if image.isNull():
+            QMessageBox.information(self, "No comparison view", "The current comparison view is empty.")
+            return
+        stem = _safe_filename_stem(self._input_path.stem if self._input_path else self._file_label.text())
+        if self._viewer.has_time_axis():
+            stem = f"{stem}_T{current_t:03d}"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Comparison View PNG",
+            str(Path(self._last_save_dir) / f"{stem}_comparison.png"),
+            "PNG files (*.png);;All files (*)",
+        )
+        if not path:
+            return
+        out = Path(path)
+        if out.suffix.lower() != ".png":
+            out = out.with_suffix(".png")
+        self._last_save_dir = str(out.parent)
+        if not image.save(str(out), "PNG"):
+            QMessageBox.critical(self, "Save Comparison", f"Could not save {out}")
+            return
+        self._log(f"Saved comparison view: {out}")
+        self._status.showMessage(f"Saved comparison → {out.name}", 4000)
+
     def _on_save_t_series(self):
         if not self._input_channels:
             return
@@ -8486,7 +9615,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._begin_busy_progress("Saving full T-series …")
         self._btn_run.setEnabled(False)
         self._btn_save.setEnabled(False)
-        self._btn_save_view.setEnabled(False)
+        self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._monitor_bar.set_active(True)
         self._set_log_running(True)
@@ -8767,7 +9896,8 @@ class DeconvolveCIWindow(QMainWindow):
         try:
             with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(self._settings_to_dict(), f, indent=2)
-            self._btn_restore.setEnabled(True)
+            if hasattr(self, "_act_restore_settings"):
+                self._act_restore_settings.setEnabled(True)
         except OSError:
             pass
 
@@ -8793,6 +9923,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_settings_dir = str(Path(path).parent)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self._settings_to_dict(), f, indent=2)
+        self._remember_recent_settings(Path(path))
         self._status.showMessage(f"Settings saved → {Path(path).name}", 3000)
 
     def _on_load_settings(self):
@@ -8812,6 +9943,7 @@ class DeconvolveCIWindow(QMainWindow):
             return
         self._apply_settings(data)
         self._viewer.refresh_view()
+        self._remember_recent_settings(Path(path))
         self._status.showMessage(f"Settings loaded from {Path(path).name}", 3000)
 
     def _configure_omero_login_dialog(self, dlg):
@@ -8881,7 +10013,14 @@ class DeconvolveCIWindow(QMainWindow):
         current_t = self._viewer.current_timepoint()
         has_preview = current_t in self._preview_outputs_by_t
         self._btn_save.setEnabled(has_preview)
-        self._btn_save_view.setEnabled(has_preview)
+        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr", "_act_save_views", "_act_save_comparison"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(has_preview)
+
+    def _on_viewer_cursor_info(self, text: str) -> None:
+        if text:
+            self._status.showMessage(text)
 
     def _on_viewer_time_changed(self, timepoint: int) -> None:
         previous_t = self._loaded_timepoint
@@ -8927,6 +10066,9 @@ class DeconvolveCIWindow(QMainWindow):
         if self._monitor is not None:
             self._monitor.request_stop()
             self._monitor = None
+        if self._help_dialog is not None:
+            self._help_dialog.close()
+            self._help_dialog = None
         try:
             logging.getLogger().removeHandler(self._log_handler)
         except Exception:
@@ -8966,11 +10108,6 @@ def main():
         action="store_true",
         help="Expose the experimental Fit PSF panel for refractive-index fitting.",
     )
-    parser.add_argument(
-        "--dlref",
-        action="store_true",
-        help="Expose the ci_rl_dl method and DL refinement parameter panel.",
-    )
     args, qt_args = parser.parse_known_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -8979,7 +10116,7 @@ def main():
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf, dlref_available=args.dlref)
+    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf)
     window.show()
     sys.exit(app.exec())
 
