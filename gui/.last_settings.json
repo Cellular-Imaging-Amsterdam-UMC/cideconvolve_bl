@@ -1,7 +1,7 @@
 {
-  "method": "ci_rl",
+  "method": "ci_rl_tv",
   "iterations": "80",
-  "tv_lambda": 0.0,
+  "tv_lambda": 0.0001,
   "damping": "none",
   "damping_value": 3.0,
   "two_d_mode": "Auto",
@@ -18,7 +18,7 @@
   "offset": "auto",
   "offset_value": 5.0,
   "prefilter_sigma": 0.0,
-  "start": "flat",
+  "start": "auto",
   "sparse_hessian_weight": 0.6,
   "sparse_hessian_reg": 0.98,
   "convergence": "auto",

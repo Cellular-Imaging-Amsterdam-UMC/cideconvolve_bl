@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import json
+import math
 from pathlib import Path
 from collections.abc import Sequence
 from typing import Any, Optional
@@ -20,11 +21,14 @@ from torch import nn
 import torch.nn.functional as F
 
 from .deconvolve_ci import (
+    _ci_deconvolve_tiled,
     _forward_project,
+    _get_memory_budget_bytes,
     _pick_device,
     _prepare_otf,
     _rfft,
     _irfft,
+    _resolve_tiling,
     _to_tensor,
     ci_rl_deconvolve,
 )
@@ -55,6 +59,14 @@ def resolve_torch_device(device: str | torch.device | None = "auto") -> torch.de
         log.warning("CUDA requested for ci_rl_dl, but CUDA is unavailable; falling back to CPU")
         return torch.device("cpu")
     return requested
+
+
+def _module_device(module: nn.Module) -> torch.device | None:
+    for tensor in module.parameters():
+        return tensor.device
+    for tensor in module.buffers():
+        return tensor.device
+    return None
 
 
 class ConvBlock(nn.Module):
@@ -345,6 +357,45 @@ def reconvolve_same(
     return out
 
 
+def _ci_rl_dl_auto_n_tiles(
+    shape: tuple[int, ...],
+    *,
+    device: str | torch.device | None,
+    psf_xy_est: int,
+    batch_size: int,
+) -> int:
+    """Choose a more conservative XY tile count for RL+DL refinement.
+
+    The RL memory model alone leaves little room for the resident U-Net,
+    per-slice DL batches, and allocator fragmentation.  Use a smaller fraction
+    of the usual RL budget so the model can stay on the GPU while each tile is
+    refined.
+    """
+    if len(shape) < 3:
+        return 1
+    n_z, height, width = (int(shape[0]), int(shape[1]), int(shape[2]))
+    dev = resolve_torch_device(device)
+    budget = _get_memory_budget_bytes(str(dev))
+    if dev.type == "cuda":
+        batch_factor = max(1.0, math.sqrt(max(int(batch_size), 1) / 8.0))
+        budget = int(budget * 0.90 / batch_factor)
+    else:
+        budget = int(budget * 0.75)
+    padded_z = max(1, 4 * n_z) if n_z > 1 else 1
+    inner_sq = budget / max(64 * padded_z, 1)
+    max_xy = int(math.sqrt(max(inner_sq, 0.0))) - int(psf_xy_est)
+    max_xy = max(256, min(max_xy, 4096))
+    ny = max(1, -(-height // max_xy))
+    nx = max(1, -(-width // max_xy))
+    n_tiles = ny * nx
+    if n_tiles > 1:
+        log.info(
+            "ci_rl_dl auto-tiling: image z=%d h=%d w=%d, max_tile_xy=%d -> %dx%d grid",
+            n_z, height, width, max_xy, ny, nx,
+        )
+    return 1 if n_tiles <= 1 else n_tiles
+
+
 def load_residual_unet_checkpoint(
     model_path: str | Path,
     *,
@@ -404,6 +455,7 @@ def apply_dl_refinement_25d(
     residual_strength: float = 1.0,
     xy_padding: int = 0,
     conditioning_values: Optional[Sequence[float]] = None,
+    compute_reconvolution_diagnostics: bool = False,
 ) -> dict[str, Any]:
     """Apply a trained 2.5D residual model slice by slice."""
     if use_forward_projection_channel:
@@ -414,7 +466,9 @@ def apply_dl_refinement_25d(
         raise ValueError(f"raw and deconv shapes differ: {raw_zyx.shape} vs {deconv_zyx.shape}")
 
     dev = resolve_torch_device(device)
-    model = model.to(dev).eval()
+    if _module_device(model) != dev:
+        model = model.to(dev)
+    model.eval()
     scale = _robust_scale(raw_zyx, deconv_zyx)
     xy_padding_i = max(int(xy_padding), 0)
     raw_work = _reflect_pad_xy(raw_zyx, xy_padding_i)
@@ -459,7 +513,7 @@ def apply_dl_refinement_25d(
         "intensity_sum_before_dl": float(np.sum(deconv_zyx)),
         "intensity_sum_after_dl": float(np.sum(refined)),
     }
-    if psf is not None:
+    if psf is not None and bool(compute_reconvolution_diagnostics):
         try:
             recon_before = reconvolve_same(deconv_zyx, psf, device=dev)
             recon_after = reconvolve_same(refined, psf, device=dev)
@@ -546,7 +600,112 @@ def deconvolve_ci_rl_dl(
     elif device == "auto":
         rl_options.setdefault("device", None)
 
-    rl_out = ci_rl_deconvolve(image_arr, np.asarray(psf), **rl_options)
+    psf_arr = np.asarray(psf)
+    psf_xy_est = max(psf_arr.shape[-1], psf_arr.shape[-2]) if psf_arr.ndim >= 2 else 65
+    tiling_mode = rl_options.get("tiling", "auto")
+    dl_options_for_tiling = {**dict(inference_defaults.get("dl_kwargs") or {}), **dict(dl_kwargs or {})}
+    dl_batch_size_for_tiling = int(dl_options_for_tiling.get("batch_size", 8) or 8)
+    if model_path is not None and image_arr.ndim == 3 and str(tiling_mode).strip().lower() in {"auto", "custom"}:
+        n_tiles = _ci_rl_dl_auto_n_tiles(
+            image_arr.shape,
+            device=rl_options.get("device", device),
+            psf_xy_est=psf_xy_est,
+            batch_size=dl_batch_size_for_tiling,
+        )
+    else:
+        n_tiles = _resolve_tiling(
+            tiling_mode,
+            image_arr.shape,
+            device=rl_options.get("device", device),
+            psf_xy_est=psf_xy_est,
+        )
+        if (
+            model_path is not None
+            and image_arr.ndim == 3
+            and not (isinstance(tiling_mode, str) and str(tiling_mode).strip().lower() == "none")
+        ):
+            n_tiles = max(
+                n_tiles,
+                _ci_rl_dl_auto_n_tiles(
+                    image_arr.shape,
+                    device=rl_options.get("device", device),
+                    psf_xy_est=psf_xy_est,
+                    batch_size=dl_batch_size_for_tiling,
+                ),
+            )
+    if model_path is not None and image_arr.ndim == 3 and n_tiles > 1:
+        log.info("ci_rl_dl tiled refinement: %d XY tiles", n_tiles)
+        dl_options = dict(dl_kwargs or {})
+        model, checkpoint = load_residual_unet_checkpoint(model_path, device=device)
+        checkpoint_metadata = checkpoint.get("sidecar_metadata") or checkpoint
+        dl_defaults = dict(checkpoint_metadata.get("recommended_inference") or {})
+        dl_options = {**dict(dl_defaults.get("dl_kwargs") or {}), **dl_options}
+        dl_options.pop("compute_reconvolution_diagnostics", None)
+        z_radius = int(dl_options.pop("z_radius", checkpoint.get("z_radius", 2)))
+        use_residual_channel = bool(
+            dl_options.pop("use_residual_channel", checkpoint.get("use_residual_channel", True))
+        )
+        conditioning_channels = list(checkpoint_metadata.get("conditioning_channels") or [])
+        conditioning_values = None
+        if conditioning_channels:
+            conditioning_values = conditioning_vector(
+                psf=np.asarray(psf_arr, dtype=np.float32),
+                metadata=optical_params or {},
+                rl_iterations=int(rl_options.get("niter", 0) or 0),
+                microscope_type=(optical_params or {}).get("microscope_type") if optical_params else None,
+            )
+
+        def _tile_solver(tile_img: np.ndarray, tile_psf: np.ndarray, **_unused: Any) -> dict[str, Any]:
+            tile_rl_options = dict(rl_options)
+            tile_rl_options["tiling"] = "none"
+            tile_rl_options["iteration_callback"] = None
+            tile_rl_out = ci_rl_deconvolve(tile_img, np.asarray(tile_psf), **tile_rl_options)
+            tile_ci_rl = np.asarray(tile_rl_out["result"], dtype=np.float32)
+            refined_out = apply_dl_refinement_25d(
+                np.asarray(tile_img, dtype=np.float32),
+                tile_ci_rl,
+                model,
+                psf=np.asarray(tile_psf, dtype=np.float32),
+                device=device,
+                z_radius=z_radius,
+                use_residual_channel=use_residual_channel,
+                conditioning_values=conditioning_values,
+                compute_reconvolution_diagnostics=False,
+                **dl_options,
+            )
+            return {
+                "result": np.clip(refined_out["result"], 0, None).astype(np.float32),
+                "convergence": tile_rl_out.get("convergence", []),
+                "iterations_used": int(tile_rl_out.get("iterations_used", 0)),
+            }
+
+        tiled_out = _ci_deconvolve_tiled(
+            np.asarray(image_arr, dtype=np.float32),
+            np.asarray(psf_arr, dtype=np.float32),
+            n_tiles,
+            solver=_tile_solver,
+        )
+        if return_diagnostics:
+            return {
+                "result": tiled_out["result"],
+                "raw": np.asarray(image),
+                "ci_rl": None,
+                "dl_refined": tiled_out["result"],
+                "residual": None,
+                "reconvolved_prediction": None,
+                "iterations_used": int(tiled_out.get("iterations_used", 0)),
+                "convergence": tiled_out.get("convergence", []),
+                "diagnostics": {
+                    "rl_iterations": int(tiled_out.get("iterations_used", 0)),
+                    "rl_convergence": tiled_out.get("convergence", []),
+                    "dl_model_path": str(model_path),
+                    "dl_tiling": int(n_tiles),
+                    "dl_refinement": "tiled",
+                },
+            }
+        return np.asarray(tiled_out["result"], dtype=np.float32)
+
+    rl_out = ci_rl_deconvolve(image_arr, psf_arr, **rl_options)
     ci_rl = np.asarray(rl_out["result"], dtype=np.float32)
     diagnostics: dict[str, Any] = {
         "rl_iterations": int(rl_out.get("iterations_used", 0)),
@@ -574,6 +733,7 @@ def deconvolve_ci_rl_dl(
     metadata = checkpoint.get("sidecar_metadata") or checkpoint
     inference_defaults = dict(metadata.get("recommended_inference") or {})
     dl_options = {**dict(inference_defaults.get("dl_kwargs") or {}), **dl_options}
+    compute_reconvolution_diagnostics = bool(dl_options.pop("compute_reconvolution_diagnostics", False))
     z_radius = int(dl_options.pop("z_radius", checkpoint.get("z_radius", 2)))
     use_residual_channel = bool(
         dl_options.pop("use_residual_channel", checkpoint.get("use_residual_channel", True))
@@ -596,16 +756,18 @@ def deconvolve_ci_rl_dl(
         z_radius=z_radius,
         use_residual_channel=use_residual_channel,
         conditioning_values=conditioning_values,
+        compute_reconvolution_diagnostics=compute_reconvolution_diagnostics,
         **dl_options,
     )
     diagnostics.update(refined_out["diagnostics"])
     result = np.clip(refined_out["result"], 0, None).astype(np.float32)
     if return_diagnostics:
         reconvolved = None
-        try:
-            reconvolved = reconvolve_same(result, np.asarray(psf, dtype=np.float32), device=device)
-        except Exception:
-            pass
+        if compute_reconvolution_diagnostics:
+            try:
+                reconvolved = reconvolve_same(result, np.asarray(psf, dtype=np.float32), device=device)
+            except Exception:
+                pass
         return {
             "result": result,
             "raw": np.asarray(image),

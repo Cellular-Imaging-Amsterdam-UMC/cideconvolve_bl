@@ -903,14 +903,30 @@ def _format_value(value, unit: str = "", digits: int = 4) -> str:
     return f"{text} {unit}".rstrip()
 
 
+_LOAD_STATS_MAX_SAMPLES = 1_000_000
+
+
+def _stats_sample(arr: np.ndarray, max_samples: int = _LOAD_STATS_MAX_SAMPLES) -> np.ndarray:
+    data = np.asarray(arr)
+    flat = data.ravel()
+    if flat.size <= max_samples:
+        return flat
+    step = max(1, int(np.ceil(flat.size / max_samples)))
+    return flat[::step]
+
+
 def _array_stats(arr: np.ndarray) -> dict:
     data = np.asarray(arr)
-    finite = data[np.isfinite(data)]
+    sample = _stats_sample(data)
+    finite = sample[np.isfinite(sample)]
+    sampled = sample.size < data.size
     if finite.size == 0:
         return {
             "shape": data.shape,
             "dtype": str(data.dtype),
             "bytes_mb": data.nbytes / (1024 * 1024),
+            "sampled": sampled,
+            "sample_size": int(sample.size),
             "min": 0.0,
             "max": 0.0,
             "mean": 0.0,
@@ -923,13 +939,15 @@ def _array_stats(arr: np.ndarray) -> dict:
         "shape": data.shape,
         "dtype": str(data.dtype),
         "bytes_mb": data.nbytes / (1024 * 1024),
+        "sampled": sampled,
+        "sample_size": int(finite.size),
         "min": float(np.min(finite)),
         "max": float(np.max(finite)),
         "mean": float(np.mean(finite)),
         "p1": float(np.percentile(finite, 1)),
         "p50": float(np.percentile(finite, 50)),
         "p99": float(np.percentile(finite, 99)),
-        "nonzero_percent": float(np.count_nonzero(data) / data.size * 100) if data.size else 0.0,
+        "nonzero_percent": float(np.count_nonzero(sample) / sample.size * 100) if sample.size else 0.0,
     }
 
 
@@ -1132,11 +1150,13 @@ def _image_detail_lines(display_name: str, source_path: Optional[Path], meta: di
             f"effective={_format_value(ch_meta.get('pinhole_airy_units'), 'AU')}"
         )
         lines.append(
-            f"    intensity  : min={stats['min']:.4g} p1={stats['p1']:.4g} "
+            f"    intensity{'*' if stats.get('sampled') else ' '} : min={stats['min']:.4g} p1={stats['p1']:.4g} "
             f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
             f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
             f"nonzero={stats['nonzero_percent']:.1f}%"
         )
+        if stats.get("sampled"):
+            lines.append(f"    *sampled from {stats['sample_size']:,} voxels for responsive loading")
     return lines
 
 
@@ -1466,6 +1486,76 @@ class _TimepointRegionSource:
         channels = self._channels_for_t(t)
         ci = max(0, min(int(c), len(channels) - 1))
         return np.asarray(channels[ci][z, y, x], dtype=np.float32)
+
+
+class _TimepointLoadWorker(QThread):
+    """Load one source timepoint without blocking the Qt event loop."""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(int, int, str)
+
+    def __init__(
+        self,
+        source: _BaseTimepointSource,
+        timepoint: int,
+        generation: int,
+        source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source = source
+        self.source_factory = source_factory
+        self.timepoint = int(timepoint)
+        self.generation = int(generation)
+
+    def run(self):
+        try:
+            if self.isInterruptionRequested():
+                self.finished.emit(
+                    {
+                        "ok": False,
+                        "cancelled": True,
+                        "generation": self.generation,
+                        "timepoint": self.timepoint,
+                        "error": "Loading cancelled",
+                    }
+                )
+                return
+            source = self.source_factory() if self.source_factory is not None else self.source
+            channels = source.load_timepoint(
+                self.timepoint,
+                progress_cb=lambda done, total, text: self.progress.emit(
+                    int(done), int(total), str(text)
+                ),
+            )
+            if self.isInterruptionRequested():
+                self.finished.emit(
+                    {
+                        "ok": False,
+                        "cancelled": True,
+                        "generation": self.generation,
+                        "timepoint": self.timepoint,
+                        "error": "Loading cancelled",
+                    }
+                )
+                return
+            self.finished.emit(
+                {
+                    "ok": True,
+                    "generation": self.generation,
+                    "timepoint": self.timepoint,
+                    "channels": channels,
+                }
+            )
+        except Exception as exc:
+            self.finished.emit(
+                {
+                    "ok": False,
+                    "generation": self.generation,
+                    "timepoint": self.timepoint,
+                    "error": str(exc),
+                }
+            )
 
 
 def _leica_microscope_type(metadata: dict) -> str:
@@ -2180,6 +2270,21 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <li>Higher Lo% values suppress background but can hide weak signal.</li>
                     <li><b>Log</b> display helps inspect low-intensity detail in high dynamic range data.</li>
                     <li><b>Adv. Scaling</b> opens per-channel and advanced display controls.</li>
+                    </ul>
+                """,
+            },
+            {
+                "id": "performance",
+                "title": "Performance",
+                "keywords": ["performance", "large image", "loading", "mip", "sum", "advanced scaling", "vram", "spill"],
+                "html": """
+                    <h2>Performance</h2>
+                    <ul>
+                    <li><b>Slice</b> is the fastest first view for large 3D data. <b>MIP</b> and <b>SUM</b> scan the stack and are cached after first use.</li>
+                    <li><b>Advanced Scaling</b> prepares per-channel histograms in the background for large images; placeholder histograms may appear briefly.</li>
+                    <li><b>Large image mode</b> means the GUI shows metadata first and keeps expensive preview work lazy or streamed where possible.</li>
+                    <li><b>OMERO pyramids</b> use overview/tiles for viewing and stream full-resolution deconvolution directly to OME-Zarr.</li>
+                    <li><b>VRAM spill</b> in the resource monitor indicates PyTorch memory pressure. Reduce image size, use streaming output, or choose CPU if the GPU is too small.</li>
                     </ul>
                 """,
             },
@@ -4221,6 +4326,7 @@ def _deconvolve_channel_stacks(
 
     try:
         from core.deconvolve_ci import (
+            _auto_n_tiles,
             ci_generate_psf,
             ci_rl_deconvolve,
             ci_sparse_hessian_deconvolve,
@@ -4367,6 +4473,22 @@ def _deconvolve_channel_stacks(
                 start = (psf.shape[0] - ch_data.shape[0]) // 2
                 psf = psf[start:start + ch_data.shape[0]]
 
+            psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
+            auto_tile_count = _auto_n_tiles(
+                ch_data.shape,
+                device=params.get("device"),
+                psf_xy_est=psf_xy_est,
+            )
+            if (
+                params["method"] == "ci_rl_dl"
+                and params.get("dl_model_path")
+                and auto_tile_count > 1
+            ):
+                _progress(
+                    f"  Ch{ci}: large ci_rl_dl input will run RL+DL per tile "
+                    f"(RL estimate {auto_tile_count} tiles; DL may choose smaller tiles)."
+                )
+
             gc.collect()
             try:
                 import torch as _torch
@@ -4423,6 +4545,11 @@ def _deconvolve_channel_stacks(
                     **common,
                 )
             elif params["method"] == "ci_rl_dl":
+                compute_reconvolution_diagnostics = bool(
+                    params.get("dl_model_path")
+                    and (movie_recorder is not None or _live_cb is not None)
+                    and auto_tile_count <= 1
+                )
                 out = deconvolve_ci_rl_dl(
                     ch_data,
                     psf,
@@ -4443,6 +4570,7 @@ def _deconvolve_channel_stacks(
                         "batch_size": params["dl_batch_size"],
                         "mixed_precision": params["dl_mixed_precision"],
                         "residual_strength": params["dl_residual_strength"],
+                        "compute_reconvolution_diagnostics": compute_reconvolution_diagnostics,
                     },
                     return_diagnostics=True,
                 )
@@ -4483,7 +4611,7 @@ def _deconvolve_channel_stacks(
                 f"  Ch{ci}: done in {_format_duration(time.time() - t_deconv)} "
                 f"(iterations used={iterations_used}{conv_text})"
             )
-            results.append(_solver_output_to_zyx(out["result"].copy()))
+            results.append(_solver_output_to_zyx(out["result"]))
 
             del psf
             del out
@@ -4574,6 +4702,85 @@ def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict) -> None:
     sink.build_pyramids()
     sink.validate()
     sink.close()
+
+
+class _SavePreviewWorker(QThread):
+    """Save a single preview/export target without blocking the GUI."""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(str)
+
+    def __init__(self, job: dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.job = dict(job)
+
+    def run(self):
+        started = time.time()
+        try:
+            kind = str(self.job.get("kind", ""))
+            if kind == "ome_tiff":
+                path = Path(str(self.job["path"]))
+                self.progress.emit(f"Saving OME-TIFF preview to {path}")
+                _write_ome_tiff(self.job["data"], path, dict(self.job.get("metadata") or {}))
+                size_mb = path.stat().st_size / (1024 * 1024) if path.exists() else 0.0
+                self.finished.emit({
+                    "ok": True,
+                    "kind": kind,
+                    "path": str(path),
+                    "size_mb": size_mb,
+                    "elapsed": time.time() - started,
+                })
+                return
+            if kind == "ome_zarr":
+                path = Path(str(self.job["path"]))
+                self.progress.emit(f"Saving OME-Zarr preview to {path}")
+                _write_ome_zarr(self.job["data"], path, dict(self.job.get("metadata") or {}))
+                self.finished.emit({
+                    "ok": True,
+                    "kind": kind,
+                    "path": str(path),
+                    "elapsed": time.time() - started,
+                })
+                return
+            if kind == "view_pngs":
+                original_path = Path(str(self.job["original_path"]))
+                decon_path = Path(str(self.job["deconvolved_path"]))
+                self.progress.emit(f"Saving view PNGs to {original_path.parent}")
+                original = self.job["original"]
+                deconvolved = self.job["deconvolved"]
+                if not original.save(str(original_path), "PNG"):
+                    raise RuntimeError(f"Could not write {original_path}")
+                if not deconvolved.save(str(decon_path), "PNG"):
+                    raise RuntimeError(f"Could not write {decon_path}")
+                self.finished.emit({
+                    "ok": True,
+                    "kind": kind,
+                    "path": str(original_path),
+                    "deconvolved_path": str(decon_path),
+                    "elapsed": time.time() - started,
+                })
+                return
+            if kind == "comparison_png":
+                path = Path(str(self.job["path"]))
+                self.progress.emit(f"Saving comparison PNG to {path}")
+                image = self.job["image"]
+                if not image.save(str(path), "PNG"):
+                    raise RuntimeError(f"Could not write {path}")
+                self.finished.emit({
+                    "ok": True,
+                    "kind": kind,
+                    "path": str(path),
+                    "elapsed": time.time() - started,
+                })
+                return
+            raise RuntimeError(f"Unknown save job kind: {kind}")
+        except Exception as exc:
+            self.finished.emit({
+                "ok": False,
+                "kind": str(self.job.get("kind", "")),
+                "error": str(exc),
+                "elapsed": time.time() - started,
+            })
 
 
 class _DeconvolveWorker(QThread):
@@ -6472,6 +6679,13 @@ class _BatchDeconvolverDialog(QDialog):
     def _start_batch(self) -> None:
         if self._worker is not None:
             return
+        if self._host._operation_busy():
+            QMessageBox.information(
+                self,
+                "Operation running",
+                "Wait for the current GUI operation to finish before starting a batch.",
+            )
+            return
         if not self._items:
             QMessageBox.information(self, "Batch Deconvolver", "Add at least one image first.")
             return
@@ -6526,6 +6740,7 @@ class _BatchDeconvolverDialog(QDialog):
         self._worker.log.connect(self._host._log)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+        self._host._set_operation_state("Batch", message="Batch running...")
 
     def _stop_batch(self) -> None:
         if self._worker is not None:
@@ -6552,6 +6767,7 @@ class _BatchDeconvolverDialog(QDialog):
     def _on_worker_finished(self, result: object) -> None:
         self._worker = None
         self._set_running(False)
+        self._host._set_operation_state("Idle")
         _release_cuda_memory(synchronize=True)
         self._batch_timer.stop()
         self._batch_finished_at = time.time()
@@ -6603,7 +6819,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._preview_outputs_by_t: dict[int, list[np.ndarray]] = {}
         self._metadata: dict = {}
         self._worker: Optional[_DeconvolveWorker] = None
+        self._load_worker: Optional[_TimepointLoadWorker] = None
+        self._load_generation = 0
+        self._queued_load_timepoint: Optional[int] = None
+        self._initial_load_context: Optional[dict[str, Any]] = None
         self._save_worker: Optional[_SaveTSeriesWorker] = None
+        self._preview_save_worker: Optional[_SavePreviewWorker] = None
         self._fit_psf_worker: Optional[_FitPsfWorker] = None
         self._fit_psf_started_at: Optional[float] = None
         self._monitor: Optional[_ResourceMonitor] = None
@@ -6638,6 +6859,8 @@ class DeconvolveCIWindow(QMainWindow):
         self._current_run_params: dict[str, Any] = {}
         self._current_run_kind: str = "Preview"
         self._movie_default_path: Optional[str] = None
+        self._operation_state = "Idle"
+        self._operation_started_at: Optional[float] = None
         self._omero_gw = None  # OmeroGateway instance (lazy)
         self._omero_session_deadline: float = 0.0
         self._excitation_saved: str = "488"  # remembered when field is disabled
@@ -7547,6 +7770,19 @@ class DeconvolveCIWindow(QMainWindow):
         self._run_step_label.setMinimumWidth(300)
         self._run_step_label.setToolTip("Current run status")
         middle_layout.addWidget(self._run_step_label)
+        self._operation_badge = QLabel("Idle")
+        self._operation_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._operation_badge.setMinimumWidth(92)
+        self._operation_badge.setToolTip("Current GUI operation")
+        self._operation_badge.setStyleSheet(
+            "QLabel { border: 1px solid #3d4248; border-radius: 4px; padding: 3px 8px; color: #cfd6dd; }"
+        )
+        middle_layout.addWidget(self._operation_badge)
+        self._btn_cancel_loading = QPushButton("Cancel")
+        self._btn_cancel_loading.setToolTip("Cancel the current image/timepoint load when safe")
+        self._btn_cancel_loading.setVisible(False)
+        self._btn_cancel_loading.clicked.connect(self._cancel_loading)
+        middle_layout.addWidget(self._btn_cancel_loading)
         self._run_elapsed_timer = QTimer(self)
         self._run_elapsed_timer.setInterval(1000)
         self._run_elapsed_timer.timeout.connect(self._update_run_elapsed_label)
@@ -7644,6 +7880,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._install_shortcuts()
         self._refresh_recent_menu()
         self._refresh_run_history_table()
+        self._set_operation_state("Idle")
 
     # -----------------------------------------------------------------------
     # Persistent GUI state, recents, metadata confidence, run history
@@ -8052,14 +8289,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._status.showMessage(msg)
         self._log(msg)
         lower = msg.lower()
-        if "psf" in lower:
+        if "decon" in lower or "iteration" in lower or "channel" in lower or "tile" in lower:
+            self._set_run_step("Deconvolve")
+        elif "psf" in lower:
             self._set_run_step("PSF")
         elif "metric" in lower:
             self._set_run_step("Metrics")
         elif "save" in lower or "writ" in lower or "export" in lower:
             self._set_run_step("Save")
-        elif "decon" in lower or "iteration" in lower or "channel" in lower:
-            self._set_run_step("Deconvolve")
 
     # -----------------------------------------------------------------------
     # Slots — control panel
@@ -8273,6 +8510,78 @@ class DeconvolveCIWindow(QMainWindow):
     def _end_progress(self) -> None:
         self._progress.setVisible(False)
 
+    def _set_operation_state(self, state: str, *, message: str = "") -> None:
+        self._operation_state = str(state or "Idle")
+        self._operation_started_at = None if self._operation_state == "Idle" else time.time()
+        if hasattr(self, "_operation_badge"):
+            self._operation_badge.setText(self._operation_state)
+            colors = {
+                "Idle": ("#3d4248", "#cfd6dd"),
+                "Loading": ("#2563eb", "#dbeafe"),
+                "Rendering": ("#7c3aed", "#ede9fe"),
+                "Deconvolving": ("#16803c", "#dcfce7"),
+                "Saving": ("#b45309", "#ffedd5"),
+                "Batch": ("#0f766e", "#ccfbf1"),
+                "Streaming": ("#0e7490", "#cffafe"),
+            }
+            border, text = colors.get(self._operation_state, ("#3d4248", "#cfd6dd"))
+            self._operation_badge.setStyleSheet(
+                "QLabel { "
+                f"border: 1px solid {border}; border-radius: 4px; padding: 3px 8px; "
+                f"color: {text}; font-weight: 700; "
+                "}"
+            )
+        if hasattr(self, "_btn_cancel_loading"):
+            self._btn_cancel_loading.setVisible(self._operation_state == "Loading")
+        if message:
+            self._status.showMessage(message)
+        self._update_operation_controls()
+
+    def _operation_busy(self) -> bool:
+        return self._operation_state not in ("Idle", "")
+
+    def _update_operation_controls(self) -> None:
+        if not hasattr(self, "_btn_run"):
+            return
+        state = self._operation_state
+        busy = self._operation_busy()
+        has_input = bool(self._input_channels)
+        has_preview = self._viewer.current_timepoint() in self._preview_outputs_by_t if hasattr(self, "_viewer") else False
+        streamed_pyramid = self._is_streamed_omero_pyramid_source() if hasattr(self, "_input_source") else False
+        worker_running = self._worker is not None and self._worker.isRunning()
+        fit_worker_running = self._fit_psf_worker is not None and self._fit_psf_worker.isRunning()
+        self._btn_run.setEnabled(
+            (has_input and state == "Idle")
+            or (state in ("Deconvolving", "Streaming") and worker_running)
+        )
+        self._btn_fit_psf.setEnabled(
+            (has_input and state == "Idle" and not streamed_pyramid)
+            or (state == "Deconvolving" and fit_worker_running)
+        )
+        self._btn_save_series.setEnabled(
+            has_input and state == "Idle" and self._viewer.has_time_axis() and not streamed_pyramid
+        )
+        self._btn_save.setEnabled(has_preview and state == "Idle")
+        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr", "_act_save_views", "_act_save_comparison"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(has_preview and state == "Idle")
+        for widget_name in ("_open_button", "_recent_button", "_settings_button", "_recent_settings_button"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(not busy)
+
+    def _cancel_loading(self) -> None:
+        if self._load_worker is None or not self._load_worker.isRunning():
+            return
+        self._queued_load_timepoint = None
+        self._initial_load_context = None
+        self._load_generation += 1
+        self._load_worker.requestInterruption()
+        self._log("Loading cancellation requested; waiting for the reader to reach a safe checkpoint.")
+        self._status.showMessage("Cancelling load...", 5000)
+        self._btn_cancel_loading.setEnabled(False)
+
     def _restore_last_browse_dirs(self) -> None:
         """Restore lightweight browse roots that should apply at startup."""
         try:
@@ -8332,6 +8641,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._batch_dialog.activateWindow()
 
     def _on_open_leica(self):
+        if self._operation_busy() and self._operation_state != "Loading":
+            self._status.showMessage("Wait for the current operation to finish.", 5000)
+            return
+        if self._load_worker is not None and self._load_worker.isRunning():
+            self._status.showMessage("Wait for the current image load to finish, or cancel it first.", 5000)
+            return
         try:
             from leica_browser_qt import LeicaBrowserDialog
         except ImportError:
@@ -8374,15 +8689,22 @@ class DeconvolveCIWindow(QMainWindow):
                 source_path=Path(context.container_path),
                 source_factory=lambda _context=context: _build_leica_source(_context),
             )
-            self._log(f"Open complete in {_format_duration(time.time() - t_open)}")
+            self._log(f"Open metadata complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
             self._log(f"Leica load failed: {exc}")
             QMessageBox.critical(self, "Leica Load Error", str(exc))
             self._status.showMessage("Leica load failed", 5000)
         finally:
-            self._end_progress()
+            if self._load_worker is None or not self._load_worker.isRunning():
+                self._end_progress()
 
     def _do_load(self, path: str):
+        if self._operation_busy() and self._operation_state != "Loading":
+            self._status.showMessage("Wait for the current operation to finish.", 5000)
+            return
+        if self._load_worker is not None and self._load_worker.isRunning():
+            self._status.showMessage("Wait for the current image load to finish, or cancel it first.", 5000)
+            return
         self._reset_log(f"CIDeconvolve GUI log — opening {Path(path).name}")
         self._log(f"Opening source: {path}")
         t_open = time.time()
@@ -8400,13 +8722,14 @@ class DeconvolveCIWindow(QMainWindow):
                 source_path=Path(path),
                 source_factory=lambda _path=str(path): _build_file_source(_path),
             )
-            self._log(f"Open complete in {_format_duration(time.time() - t_open)}")
+            self._log(f"Open metadata complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
             self._log(f"Load failed: {exc}")
             QMessageBox.critical(self, "Load Error", str(exc))
             self._status.showMessage("Load failed", 5000)
         finally:
-            self._end_progress()
+            if self._load_worker is None or not self._load_worker.isRunning():
+                self._end_progress()
 
     def _apply_image_source(
         self,
@@ -8504,14 +8827,26 @@ class DeconvolveCIWindow(QMainWindow):
         finally:
             self._applying_metadata_to_fields = False
 
-        self._viewer.set_input_data([], self._metadata)
-        self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
-        self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
         size_t = self._metadata.get("size_t", 1)
         size_z = self._metadata.get("size_z", 1)
         size_y = self._metadata.get("size_y", "?")
         size_x = self._metadata.get("size_x", "?")
         source_is_pyramidal = bool(getattr(source, "is_pyramidal", False))
+        n_ch = int(self._metadata.get("size_c", 0))
+        try:
+            estimated_timepoint_gb = (
+                max(n_ch, 1)
+                * max(int(size_z), 1)
+                * max(int(size_y), 1)
+                * max(int(size_x), 1)
+                * 4
+                / (1024 ** 3)
+            )
+            estimated_total_gb = max(int(size_t), 1) * estimated_timepoint_gb
+        except (TypeError, ValueError):
+            estimated_timepoint_gb = 0.0
+            estimated_total_gb = 0.0
+        large_image_mode = source_is_pyramidal or estimated_timepoint_gb >= 2.0
         if source_is_pyramidal:
             provider = getattr(source, "tile_provider", None)
             full_size = provider.full_size() if provider is not None else (size_y, size_x)
@@ -8523,31 +8858,33 @@ class DeconvolveCIWindow(QMainWindow):
             self._log(
                 "Run Deconvolution will stream full-resolution tiles directly to OME-Zarr."
             )
+        elif large_image_mode:
+            self._log(
+                f"Large image mode: estimated loaded timepoint size is {estimated_timepoint_gb:.2f} GB "
+                f"(full series {estimated_total_gb:.2f} GB); "
+                "showing metadata first and rendering a lightweight slice preview."
+            )
 
-        n_ch = int(self._metadata.get("size_c", 0))
-        self._file_label.setText(display_name)
+        self._file_label.setText(f"{display_name}  [Large image mode]" if large_image_mode else display_name)
         self._file_label.setToolTip(
             f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
-        self._btn_run.setEnabled(True)
-        self._btn_fit_psf.setEnabled(not source_is_pyramidal)
-        self._btn_save_series.setEnabled(self._viewer.has_time_axis() and not source_is_pyramidal)
+        self._btn_run.setEnabled(False)
+        self._btn_fit_psf.setEnabled(False)
+        self._btn_save_series.setEnabled(False)
         self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
-        self._btn_save.setEnabled(False)
         self._sync_preview_buttons()
-        if source_is_pyramidal:
-            self._btn_fit_psf.setEnabled(False)
+        self._viewer.set_input_data([], self._metadata)
         self._viewer.refresh_view()
         self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
-        self._maybe_load_default_ci_rl_dl_model()
-        if source_path is not None:
-            kind = "zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file"
-            self._remember_recent_source(kind, display_name, source_path)
-        elif display_name.startswith("OMERO:"):
-            self._remember_recent_source("omero", display_name)
         self._set_default_movie_output_path(display_name, source_path)
-        self._status.showMessage(f"Loaded {display_name}", 5000)
+        self._initial_load_context = {
+            "display_name": display_name,
+            "source_path": source_path,
+            "source_is_pyramidal": source_is_pyramidal,
+        }
+        self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
 
     def _default_movie_output_path(self, display_name: str, source_path: Optional[Path]) -> str:
         if source_path is not None:
@@ -8572,6 +8909,12 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_open_omero(self):
+        if self._operation_busy() and self._operation_state != "Loading":
+            self._status.showMessage("Wait for the current operation to finish.", 5000)
+            return
+        if self._load_worker is not None and self._load_worker.isRunning():
+            self._status.showMessage("Wait for the current image load to finish, or cancel it first.", 5000)
+            return
         try:
             from omero_browser_qt import (
                 LoginDialog,
@@ -8637,13 +8980,14 @@ class DeconvolveCIWindow(QMainWindow):
                 f"OMERO: {name}",
                 source_factory=lambda _image=image: _build_omero_source(_image),
             )
-            self._log(f"Open complete in {_format_duration(time.time() - t_open)}")
+            self._log(f"Open metadata complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
             self._log(f"OMERO load failed: {exc}")
             QMessageBox.critical(self, "OMERO Error", str(exc))
             self._status.showMessage("OMERO load failed", 5000)
         finally:
-            self._end_progress()
+            if self._load_worker is None or not self._load_worker.isRunning():
+                self._end_progress()
 
     # -----------------------------------------------------------------------
     # Run deconvolution
@@ -8854,6 +9198,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._begin_busy_progress("Streaming OMERO deconvolution ...")
+        self._set_operation_state("Streaming", message="Streaming OMERO deconvolution...")
         self._current_run_params = self._settings_to_dict()
         self._begin_run_timeline("Streaming")
         self._monitor_bar.set_active(True)
@@ -8873,6 +9218,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._worker.finished.connect(self._on_deconv_done)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+        self._update_operation_controls()
 
     def _on_run(self):
         # --- Stop mode: cancel running worker ---
@@ -8891,6 +9237,13 @@ class DeconvolveCIWindow(QMainWindow):
                 "A full T-series export is currently running. Please wait for it to finish first.",
             )
             return
+        if self._preview_save_worker is not None and self._preview_save_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Save in progress",
+                "A preview export is currently running. Please wait for it to finish first.",
+            )
+            return
 
         if not self._input_channels:
             return
@@ -8907,6 +9260,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._begin_busy_progress("Running deconvolution …")
+        self._set_operation_state("Deconvolving", message="Running deconvolution...")
         self._current_run_params = self._settings_to_dict()
         self._begin_run_timeline("Preview")
 
@@ -8932,6 +9286,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._btn_run.setEnabled(True)
                 self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
                 self._finish_run_timeline("Idle")
+                self._set_operation_state("Idle")
                 QMessageBox.warning(self, "Movie Export", "Choose an MP4 output path before running.")
                 return
             try:
@@ -8948,6 +9303,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._btn_run.setEnabled(True)
                 self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
                 self._finish_run_timeline("Idle")
+                self._set_operation_state("Idle")
                 QMessageBox.warning(
                     self,
                     "Movie Export",
@@ -8976,6 +9332,7 @@ class DeconvolveCIWindow(QMainWindow):
         movie_params = params.get("movie") or {}
         self._live_log_scale = bool(movie_params.get("convergence_log_scale", False))
         self._worker.start()
+        self._update_operation_controls()
 
     def _on_deconv_done(self, result):
         self._monitor_bar.set_active(False)
@@ -9009,6 +9366,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._status.showMessage("Deconvolution failed", 5000)
                 self._finish_run_timeline("Failed")
                 self._add_run_history("Failed", message=msg)
+            self._set_operation_state("Idle")
             return
 
         try:
@@ -9026,6 +9384,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._status.showMessage(f"Streaming deconvolution complete → {Path(output_path).name}", 8000)
                 self._finish_run_timeline("Done")
                 self._add_run_history("Done", output_path=output_path)
+                self._set_operation_state("Idle")
                 return
 
             timepoint = int(result["timepoint"])
@@ -9067,6 +9426,7 @@ class DeconvolveCIWindow(QMainWindow):
             QMessageBox.critical(self, "Viewer Error", str(exc))
         finally:
             self._worker = None
+            self._set_operation_state("Idle")
 
     # -----------------------------------------------------------------------
     # Live chart updates from worker thread
@@ -9163,7 +9523,7 @@ class DeconvolveCIWindow(QMainWindow):
             "QPushButton { background-color: #e53935; color: white; "
             "font-weight: bold; }"
         )
-        self._btn_run.setEnabled(False)
+        self._set_operation_state("Deconvolving", message="Fitting PSF...")
         self._sp_fit_niter.setEnabled(False)
         self._fit_psf_started_at = time.time()
         niter_fit = self._sp_fit_niter.value()
@@ -9223,8 +9583,6 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_fit_psf_done(self, result):
         self._btn_fit_psf.setText("Fit PSF\u2026")
         self._btn_fit_psf.setStyleSheet("")
-        self._btn_fit_psf.setEnabled(bool(self._input_channels))
-        self._btn_run.setEnabled(bool(self._input_channels))
         self._sp_fit_niter.setEnabled(True)
         self._fit_psf_started_at = None
 
@@ -9279,6 +9637,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._log(f"PSF fit result display error: {exc}")
         finally:
             self._fit_psf_worker = None
+            self._set_operation_state("Idle")
 
     def _render_psf_fit_heatmap(self, result: dict):
         """Render a PSF fitting heatmap and display it in the decon viewer pane."""
@@ -9422,6 +9781,51 @@ class DeconvolveCIWindow(QMainWindow):
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
         return f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t:03d}"
 
+    def _start_preview_save(self, job: dict[str, Any]) -> None:
+        if self._preview_save_worker is not None and self._preview_save_worker.isRunning():
+            QMessageBox.information(self, "Save in progress", "A preview export is already running.")
+            return
+        self._set_operation_state("Saving", message="Saving preview export...")
+        self._begin_busy_progress("Saving preview export...")
+        self._preview_save_worker = _SavePreviewWorker(job, parent=self)
+        self._preview_save_worker.progress.connect(self._on_worker_progress)
+        self._preview_save_worker.finished.connect(self._on_preview_save_done)
+        self._preview_save_worker.finished.connect(self._preview_save_worker.deleteLater)
+        self._preview_save_worker.start()
+
+    def _on_preview_save_done(self, result: object) -> None:
+        self._end_progress()
+        self._preview_save_worker = None
+        payload = result if isinstance(result, dict) else {}
+        kind = str(payload.get("kind", "export"))
+        if not payload.get("ok"):
+            msg = str(payload.get("error") or "Save failed")
+            self._log(f"{kind} save failed: {msg}")
+            QMessageBox.critical(self, "Save Error", msg)
+            self._status.showMessage("Save failed", 5000)
+            self._set_operation_state("Idle")
+            return
+
+        elapsed = _format_duration(float(payload.get("elapsed", 0.0)))
+        path = Path(str(payload.get("path", "")))
+        if kind == "ome_tiff":
+            self._log(
+                f"Saved OME-TIFF preview in {elapsed} "
+                f"({_format_bytes(float(payload.get('size_mb', 0.0)))})"
+            )
+            self._status.showMessage(f"Saved -> {path.name}", 5000)
+        elif kind == "ome_zarr":
+            self._log(f"Saved OME-Zarr preview in {elapsed}")
+            self._status.showMessage(f"Saved -> {path.name}", 5000)
+        elif kind == "view_pngs":
+            decon_path = Path(str(payload.get("deconvolved_path", "")))
+            self._log(f"Saved view PNGs: {path} and {decon_path}")
+            self._status.showMessage(f"Saved view PNGs -> {path.name}, {decon_path.name}", 5000)
+        elif kind == "comparison_png":
+            self._log(f"Saved comparison view: {path}")
+            self._status.showMessage(f"Saved comparison -> {path.name}", 4000)
+        self._set_operation_state("Idle")
+
     def _on_save(self):
         try:
             current_t, data, metadata = self._current_preview_export_data()
@@ -9439,17 +9843,8 @@ class DeconvolveCIWindow(QMainWindow):
         if not path:
             return
         self._last_save_dir = str(Path(path).parent)
-
-        try:
-            t_save = time.time()
-            self._log(f"Saving OME-TIFF preview to {path}")
-            _write_ome_tiff(data, path, metadata)
-            size = Path(path).stat().st_size / (1024 * 1024) if Path(path).exists() else 0.0
-            self._log(f"Saved OME-TIFF preview in {_format_duration(time.time() - t_save)} ({_format_bytes(size)})")
-            self._status.showMessage(f"Saved → {Path(path).name}", 5000)
-        except Exception as exc:
-            self._log(f"Save failed: {exc}")
-            QMessageBox.critical(self, "Save Error", str(exc))
+        self._log(f"Saving OME-TIFF preview to {path}")
+        self._start_preview_save({"kind": "ome_tiff", "path": path, "data": data, "metadata": metadata})
 
     def _on_save_zarr(self) -> None:
         try:
@@ -9484,15 +9879,8 @@ class DeconvolveCIWindow(QMainWindow):
             else:
                 out.unlink()
         self._last_save_dir = str(out.parent)
-        try:
-            t_save = time.time()
-            self._log(f"Saving OME-Zarr preview to {out}")
-            _write_ome_zarr(data, out, metadata)
-            self._log(f"Saved OME-Zarr preview in {_format_duration(time.time() - t_save)}")
-            self._status.showMessage(f"Saved → {out.name}", 5000)
-        except Exception as exc:
-            self._log(f"OME-Zarr save failed: {exc}")
-            QMessageBox.critical(self, "Save OME-Zarr Error", str(exc))
+        self._log(f"Saving OME-Zarr preview to {out}")
+        self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
 
     def _on_save_view(self):
         current_t = self._viewer.current_timepoint()
@@ -9525,7 +9913,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir = str(original_path.parent)
 
         try:
-            QApplication.processEvents()
             images = self._viewer.current_view_images()
             original = images.get("original")
             deconvolved = images.get("deconvolved")
@@ -9533,12 +9920,13 @@ class DeconvolveCIWindow(QMainWindow):
                 raise RuntimeError("Could not render the current original viewer pane.")
             if deconvolved is None or deconvolved.isNull():
                 raise RuntimeError("Could not render the current deconvolved viewer pane.")
-            if not original.save(str(original_path), "PNG"):
-                raise RuntimeError(f"Could not write {original_path}")
-            if not deconvolved.save(str(decon_path), "PNG"):
-                raise RuntimeError(f"Could not write {decon_path}")
-            self._log(f"Saved view PNGs: {original_path} and {decon_path}")
-            self._status.showMessage(f"Saved view PNGs → {original_path.name}, {decon_path.name}", 5000)
+            self._start_preview_save({
+                "kind": "view_pngs",
+                "original_path": str(original_path),
+                "deconvolved_path": str(decon_path),
+                "original": original.copy(),
+                "deconvolved": deconvolved.copy(),
+            })
         except Exception as exc:
             self._log(f"Save view failed: {exc}")
             QMessageBox.critical(self, "Save View Error", str(exc))
@@ -9571,11 +9959,7 @@ class DeconvolveCIWindow(QMainWindow):
         if out.suffix.lower() != ".png":
             out = out.with_suffix(".png")
         self._last_save_dir = str(out.parent)
-        if not image.save(str(out), "PNG"):
-            QMessageBox.critical(self, "Save Comparison", f"Could not save {out}")
-            return
-        self._log(f"Saved comparison view: {out}")
-        self._status.showMessage(f"Saved comparison → {out.name}", 4000)
+        self._start_preview_save({"kind": "comparison_png", "path": str(out), "image": image.copy()})
 
     def _on_save_t_series(self):
         if not self._input_channels:
@@ -9613,6 +9997,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._save_last_settings()
         self._begin_busy_progress("Saving full T-series …")
+        self._set_operation_state("Saving", message="Saving full T-series...")
         self._btn_run.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._btn_save.setEnabled(False)
@@ -9629,9 +10014,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._monitor_bar.set_active(False)
             self._set_log_running(False)
             self._end_progress()
-            self._btn_run.setEnabled(bool(self._input_channels))
-            self._sync_preview_buttons()
-            self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+            self._set_operation_state("Idle")
             return
 
         params = self._collect_params()
@@ -9641,9 +10024,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._monitor_bar.set_active(False)
             self._set_log_running(False)
             self._end_progress()
-            self._btn_run.setEnabled(bool(self._input_channels))
-            self._sync_preview_buttons()
-            self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+            self._set_operation_state("Idle")
             QMessageBox.critical(self, "Save Error", str(exc))
             return
 
@@ -9663,10 +10044,8 @@ class DeconvolveCIWindow(QMainWindow):
         self._monitor_bar.set_active(False)
         self._set_log_running(False)
         self._end_progress()
-        self._btn_run.setEnabled(bool(self._input_channels))
-        self._sync_preview_buttons()
-        self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
         self._save_worker = None
+        self._set_operation_state("Idle")
 
         if isinstance(result, Exception):
             msg = str(result)
@@ -9973,6 +10352,10 @@ class DeconvolveCIWindow(QMainWindow):
         target_t = max(0, min(int(timepoint), max(int(self._metadata.get("size_t", 1)) - 1, 0)))
         if not force and self._loaded_timepoint == target_t and self._input_channels:
             return
+        if self._load_worker is not None and self._load_worker.isRunning():
+            self._queued_load_timepoint = target_t
+            self._status.showMessage(f"Queued T={target_t + 1}; current load will finish or be ignored.", 5000)
+            return
 
         size_z = max(int(self._metadata.get("size_z", 1)), 1)
         size_c = max(int(self._metadata.get("size_c", 1)), 1)
@@ -9989,34 +10372,114 @@ class DeconvolveCIWindow(QMainWindow):
         else:
             self._begin_busy_progress(f"Loading T={target_t + 1}…")
 
-        try:
-            t_load = time.time()
-            channels = self._input_source.load_timepoint(
-                target_t,
-                progress_cb=lambda done, total_steps, text: (
-                    self._advance_progress(done, text),
-                    self._log(text),
-                ),
-            )
-            self._input_channels = channels
-            self._loaded_timepoint = target_t
-            self._viewer.set_input_timepoint_data(target_t, channels)
-            if is_omero_pyramid:
-                provider = getattr(self._input_source, "tile_provider", None)
-                if provider is not None:
-                    self._viewer.set_tiled_input_provider(provider)
-            self._log(f"Loaded timepoint T={target_t + 1} in {_format_duration(time.time() - t_load)}")
-        finally:
-            self._end_progress()
+        self._load_generation += 1
+        self._load_started_at = time.time()
+        use_factory = (
+            self._input_source_factory
+            if self._input_source_factory is not None
+            and not isinstance(self._input_source, _OmeroTimepointSource)
+            else None
+        )
+        self._load_worker = _TimepointLoadWorker(
+            self._input_source,
+            target_t,
+            self._load_generation,
+            source_factory=use_factory,
+            parent=self,
+        )
+        self._load_worker.progress.connect(self._on_timepoint_load_progress)
+        self._load_worker.finished.connect(self._on_timepoint_load_finished)
+        self._set_operation_state("Loading", message=f"Loading T={target_t + 1}...")
+        if hasattr(self, "_btn_cancel_loading"):
+            self._btn_cancel_loading.setEnabled(True)
+        self._load_worker.start()
+
+    def _on_timepoint_load_progress(self, done: int, total: int, text: str) -> None:
+        if self._progress.maximum() > 0 and total > 0 and self._progress.maximum() != total:
+            self._progress.setMaximum(total)
+        self._advance_progress(done, text)
+        self._log(text)
+
+    def _on_timepoint_load_finished(self, result: object) -> None:
+        worker = self._load_worker
+        self._load_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._end_progress()
+
+        payload = result if isinstance(result, dict) else {}
+        generation = int(payload.get("generation", -1))
+        if generation != self._load_generation:
+            self._set_operation_state("Idle")
+            return
+
+        target_t = int(payload.get("timepoint", 0))
+        context = self._initial_load_context
+        queued_t = self._queued_load_timepoint
+        if queued_t is not None and queued_t != target_t:
+            self._queued_load_timepoint = None
+            self._log(f"Skipping loaded T={target_t + 1}; loading latest requested T={queued_t + 1}.")
+            self._load_timepoint_into_viewer(queued_t, force=True)
+            return
+        self._queued_load_timepoint = None
+        self._initial_load_context = None
+        if not payload.get("ok"):
+            if payload.get("cancelled"):
+                self._log("Loading cancelled.")
+                self._status.showMessage("Loading cancelled", 5000)
+                self._set_operation_state("Idle")
+                return
+            message = str(payload.get("error") or "Unknown load error")
+            self._log(f"Load failed: {message}")
+            QMessageBox.critical(self, "Load Error", message)
+            self._status.showMessage("Load failed", 5000)
+            self._set_operation_state("Idle")
+            return
+
+        channels = list(payload.get("channels") or [])
+        self._input_channels = channels
+        self._loaded_timepoint = target_t
+        self._set_operation_state("Rendering", message=f"Rendering T={target_t + 1}...")
+        self._viewer.set_input_timepoint_data(target_t, channels)
+
+        is_omero_pyramid = (
+            isinstance(self._input_source, _OmeroTimepointSource)
+            and bool(getattr(self._input_source, "is_pyramidal", False))
+        )
+        if is_omero_pyramid:
+            provider = getattr(self._input_source, "tile_provider", None)
+            if provider is not None:
+                self._viewer.set_tiled_input_provider(provider)
+
+        elapsed = time.time() - getattr(self, "_load_started_at", time.time())
+        self._log(f"Loaded timepoint T={target_t + 1} in {_format_duration(elapsed)}")
+
+        if context is not None:
+            display_name = str(context.get("display_name") or "Image")
+            source_path = context.get("source_path")
+            if source_path is not None and not isinstance(source_path, Path):
+                source_path = Path(str(source_path))
+            source_is_pyramidal = bool(context.get("source_is_pyramidal", False))
+            self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
+            self._btn_run.setEnabled(True)
+            self._btn_fit_psf.setEnabled(not source_is_pyramidal)
+            self._btn_save_series.setEnabled(self._viewer.has_time_axis() and not source_is_pyramidal)
+            self._btn_save_series.setVisible(self._viewer.has_time_axis())
+            if source_is_pyramidal:
+                self._btn_fit_psf.setEnabled(False)
+            self._maybe_load_default_ci_rl_dl_model()
+            if source_path is not None:
+                kind = "zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file"
+                self._remember_recent_source(kind, display_name, source_path)
+            elif display_name.startswith("OMERO:"):
+                self._remember_recent_source("omero", display_name)
+            self._status.showMessage(f"Loaded {display_name}", 5000)
+
+        self._set_operation_state("Idle")
+        self._sync_preview_buttons()
 
     def _sync_preview_buttons(self) -> None:
-        current_t = self._viewer.current_timepoint()
-        has_preview = current_t in self._preview_outputs_by_t
-        self._btn_save.setEnabled(has_preview)
-        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr", "_act_save_views", "_act_save_comparison"):
-            action = getattr(self, action_name, None)
-            if action is not None:
-                action.setEnabled(has_preview)
+        self._update_operation_controls()
 
     def _on_viewer_cursor_info(self, text: str) -> None:
         if text:
@@ -10063,6 +10526,14 @@ class DeconvolveCIWindow(QMainWindow):
             self._save_worker.requestInterruption()
             self._save_worker.wait(2000)
             self._save_worker = None
+        if self._preview_save_worker is not None and self._preview_save_worker.isRunning():
+            self._preview_save_worker.requestInterruption()
+            self._preview_save_worker.wait(2000)
+            self._preview_save_worker = None
+        if self._load_worker is not None and self._load_worker.isRunning():
+            self._load_worker.requestInterruption()
+            self._load_worker.wait(2000)
+            self._load_worker = None
         if self._monitor is not None:
             self._monitor.request_stop()
             self._monitor = None

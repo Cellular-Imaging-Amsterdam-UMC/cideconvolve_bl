@@ -741,14 +741,20 @@ TILE_MARGIN = 16
 def _get_memory_budget_bytes(device: Optional[str] = None) -> int:
     """Return an estimated safe memory budget in bytes for tiling decisions.
 
-    Uses 55% of total GPU VRAM when CUDA is available, or 50% of available
-    system RAM (capped at 16 GB) for CPU execution.
+    Uses 55% of total GPU VRAM when CUDA is available, capped by current
+    free VRAM so other processes on the same card force smaller tiles.  CPU
+    execution uses 50% of available system RAM (capped at 16 GB).
     """
     dev = _pick_device(device)
     if dev.type == "cuda":
         try:
-            total = torch.cuda.get_device_properties(dev).total_memory
-            return int(total * 0.55)
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(idx).total_memory
+            try:
+                free, _ = torch.cuda.mem_get_info(idx)
+                return int(max(512 * 1024 ** 2, min(total * 0.55, free * 0.80)))
+            except Exception:
+                return int(total * 0.55)
         except Exception:
             return int(8e9 * 0.55)
     else:
@@ -938,8 +944,8 @@ def _ci_deconvolve_tiled(
     )
 
     Z, H, W = image.shape
-    numerator = np.zeros_like(image, dtype=np.float64)
-    denominator = np.zeros(image.shape, dtype=np.float64)
+    numerator = np.zeros_like(image, dtype=np.float32)
+    denominator = np.zeros(image.shape, dtype=np.float32)
 
     total_iterations = 0
     all_convergence: list[float] = []
@@ -969,13 +975,16 @@ def _ci_deconvolve_tiled(
 
         weighted, weight = _blend_tile(tile_cropped, desc)
         ext = desc["extract"]
-        numerator[ext] += weighted.astype(np.float64)
-        denominator[ext] += weight[np.newaxis, :, :].astype(np.float64)
+        numerator[ext] += weighted.astype(np.float32, copy=False)
+        denominator[ext] += weight[np.newaxis, :, :].astype(np.float32, copy=False)
         del tile_img, tile_out, tile_result, tile_cropped, weighted, weight
         _release_cuda_cache()
 
-    denominator = np.maximum(denominator, 1e-12)
-    result = np.clip((numerator / denominator).astype(np.float32), 0, None)
+    np.maximum(denominator, np.float32(1e-12), out=denominator)
+    np.divide(numerator, denominator, out=numerator)
+    np.clip(numerator, 0, None, out=numerator)
+    result = numerator
+    del denominator
     _release_cuda_cache()
     return {
         "result": result,

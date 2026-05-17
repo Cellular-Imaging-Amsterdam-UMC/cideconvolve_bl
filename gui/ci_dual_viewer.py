@@ -11,7 +11,7 @@ import math
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -95,6 +95,7 @@ _VOLUME_METHOD_UI = {
 _INTERPOLATION_TOGGLE_METHODS = set(_VOLUME_METHODS) - {"iso"}
 _MAX_HIST_SAMPLES = 1_000_000
 _MAX_VIEW_PIXELS = 2_000_000
+_MAX_PROJECTION_CACHE_ITEMS = 8
 
 
 def _toolbar_icon(kind: str, color: str = "#9cc8ff", size: int = 18) -> QPixmap:
@@ -1845,6 +1846,105 @@ class _AdvancedScalingWindow(QWidget):
             self._apply_selected_levels(pane="deconvolved", lo=value if edge == "min" else None, hi=value if edge == "max" else None)
 
 
+def _scaling_projection_source(source: Optional[np.ndarray], projection: str) -> Optional[np.ndarray]:
+    if source is None:
+        return None
+    if projection == "SUM":
+        return np.asarray(source).sum(axis=0).astype(np.float64)
+    return source
+
+
+def _scaling_hist_counts(source: Optional[np.ndarray], hist_max: float) -> np.ndarray:
+    if source is None:
+        return np.zeros(512, dtype=np.int64)
+    finite = _finite_sample(np.asarray(source))
+    if finite.size == 0:
+        return np.zeros(512, dtype=np.int64)
+    finite = np.clip(finite, 0.0, hist_max)
+    counts, _ = np.histogram(finite, bins=512, range=(0.0, hist_max))
+    return counts.astype(np.int64, copy=False)
+
+
+def _scaling_max(source: Optional[np.ndarray]) -> float:
+    if source is None:
+        return 0.0
+    arr = np.asarray(source)
+    if arr.size == 0:
+        return 0.0
+    try:
+        max_val = float(np.nanmax(arr))
+    except ValueError:
+        return 0.0
+    return max(max_val, 0.0) if np.isfinite(max_val) else 0.0
+
+
+class _AdvancedScalingPrepWorker(QThread):
+    """Prepare advanced-scaling maxima and histograms off the UI thread."""
+
+    finished = pyqtSignal(object)
+
+    def __init__(
+        self,
+        generation: int,
+        projection: str,
+        originals: list[np.ndarray],
+        deconvolved: list[np.ndarray],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.generation = int(generation)
+        self.projection = str(projection)
+        self.originals = list(originals)
+        self.deconvolved = list(deconvolved)
+
+    def run(self):
+        try:
+            count = max(len(self.originals), len(self.deconvolved))
+            maxima: list[dict[str, float]] = []
+            histograms: list[dict[str, object]] = []
+            for idx in range(count):
+                if self.isInterruptionRequested():
+                    self.finished.emit({
+                        "generation": self.generation,
+                        "projection": self.projection,
+                        "cancelled": True,
+                    })
+                    return
+                original = self.originals[idx] if idx < len(self.originals) else None
+                deconv = self.deconvolved[idx] if idx < len(self.deconvolved) else None
+                original_src = _scaling_projection_source(original, self.projection)
+                deconv_src = _scaling_projection_source(deconv, self.projection)
+                original_max = _scaling_max(original_src)
+                deconv_max = _scaling_max(deconv_src)
+                original_hist_max = max(original_max, 1.0)
+                deconv_hist_max = max(deconv_max, 1.0)
+                maxima.append({
+                    "original": original_max,
+                    "deconvolved": deconv_max,
+                    "shared": max(original_max, deconv_max, 1.0),
+                })
+                histograms.append({
+                    "original_bin_edges": np.linspace(0.0, original_hist_max, 513, dtype=np.float64),
+                    "deconvolved_bin_edges": np.linspace(0.0, deconv_hist_max, 513, dtype=np.float64),
+                    "original": _scaling_hist_counts(original_src, original_hist_max),
+                    "deconvolved": _scaling_hist_counts(deconv_src, deconv_hist_max),
+                    "has_original": original is not None,
+                    "has_deconvolved": deconv is not None,
+                })
+            self.finished.emit({
+                "generation": self.generation,
+                "projection": self.projection,
+                "maxima": maxima,
+                "histograms": histograms,
+            })
+        except Exception as exc:
+            self.finished.emit({
+                "generation": self.generation,
+                "projection": self.projection,
+                "error": str(exc),
+            })
+
+
 class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
     logRequested = pyqtSignal()
@@ -1864,6 +1964,9 @@ class DualViewerWidget(QWidget):
         self._channel_scaling_projection: Optional[str] = None
         self._advanced_scaling_window: Optional[_AdvancedScalingWindow] = None
         self._advanced_scaling_active = False
+        self._advanced_scaling_prep_worker: Optional[_AdvancedScalingPrepWorker] = None
+        self._advanced_scaling_generation = 0
+        self._advanced_scaling_prepared: Optional[dict[str, object]] = None
         self._available_volume_methods = list(_VOLUME_METHODS)
         self._active_volume_method = _VOLUME_METHODS[0]
         self._volume_method_values = {
@@ -1888,6 +1991,7 @@ class DualViewerWidget(QWidget):
         # _hist_cache keying (SUM values are n_z× larger than stack values
         # and need their own histogram range).
         self._sum_cache: dict[int, np.ndarray] = {}
+        self._projection_cache: dict[tuple[int, str], np.ndarray] = {}
         # Debounce timer for 2-D contrast changes: only redraw 300 ms after the
         # last spin-box change, avoiding expensive re-renders on every keystroke.
         self._contrast_2d_timer = QTimer(self)
@@ -2149,9 +2253,7 @@ class DualViewerWidget(QWidget):
     def set_input_data(self, channels: list[np.ndarray], metadata: dict) -> None:
         self._tiled_provider = None
         self._tiled_item = None
-        self._hist_cache.clear()
-        self._max_cache.clear()
-        self._sum_cache.clear()
+        self._clear_view_caches()
         self._input_channels = channels
         self._loaded_input_timepoint = None
         self._metadata = metadata
@@ -2173,6 +2275,10 @@ class DualViewerWidget(QWidget):
         self._z_slider.setMaximum(size_z - 1)
         self._z_slider.setValue(default_z)
         self._z_slider.blockSignals(False)
+        if size_z > 1:
+            self._projection_combo.blockSignals(True)
+            self._projection_combo.setCurrentText("Slice")
+            self._projection_combo.blockSignals(False)
         self._time_bar.setVisible(size_t > 1)
         self._update_labels()
         self._fit_on_next_render = True
@@ -2198,9 +2304,7 @@ class DualViewerWidget(QWidget):
         self._refresh_view()
 
     def set_input_timepoint_data(self, timepoint: int, channels_zyx: list[np.ndarray]) -> None:
-        self._hist_cache.clear()
-        self._max_cache.clear()
-        self._sum_cache.clear()
+        self._clear_view_caches()
         self._input_channels = list(channels_zyx)
         self._loaded_input_timepoint = int(timepoint)
         self._ensure_channel_scaling_defaults()
@@ -2209,9 +2313,7 @@ class DualViewerWidget(QWidget):
         self._refresh_view()
 
     def clear_preview_results(self) -> None:
-        self._hist_cache.clear()
-        self._max_cache.clear()
-        self._sum_cache.clear()
+        self._clear_view_caches()
         self._preview_by_t.clear()
         self._sync_advanced_scaling_window()
         self._refresh_view()
@@ -2229,10 +2331,35 @@ class DualViewerWidget(QWidget):
                 if sum_plane is not None:
                     self._hist_cache.pop(id(sum_plane), None)
                     self._max_cache.pop(id(sum_plane), None)
+                self._projection_cache.pop((key, "MIP"), None)
+                self._projection_cache.pop((key, "SUM"), None)
         self._preview_by_t[int(timepoint)] = channels_zyx
         self._ensure_channel_scaling_defaults()
         self._sync_advanced_scaling_window()
         self._refresh_view()
+
+    def _clear_view_caches(self) -> None:
+        self._hist_cache.clear()
+        self._max_cache.clear()
+        self._sum_cache.clear()
+        self._projection_cache.clear()
+        self._advanced_scaling_generation += 1
+        self._advanced_scaling_prepared = None
+        if self._advanced_scaling_prep_worker is not None and self._advanced_scaling_prep_worker.isRunning():
+            self._advanced_scaling_prep_worker.requestInterruption()
+
+    def _cached_projection(self, stack: np.ndarray, projection: str, z_index: int) -> np.ndarray:
+        if projection == "Slice":
+            return _project_stack(stack, projection, z_index)
+        key = (id(stack), projection)
+        cached = self._projection_cache.get(key)
+        if cached is not None:
+            return cached
+        projected = _project_stack(stack, projection, z_index)
+        self._projection_cache[key] = projected
+        while len(self._projection_cache) > _MAX_PROJECTION_CACHE_ITEMS:
+            self._projection_cache.pop(next(iter(self._projection_cache)))
+        return projected
 
     def current_timepoint(self) -> int:
         return self._t_slider.value()
@@ -2459,37 +2586,64 @@ class DualViewerWidget(QWidget):
         self._ensure_channel_scaling_defaults()
 
     def _ensure_channel_scaling_defaults(self) -> None:
+        compute_maxima = bool(
+            (self._advanced_scaling_active or self._advanced_scaling_window is not None)
+            and self._advanced_scaling_prepared is not None
+        )
         projection = self._active_scaling_projection()
         if self._channel_scaling_projection != projection:
             self._channel_scaling = []
             self._channel_scaling_projection = projection
         channel_count = len(self._display_channels())
+        prepared_maxima = []
+        if compute_maxima and isinstance(self._advanced_scaling_prepared, dict):
+            prepared_maxima = list(self._advanced_scaling_prepared.get("maxima") or [])
+
+        def _prepared_or_scan(idx: int, pane: str) -> float:
+            if idx < len(prepared_maxima):
+                try:
+                    return float(dict(prepared_maxima[idx]).get(pane, 0.0))
+                except (TypeError, ValueError):
+                    pass
+            return self._pane_channel_max_value(idx, pane, projection)
+
         while len(self._channel_scaling) < channel_count:
             idx = len(self._channel_scaling)
+            original_max = _prepared_or_scan(idx, "original") if compute_maxima else 1.0
+            deconvolved_max = _prepared_or_scan(idx, "deconvolved") if compute_maxima else 1.0
             self._channel_scaling.append(
                 {
                     "original": {
                         "min": 0.0,
-                        "max": self._pane_channel_max_value(idx, "original", projection),
+                        "max": original_max,
                     },
                     "deconvolved": {
                         "min": 0.0,
-                        "max": self._pane_channel_max_value(idx, "deconvolved", projection),
+                        "max": deconvolved_max,
                     },
                     "gamma": 1.0,
+                    "_auto_levels": True,
                 }
             )
         if len(self._channel_scaling) > channel_count:
             self._channel_scaling = self._channel_scaling[:channel_count]
         for idx, state in enumerate(self._channel_scaling):
-            original_max = self._pane_channel_max_value(idx, "original", projection)
-            deconvolved_max = self._pane_channel_max_value(idx, "deconvolved", projection)
+            original_max = _prepared_or_scan(idx, "original") if compute_maxima else 1.0
+            deconvolved_max = _prepared_or_scan(idx, "deconvolved") if compute_maxima else 1.0
             if not isinstance(state.get("original"), dict):
                 state["original"] = {"min": 0.0, "max": original_max}
+                state["_auto_levels"] = True
             if not isinstance(state.get("deconvolved"), dict):
                 state["deconvolved"] = {"min": 0.0, "max": deconvolved_max}
+                state["_auto_levels"] = True
             original_state = dict(state.get("original") or {})
             deconvolved_state = dict(state.get("deconvolved") or {})
+            auto_levels = bool(state.get("_auto_levels", False))
+            if compute_maxima and auto_levels:
+                original_state["min"] = 0.0
+                original_state["max"] = original_max
+                deconvolved_state["min"] = 0.0
+                deconvolved_state["max"] = deconvolved_max
             if original_max > 0.0 and float(original_state.get("max", 0.0)) <= 0.0:
                 original_state["max"] = original_max
             if deconvolved_max > 0.0 and float(deconvolved_state.get("max", 0.0)) <= 0.0:
@@ -2524,8 +2678,8 @@ class DualViewerWidget(QWidget):
         if not self._display_channels():
             return
         window = self._ensure_advanced_scaling_window()
-        self._sync_advanced_scaling_window()
         self._set_advanced_scaling_active(True)
+        self._sync_advanced_scaling_window()
         window.show()
         window.raise_()
         window.activateWindow()
@@ -2547,8 +2701,24 @@ class DualViewerWidget(QWidget):
             self._channel_colors[idx] if idx < len(self._channel_colors) else _FALLBACK_PALETTE[idx % len(_FALLBACK_PALETTE)]
             for idx in range(len(channels))
         ]
-        maxima = [self._channel_maxima(idx) for idx in range(len(channels))]
-        histograms = [self._channel_histogram_bundle(idx) for idx in range(len(channels))]
+        prepared = self._advanced_scaling_prepared or {}
+        if prepared.get("projection") == self._active_scaling_projection():
+            maxima = list(prepared.get("maxima") or [])
+            histograms = list(prepared.get("histograms") or [])
+        else:
+            maxima = [{"original": 1.0, "deconvolved": 1.0, "shared": 1.0} for _ in range(len(channels))]
+            histograms = [
+                {
+                    "original_bin_edges": np.array([0.0, 1.0], dtype=np.float64),
+                    "deconvolved_bin_edges": np.array([0.0, 1.0], dtype=np.float64),
+                    "original": np.zeros(1, dtype=np.int64),
+                    "deconvolved": np.zeros(1, dtype=np.int64),
+                    "has_original": False,
+                    "has_deconvolved": False,
+                }
+                for _ in range(len(channels))
+            ]
+            self._start_advanced_scaling_prep()
         window.set_channel_data(
             names,
             colors,
@@ -2557,6 +2727,47 @@ class DualViewerWidget(QWidget):
             maxima,
             histograms,
         )
+
+    def _start_advanced_scaling_prep(self) -> None:
+        projection = self._active_scaling_projection()
+        if (
+            self._advanced_scaling_prep_worker is not None
+            and self._advanced_scaling_prep_worker.isRunning()
+        ):
+            if self._advanced_scaling_prep_worker.projection != projection:
+                self._advanced_scaling_prep_worker.requestInterruption()
+            return
+        self._advanced_scaling_generation += 1
+        preview = self._preview_by_t.get(self.current_timepoint()) or []
+        self._advanced_scaling_prep_worker = _AdvancedScalingPrepWorker(
+            self._advanced_scaling_generation,
+            projection,
+            list(self._input_channels),
+            list(preview),
+            parent=self,
+        )
+        self._advanced_scaling_prep_worker.finished.connect(self._on_advanced_scaling_prep_done)
+        self._advanced_scaling_prep_worker.finished.connect(self._advanced_scaling_prep_worker.deleteLater)
+        self._advanced_scaling_prep_worker.start()
+
+    def _on_advanced_scaling_prep_done(self, result: object) -> None:
+        self._advanced_scaling_prep_worker = None
+        payload = result if isinstance(result, dict) else {}
+        if int(payload.get("generation", -1)) != self._advanced_scaling_generation:
+            if self._advanced_scaling_active and self._advanced_scaling_window is not None:
+                QTimer.singleShot(0, self._sync_advanced_scaling_window)
+            return
+        if payload.get("cancelled"):
+            if self._advanced_scaling_active and self._advanced_scaling_window is not None:
+                QTimer.singleShot(0, self._sync_advanced_scaling_window)
+            return
+        if payload.get("error"):
+            return
+        self._advanced_scaling_prepared = payload
+        self._ensure_channel_scaling_defaults()
+        if self._advanced_scaling_active and self._advanced_scaling_window is not None:
+            self._sync_advanced_scaling_window()
+            self._refresh_view()
 
     def _active_scaling_projection(self) -> str:
         if self._mode_combo.currentText() != _TWO_D_MODE:
@@ -2757,6 +2968,8 @@ class DualViewerWidget(QWidget):
             and self._projection_combo.currentText() == "Slice"
         )
         self._channel_scaling_projection = None
+        self._advanced_scaling_generation += 1
+        self._advanced_scaling_prepared = None
         self._ensure_channel_scaling_defaults()
         self._sync_advanced_scaling_window()
         self._refresh_view()
@@ -2815,6 +3028,7 @@ class DualViewerWidget(QWidget):
                 "max": float(deconvolved.get("max", self._pane_channel_max_value(index, "deconvolved", projection))),
             },
             "gamma": gamma,
+            "_auto_levels": False,
         }
         self._on_contrast_changed()
 
@@ -2852,6 +3066,7 @@ class DualViewerWidget(QWidget):
                 "max": float(min(max(deconvolved_hi, deconvolved_lo), deconvolved_max)),
             },
             "gamma": gamma,
+            "_auto_levels": False,
         }
         self._sync_advanced_scaling_window()
         self._on_contrast_changed()
@@ -2869,6 +3084,7 @@ class DualViewerWidget(QWidget):
                 "max": self._pane_channel_max_value(index, "deconvolved", self._active_scaling_projection()),
             },
             "gamma": 1.0,
+            "_auto_levels": False,
         }
         self._sync_advanced_scaling_window()
         self._on_contrast_changed()
@@ -3133,7 +3349,7 @@ class DualViewerWidget(QWidget):
             if idx >= len(channels_zyx):
                 continue
             stack = channels_zyx[idx]
-            plane = _project_stack(stack, projection, self._z_slider.value())
+            plane = self._cached_projection(stack, projection, self._z_slider.value())
             slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         return _composite_to_pixmap(slices)
 
@@ -3149,7 +3365,7 @@ class DualViewerWidget(QWidget):
             if idx >= len(channels_zyx):
                 continue
             stack = channels_zyx[idx]
-            plane = _project_stack(stack, projection, self._z_slider.value())
+            plane = self._cached_projection(stack, projection, self._z_slider.value())
             slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         return _rgb_to_qimage(_composite_to_rgb(slices))
 
@@ -3165,7 +3381,7 @@ class DualViewerWidget(QWidget):
             if idx >= len(channels_zyx):
                 continue
             stack = channels_zyx[idx]
-            plane = _project_stack(stack, projection, self._z_slider.value())
+            plane = self._cached_projection(stack, projection, self._z_slider.value())
             slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         if not slices:
             return np.zeros((0, 0, 3), dtype=np.uint8)
