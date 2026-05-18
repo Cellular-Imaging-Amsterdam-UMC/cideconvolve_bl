@@ -22,6 +22,22 @@ import shutil
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
+_SPEC_DIR = os.path.abspath(SPECPATH)
+_ROOT = os.path.abspath(os.path.join(_SPEC_DIR, os.pardir))
+
+
+def _collect_model_datas():
+    """Return PyInstaller (source, destination) tuples for bundled DL models."""
+    model_root = os.path.join(_ROOT, 'models')
+    if not os.path.isdir(model_root):
+        return []
+    datas = []
+    for dirpath, _, filenames in os.walk(model_root):
+        rel_dir = os.path.relpath(dirpath, model_root)
+        target_dir = 'models' if rel_dir == '.' else os.path.join('models', rel_dir)
+        for filename in filenames:
+            datas.append((os.path.join(dirpath, filename), target_dir))
+    return datas
 
 # ── Collect full PyQt6 ecosystem ──────────────────────────────────────────────
 pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
@@ -87,13 +103,16 @@ leica_datas, leica_binaries, leica_hiddenimports = collect_all('leica_browser_qt
 pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
 
 # ── Resolve exe icon (needs .ico on Windows) ─────────────────────────────────
-_icon = os.path.abspath('gui/icon.ico')
+_icon = os.path.join(_ROOT, 'gui', 'icon.ico')
 if not os.path.exists(_icon):
     raise FileNotFoundError('gui/icon.ico is required for the Windows executable icon')
+_splash_image = os.path.join(_ROOT, 'gui', 'CIDeconvolve-Splash.png')
+if not os.path.exists(_splash_image):
+    raise FileNotFoundError('gui/CIDeconvolve-Splash.png is required for the startup splash screen')
 
 a = Analysis(
-    ['gui/gui_deconvolve_ci.py'],
-    pathex=['.', 'gui'],
+    [os.path.join(_ROOT, 'gui', 'gui_deconvolve_ci.py')],
+    pathex=[_ROOT, os.path.join(_ROOT, 'gui')],
     binaries=(
         pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
         + zarr_binaries + numcodecs_binaries
@@ -109,8 +128,8 @@ a = Analysis(
         + bioio_cz_binaries + bioio_nd_binaries
     ),
     datas=[
-        ('gui/icon.svg', '.'),      # runtime window icon (loaded by the app)
-        ('gui/icon.ico', '.'),      # Windows executable icon
+        (os.path.join(_ROOT, 'gui', 'icon.svg'), '.'),      # runtime window icon (loaded by the app)
+        (os.path.join(_ROOT, 'gui', 'icon.ico'), '.'),      # Windows executable icon
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
@@ -122,7 +141,8 @@ a = Analysis(
       + imc_datas
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
-      + bioio_cz_datas + bioio_nd_datas,
+      + bioio_cz_datas + bioio_nd_datas
+      + _collect_model_datas(),  # default ci_rl_dl models
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
@@ -247,10 +267,19 @@ a = Analysis(
     noarchive=False,
 )
 
+splash = Splash(
+    _splash_image,
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=None,
+    minify_script=True,
+)
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
+    splash,
     a.scripts,
     [],                         # no binaries/datas embedded — goes into COLLECT
     name='cideconvolve',
@@ -268,6 +297,7 @@ exe = EXE(
 
 coll = COLLECT(
     exe,
+    splash.binaries,
     a.binaries,
     a.zipfiles,
     a.datas,
@@ -290,7 +320,11 @@ if _os.path.isfile(_stale):
 #    dist/cideconvolve/cideconvolve.exe so they can be inspected or replaced
 #    without rebuilding the executable.
 _dist_models = _os.path.join(DISTPATH, 'cideconvolve', 'models')
-if _os.path.isdir(_dist_models):
-    shutil.rmtree(_dist_models)
-shutil.copytree(_os.path.abspath('models'), _dist_models)
-print(f'Copied default DL models: {_dist_models}')
+_src_models = _os.path.join(_ROOT, 'models')
+if _os.path.isdir(_src_models):
+    if _os.path.isdir(_dist_models):
+        shutil.rmtree(_dist_models)
+    shutil.copytree(_src_models, _dist_models)
+    print(f'Copied default DL models: {_dist_models}')
+else:
+    print(f'Skipped default DL models: {_src_models} not found')

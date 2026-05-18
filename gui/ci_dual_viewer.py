@@ -345,6 +345,23 @@ def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
     return qimg.copy()
 
 
+def _montage_qimages(left: QImage, right: QImage, gap: int = 8) -> QImage:
+    """Return a side-by-side montage for original/deconvolved exports."""
+    if left.isNull():
+        return right.copy() if not right.isNull() else QImage()
+    if right.isNull():
+        return left.copy()
+    width = left.width() + right.width() + max(int(gap), 0)
+    height = max(left.height(), right.height())
+    montage = QImage(width, height, QImage.Format.Format_RGB888)
+    montage.fill(QColor(0, 0, 0))
+    painter = QPainter(montage)
+    painter.drawImage(0, (height - left.height()) // 2, left)
+    painter.drawImage(left.width() + max(int(gap), 0), (height - right.height()) // 2, right)
+    painter.end()
+    return montage
+
+
 def _composite_to_pixmap(
     slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
 ) -> QPixmap:
@@ -2427,8 +2444,14 @@ class DualViewerWidget(QWidget):
     def current_comparison_image(self) -> QImage:
         """Return the active display-normalized comparison image."""
         self._ensure_channel_scaling_defaults()
+        mode = self._view_mode_text()
         if self._mode_combo.currentText() == _THREE_D_MODE:
             images = self.current_view_images()
+            if mode == "Both":
+                return _montage_qimages(
+                    images.get("original") or QImage(),
+                    images.get("deconvolved") or QImage(),
+                )
             deconvolved = images.get("deconvolved") or QImage()
             if not deconvolved.isNull():
                 return deconvolved
@@ -2436,6 +2459,12 @@ class DualViewerWidget(QWidget):
         preview = self._preview_by_t.get(self.current_timepoint())
         if not preview:
             return QImage()
+        if mode == "Both":
+            images = self.current_view_images()
+            return _montage_qimages(
+                images.get("original") or QImage(),
+                images.get("deconvolved") or QImage(),
+            )
         return _rgb_to_qimage(self._build_compare_rgb(preview, self._projection_combo.currentText()))
 
     def set_lo_percentile(self, value: float) -> None:

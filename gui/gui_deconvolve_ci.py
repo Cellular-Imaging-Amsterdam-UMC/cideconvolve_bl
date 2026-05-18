@@ -3187,6 +3187,13 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class NoWheelTableWidget(QTableWidget):
+    """Table widget that lets wheel scrolling pass to the parent scroll area."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
 # ---------------------------------------------------------------------------
 # Iteration movie helpers
 # ---------------------------------------------------------------------------
@@ -7826,7 +7833,7 @@ class DeconvolveCIWindow(QMainWindow):
         # --- Run history ---
         self._run_history_section = CollapsibleSection("Run History", expanded=False)
         history_layout = self._run_history_section.content_layout()
-        self._run_history_table = QTableWidget(0, 5)
+        self._run_history_table = NoWheelTableWidget(0, 5)
         self._run_history_table.setHorizontalHeaderLabels(["Time", "Image", "Method", "Status", "Output"])
         self._run_history_table.verticalHeader().setVisible(False)
         self._run_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -7959,7 +7966,11 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         save_menu = QMenu(self._btn_save)
         self._act_save_ome_tiff = save_menu.addAction("Save as OME-TIFF\u2026", self._on_save)
+        self._act_save_ome_tiff_mip = save_menu.addAction("Save as MIP Projection OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "MIP"))
+        self._act_save_ome_tiff_sum = save_menu.addAction("Save as SUM Projection OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "SUM"))
         self._act_save_ome_zarr = save_menu.addAction("Save as OME-Zarr\u2026", self._on_save_zarr)
+        self._act_save_ome_zarr_mip = save_menu.addAction("Save as MIP Projection OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "MIP"))
+        self._act_save_ome_zarr_sum = save_menu.addAction("Save as SUM Projection OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "SUM"))
         save_menu.addSeparator()
         self._act_save_views = save_menu.addAction("Save Views as PNG\u2026", self._on_save_view)
         self._act_save_comparison = save_menu.addAction("Save Comparison as PNG\u2026", self._on_save_comparison_view)
@@ -8855,7 +8866,16 @@ class DeconvolveCIWindow(QMainWindow):
             has_input and state == "Idle" and self._viewer.has_time_axis() and not streamed_pyramid
         )
         self._btn_save.setEnabled(has_preview and state == "Idle")
-        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr", "_act_save_views", "_act_save_comparison"):
+        for action_name in (
+            "_act_save_ome_tiff",
+            "_act_save_ome_tiff_mip",
+            "_act_save_ome_tiff_sum",
+            "_act_save_ome_zarr",
+            "_act_save_ome_zarr_mip",
+            "_act_save_ome_zarr_sum",
+            "_act_save_views",
+            "_act_save_comparison",
+        ):
             action = getattr(self, action_name, None)
             if action is not None:
                 action.setEnabled(has_preview and state == "Idle")
@@ -10073,6 +10093,34 @@ class DeconvolveCIWindow(QMainWindow):
         metadata["cideconvolve_processing"]["preview_timepoint"] = int(current_t)
         return current_t, data, metadata
 
+    def _project_preview_export_data(
+        self,
+        data: np.ndarray,
+        metadata: dict,
+        projection: str,
+    ) -> tuple[np.ndarray, dict]:
+        mode = str(projection or "").strip().upper()
+        if mode not in {"MIP", "SUM"}:
+            raise ValueError(f"Unsupported preview projection: {projection}")
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim != 5:
+            raise ValueError(f"Expected TCZYX preview data, got {arr.shape}")
+        if arr.shape[2] <= 1:
+            projected = arr.copy()
+        elif mode == "MIP":
+            projected = np.max(arr, axis=2, keepdims=True).astype(np.float32, copy=False)
+        else:
+            projected = np.sum(arr, axis=2, keepdims=True, dtype=np.float32)
+        projected_metadata = dict(metadata or {})
+        projected_metadata["size_z"] = 1
+        projected_metadata["default_z"] = 0
+        projected_metadata["projection"] = mode.lower()
+        projected_metadata["cideconvolve_processing"] = dict(
+            projected_metadata.get("cideconvolve_processing") or {}
+        )
+        projected_metadata["cideconvolve_processing"]["projection"] = mode.lower()
+        return projected.astype(np.float32, copy=False), projected_metadata
+
     def _preview_export_stem(self, current_t: int) -> str:
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
@@ -10178,6 +10226,65 @@ class DeconvolveCIWindow(QMainWindow):
                 out.unlink()
         self._last_save_dir = str(out.parent)
         self._log(f"Saving OME-Zarr preview to {out}")
+        self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
+
+    def _on_save_projection(self, output_kind: str, projection: str) -> None:
+        try:
+            current_t, data, metadata = self._current_preview_export_data()
+            data, metadata = self._project_preview_export_data(data, metadata, projection)
+        except RuntimeError as exc:
+            QMessageBox.information(self, "No deconvolved result", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
+
+        projection_key = _safe_filename_stem(projection.lower())
+        suggested_stem = f"{self._preview_export_stem(current_t)}_{projection_key}"
+        if output_kind == "ome_tiff":
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Save {projection} Projection as OME-TIFF",
+                str(Path(self._last_save_dir) / f"{suggested_stem}.ome.tiff"),
+                "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
+            )
+            if not path:
+                return
+            self._last_save_dir = str(Path(path).parent)
+            self._log(f"Saving {projection} OME-TIFF preview to {path}")
+            self._start_preview_save({"kind": "ome_tiff", "path": path, "data": data, "metadata": metadata})
+            return
+
+        if output_kind != "ome_zarr":
+            QMessageBox.critical(self, "Save Error", f"Unknown export format: {output_kind}")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Save {projection} Projection as OME-Zarr",
+            str(Path(self._last_save_dir) / f"{suggested_stem}.ome.zarr"),
+            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
+        )
+        if not path:
+            return
+        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+            path += ".ome.zarr"
+        out = Path(path)
+        if out.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace OME-Zarr",
+                f"Replace existing folder?\n{out}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            if out.is_dir():
+                shutil.rmtree(out)
+            else:
+                out.unlink()
+        self._last_save_dir = str(out.parent)
+        self._log(f"Saving {projection} OME-Zarr preview to {out}")
         self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
 
     def _on_save_view(self):
