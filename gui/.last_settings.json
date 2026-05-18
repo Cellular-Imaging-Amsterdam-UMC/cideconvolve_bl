@@ -1,6 +1,6 @@
 {
   "method": "ci_rl_tv",
-  "iterations": "80",
+  "iterations": "30",
   "tv_lambda": 0.0001,
   "damping": "none",
   "damping_value": 3.0,
@@ -26,14 +26,14 @@
   "check_every": 5,
   "device": "auto",
   "na": 1.4,
-  "emission_wavelengths": "461.0, 610.0",
-  "excitation_wavelengths": "424.0, 488.0",
-  "pinhole_airy_units": "1.39, 1.05",
-  "pixel_size_xy_nm": 64.967,
-  "pixel_size_z_nm": 212.8,
+  "emission_wavelengths": "520.0",
+  "excitation_wavelengths": "488.0",
+  "pinhole_airy_units": "1.00",
+  "pixel_size_xy_nm": 79.365,
+  "pixel_size_z_nm": 200.0,
   "ri_immersion": 1.518,
-  "ri_sample": 1.47,
-  "embedding_medium": "prolong gold (1.47)",
+  "ri_sample": 1.337,
+  "embedding_medium": "culture medium (1.337)",
   "t_g": 170000.0,
   "t_g0": 170000.0,
   "t_i0": 100000.0,
@@ -54,5 +54,5 @@
   "movie_title_text": "",
   "movie_info_overlay": false,
   "movie_log_convergence": false,
-  "last_leica_dir": "U:\\aaData"
+  "last_leica_dir": "L:\\Archief\\active\\cellular_imaging\\OMERO_test"
 }

@@ -36,6 +36,24 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+
+def _resource_roots() -> list[Path]:
+    """Candidate roots for bundled resources in source and PyInstaller builds."""
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass).resolve())
+    roots.append(_REPO_ROOT)
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            unique.append(root)
+    return unique
+
 import numpy as np
 
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon
@@ -112,6 +130,16 @@ GITHUB_DOCS_BASE_URL = "https://github.com/Cellular-Imaging-Amsterdam-UMC/cideco
 
 class _GuiLogEmitter(QObject):
     line = pyqtSignal(str)
+
+
+@dataclass(frozen=True)
+class MetadataIssue:
+    key: str
+    title: str
+    tooltip: str
+    severity: str = "warning"
+    field_key: Optional[str] = None
+    ack_key: Optional[str] = None
 
 
 class _QtLogHandler(logging.Handler):
@@ -1570,6 +1598,72 @@ def _leica_microscope_type(metadata: dict) -> str:
     return "widefield"
 
 
+_LEICA_COLOR_NAMES = {
+    "gray": (192, 192, 192),
+    "grey": (192, 192, 192),
+    "white": (255, 255, 255),
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "yellow": (255, 255, 0),
+    "orange": (255, 128, 0),
+}
+
+
+def _coerce_channel_color(value: Any) -> Optional[tuple[int, int, int]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _LEICA_COLOR_NAMES:
+            return _LEICA_COLOR_NAMES[text]
+        hex_text = text.lstrip("#")
+        if len(hex_text) == 8:
+            # Leica/OME-like values may include alpha first; keep RGB tail.
+            hex_text = hex_text[-6:]
+        if len(hex_text) == 6:
+            try:
+                return tuple(int(hex_text[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+            except ValueError:
+                return None
+        return None
+    if isinstance(value, int):
+        return ((value >> 16) & 255, (value >> 8) & 255, value & 255)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        vals = list(value)
+        if len(vals) >= 3:
+            try:
+                return tuple(max(0, min(255, int(v))) for v in vals[:3])  # type: ignore[return-value]
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _leica_channel_color(metadata: dict, idx: int) -> Optional[tuple[int, int, int]]:
+    for key in ("channel_colors", "colors", "lut_colors", "lutcolors", "color"):
+        values = metadata.get(key)
+        if idx == 0 and isinstance(values, (str, int)):
+            color = _coerce_channel_color(values)
+            if color is not None:
+                return color
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
+            vals = list(values)
+            if idx < len(vals):
+                color = _coerce_channel_color(vals[idx])
+                if color is not None:
+                    return color
+    names = metadata.get("lutname") or metadata.get("lut_names") or metadata.get("channel_names") or []
+    if idx == 0 and isinstance(names, str):
+        return _coerce_channel_color(names)
+    if isinstance(names, Sequence) and not isinstance(names, (str, bytes, bytearray)):
+        vals = list(names)
+        if idx < len(vals):
+            return _coerce_channel_color(vals[idx])
+    return None
+
+
 def _leica_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
     emissions = metadata.get("emission")
     excitations = metadata.get("excitation")
@@ -1581,6 +1675,9 @@ def _leica_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
             ch["name"] = str(names[idx])
         else:
             ch["name"] = _default_channel_name(idx)
+        color = _leica_channel_color(metadata, idx)
+        if color is not None and color != (255, 255, 255):
+            ch["color"] = color
         if isinstance(emissions, list) and idx < len(emissions):
             try:
                 value = float(emissions[idx])
@@ -1625,6 +1722,7 @@ class _LeicaTimepointSource(_BaseTimepointSource):
         src = dict(context.metadata)
         size_c = max(int(context.size_c or src.get("channels") or 1), 1)
         meta = {
+            "id": _leica_context_id(context),
             "pixel_size_x": (
                 _leica_resolution_m_to_um(src.get("xres"))
                 or _positive_float(context.pixel_size_x_um)
@@ -1700,6 +1798,36 @@ def _build_omero_source(image) -> _BaseTimepointSource:
 
 def _build_leica_source(context) -> _BaseTimepointSource:
     return _LeicaTimepointSource(context)
+
+
+def _leica_context_dict(context: Any) -> dict[str, Any]:
+    if context is None:
+        return {}
+    if hasattr(context, "to_dict"):
+        try:
+            data = context.to_dict()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:
+            pass
+    return {}
+
+
+def _leica_context_id(context: Any) -> str:
+    data = _leica_context_dict(context)
+    candidates = (
+        "uuid", "id", "image_id", "image_uuid", "series_uuid", "series_id",
+        "internal_id", "internal_path", "path", "name",
+    )
+    for key in candidates:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    for key in candidates:
+        value = getattr(context, key, None)
+        if value not in (None, ""):
+            return str(value)
+    return str(getattr(context, "internal_path", "") or getattr(context, "name", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -2399,9 +2527,10 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                 "keywords": ["metadata", "warnings", "missing", "sample RI", "default", "approve"],
                 "html": """
                     <h2>Metadata Warnings And Defaults</h2>
-                    <p>Warning chips are reserved for high-impact metadata issues: missing pixel size, missing emission wavelength, unknown microscope type, missing sample RI, suspicious Z spacing, or channel-list mismatch.</p>
+                    <p>The metadata summary row reports high-impact metadata issues: missing pixel size, missing emission wavelength, unknown microscope type, missing sample RI, suspicious Z spacing, or channel-list mismatch.</p>
                     <ul>
-                    <li>Changing a warned field or accepting a reasonable default clears that warning.</li>
+                    <li>Small warning icons appear beside affected parameters. Hover for details; click an icon to accept that field's current value.</li>
+                    <li>Changing a warned field or accepting current values clears the matching warning.</li>
                     <li><b>Reset to image metadata</b> restores values from the loaded image when available.</li>
                     <li>When metadata is absent, enter values from the microscope configuration or acquisition notes.</li>
                     </ul>
@@ -6909,7 +7038,15 @@ class DeconvolveCIWindow(QMainWindow):
         warning_layout = QHBoxLayout(self._metadata_warning_bar)
         warning_layout.setContentsMargins(0, 0, 0, 0)
         warning_layout.setSpacing(4)
-        self._metadata_warning_labels: list[QLabel] = []
+        self._metadata_issue_by_key: dict[str, MetadataIssue] = {}
+        self._metadata_issue_buttons: dict[str, QToolButton] = {}
+        self._metadata_field_rows: dict[QWidget, QWidget] = {}
+        self._metadata_field_labels: dict[QWidget, QWidget] = {}
+        self._metadata_warning_summary = QLabel("Metadata: OK")
+        self._metadata_warning_summary.setStyleSheet(
+            "QLabel { background: #1f2933; color: #d7dde5; border-radius: 4px; padding: 3px 7px; }"
+        )
+        warning_layout.addWidget(self._metadata_warning_summary)
         self._btn_reset_metadata = QPushButton("Reset to image metadata")
         self._btn_reset_metadata.setVisible(False)
         self._btn_reset_metadata.clicked.connect(self._on_reset_fields_to_image_metadata)
@@ -6924,9 +7061,34 @@ class DeconvolveCIWindow(QMainWindow):
 
         def _set_field_tooltip(form_layout: QFormLayout, widget: QWidget, text: str) -> None:
             widget.setToolTip(text)
-            label = form_layout.labelForField(widget)
+            row_widget = self._metadata_field_rows.get(widget, widget)
+            row_widget.setToolTip(text)
+            label = self._metadata_field_labels.get(widget) or form_layout.labelForField(row_widget)
             if label is not None:
                 label.setToolTip(text)
+
+        def _add_metadata_row(form_layout: QFormLayout, label: str, widget: QWidget, field_key: str) -> QWidget:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(widget, stretch=1)
+            button = QToolButton()
+            button.setAutoRaise(True)
+            button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
+            button.setFixedSize(22, 22)
+            button.setIconSize(QSize(16, 16))
+            button.setToolTip("Metadata warning")
+            button.setVisible(False)
+            button.clicked.connect(lambda _checked=False, key=field_key: self._ack_metadata_field(key))
+            row_layout.addWidget(button)
+            form_layout.addRow(label, row)
+            self._metadata_issue_buttons[field_key] = button
+            self._metadata_field_rows[widget] = row
+            label_widget = form_layout.labelForField(row)
+            if label_widget is not None:
+                self._metadata_field_labels[widget] = label_widget
+            return row
 
         # --- Method ---
         method_group = QGroupBox("Method")
@@ -7164,27 +7326,27 @@ class DeconvolveCIWindow(QMainWindow):
         self._le_emission.setToolTip(
             "Emission wavelength(s) in nm, comma-separated per channel."
         )
-        ol.addRow("Emission (nm):", self._le_emission)
+        _add_metadata_row(ol, "Emission (nm):", self._le_emission, "emission_wavelength")
 
         self._sp_px_xy = NoWheelDoubleSpinBox()
         self._sp_px_xy.setRange(1.0, 10000.0)
         self._sp_px_xy.setDecimals(3)
         self._sp_px_xy.setSingleStep(1.0)
         self._sp_px_xy.setValue(65.0)
-        ol.addRow("Pixel XY (nm):", self._sp_px_xy)
+        _add_metadata_row(ol, "Pixel XY (nm):", self._sp_px_xy, "pixel_size_x")
 
         self._sp_px_z = NoWheelDoubleSpinBox()
         self._sp_px_z.setRange(1.0, 50000.0)
         self._sp_px_z.setDecimals(3)
         self._sp_px_z.setSingleStep(10.0)
         self._sp_px_z.setValue(200.0)
-        ol.addRow("Pixel Z (nm):", self._sp_px_z)
+        _add_metadata_row(ol, "Pixel Z (nm):", self._sp_px_z, "pixel_size_z")
 
         self._micro_combo = NoWheelComboBox()
         self._micro_combo.addItems(["widefield", "confocal"])
         self._micro_combo.setCurrentText("confocal")
         self._micro_combo.currentTextChanged.connect(self._on_micro_changed)
-        ol.addRow("Microscope:", self._micro_combo)
+        _add_metadata_row(ol, "Microscope:", self._micro_combo, "microscope_type")
 
         self._le_excitation = QLineEdit("488")
         self._le_excitation.setToolTip(
@@ -7248,7 +7410,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._le_emission.textEdited.connect(lambda _text: self._ack_metadata_field("emission_wavelength"))
         self._micro_combo.currentTextChanged.connect(lambda _text: self._ack_metadata_field("microscope_type"))
         self._sp_ri_sample.valueChanged.connect(lambda _value: self._ack_metadata_field("sample_refractive_index"))
-        rl.addRow("RI sample:", self._sp_ri_sample)
+        _add_metadata_row(rl, "RI sample:", self._sp_ri_sample, "sample_refractive_index")
 
 
 
@@ -7906,17 +8068,33 @@ class DeconvolveCIWindow(QMainWindow):
         except OSError:
             pass
 
-    def _remember_recent_source(self, kind: str, label: str, path: Optional[Path] = None) -> None:
+    def _remember_recent_source(
+        self,
+        kind: str,
+        label: str,
+        path: Optional[Path] = None,
+        *,
+        source_id: str = "",
+        locator: str = "",
+    ) -> None:
         entry = {
             "kind": str(kind),
             "label": str(label),
             "path": str(path) if path is not None else "",
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        key = (entry["kind"], entry["path"], entry["label"])
+        if source_id:
+            entry["id"] = str(source_id)
+        if locator:
+            entry["locator"] = str(locator)
+        key = (entry["kind"], entry["path"], entry.get("id") or entry.get("locator") or entry["label"])
         self._recent_sources = [
             item for item in self._recent_sources
-            if (item.get("kind"), item.get("path"), item.get("label")) != key
+            if (
+                item.get("kind"),
+                item.get("path"),
+                item.get("id") or item.get("locator") or item.get("label"),
+            ) != key
         ]
         self._recent_sources.insert(0, entry)
         self._recent_sources = self._recent_sources[:MAX_RECENT_ITEMS]
@@ -7942,6 +8120,12 @@ class DeconvolveCIWindow(QMainWindow):
             for entry in self._recent_sources:
                 label = f"{entry.get('label', 'Recent')} ({entry.get('kind', 'file')})"
                 action = source_menu.addAction(label)
+                details = str(entry.get("path") or "")
+                if entry.get("id"):
+                    details = f"{details}\nID: {entry.get('id')}"
+                if entry.get("locator"):
+                    details = f"{details}\n{entry.get('locator')}"
+                action.setToolTip(details)
                 action.triggered.connect(lambda _checked=False, item=dict(entry): self._open_recent_source(item))
         else:
             action = source_menu.addAction("No recent sources")
@@ -7965,6 +8149,17 @@ class DeconvolveCIWindow(QMainWindow):
         if kind == "omero":
             self._status.showMessage("Open OMERO and select the recent image again", 5000)
             self._on_open_omero()
+            return
+        if kind == "leica":
+            if raw_path:
+                path = Path(raw_path)
+                self._set_last_leica_dir(path.parent if path.is_file() else path)
+            self._status.showMessage(
+                "Opening Leica browser; select the stored image"
+                + (f" (ID: {entry.get('id')})" if entry.get("id") else ""),
+                7000,
+            )
+            self._on_open_leica()
             return
         path = Path(raw_path)
         if not raw_path or not path.exists():
@@ -8017,48 +8212,126 @@ class DeconvolveCIWindow(QMainWindow):
                 return
         super().dropEvent(event)
 
-    def _metadata_warning_texts(self, meta: dict) -> list[str]:
+    def _metadata_issues(self, meta: dict) -> list[MetadataIssue]:
         from_file = set(meta.get("_from_file") or [])
         acknowledged = set(self._metadata_acknowledged_fields)
-        warnings: list[str] = []
+        issues: list[MetadataIssue] = []
         size_z = int(meta.get("size_z", 1) or 1)
         size_c = int(meta.get("size_c", meta.get("n_channels", 0)) or 0)
         if "pixel_size_x" not in from_file and "pixel_size_x" not in acknowledged:
-            warnings.append("Pixel XY default")
+            issues.append(MetadataIssue(
+                key="pixel_size_x_default",
+                title="Pixel XY default",
+                tooltip=f"Pixel XY was not found in the image metadata. The current value is {self._sp_px_xy.value():.3f} nm.",
+                field_key="pixel_size_x",
+                ack_key="pixel_size_x",
+            ))
         if size_z > 1 and "pixel_size_z" not in from_file and "pixel_size_z" not in acknowledged:
-            warnings.append("Pixel Z default")
+            issues.append(MetadataIssue(
+                key="pixel_size_z_default",
+                title="Pixel Z default",
+                tooltip=f"Pixel Z spacing was not found in the image metadata. The current value is {self._sp_px_z.value():.3f} nm.",
+                field_key="pixel_size_z",
+                ack_key="pixel_size_z",
+            ))
         if "emission_wavelength" not in from_file and "emission_wavelength" not in acknowledged:
-            warnings.append("Emission default")
+            issues.append(MetadataIssue(
+                key="emission_wavelength_default",
+                title="Emission default",
+                tooltip=f"Emission wavelength metadata is missing. The current value is {self._le_emission.text().strip() or 'blank'} nm.",
+                field_key="emission_wavelength",
+                ack_key="emission_wavelength",
+            ))
         if "microscope_type" not in from_file and "microscope_type" not in acknowledged:
-            warnings.append("Microscope default")
+            issues.append(MetadataIssue(
+                key="microscope_type_default",
+                title="Microscope default",
+                tooltip=f"Microscope type metadata is missing. The current model is {self._micro_combo.currentText()}.",
+                field_key="microscope_type",
+                ack_key="microscope_type",
+            ))
         if "sample_refractive_index" not in from_file and "sample_refractive_index" not in acknowledged:
-            warnings.append("Sample RI missing")
+            issues.append(MetadataIssue(
+                key="sample_refractive_index_missing",
+                title="Sample RI missing",
+                tooltip=f"Sample refractive index metadata is missing. The current value is {self._sp_ri_sample.value():.4f}.",
+                field_key="sample_refractive_index",
+                ack_key="sample_refractive_index",
+            ))
         channels = meta.get("channels", [])
-        if isinstance(channels, list) and channels and size_c and len(channels) != size_c:
-            warnings.append("Channel metadata mismatch")
+        if (
+            "channel_metadata_mismatch" not in acknowledged
+            and isinstance(channels, list)
+            and channels
+            and size_c
+            and len(channels) != size_c
+        ):
+            issues.append(MetadataIssue(
+                key="channel_metadata_mismatch",
+                title="Channel metadata mismatch",
+                tooltip=f"The metadata describes {len(channels)} channel(s), but the image has {size_c} channel(s).",
+                ack_key="channel_metadata_mismatch",
+            ))
         try:
             px_xy = float(meta.get("pixel_size_x") or 0)
             px_z = float(meta.get("pixel_size_z") or 0)
-            if size_z > 1 and px_xy > 0 and px_z > 0 and (px_z / px_xy > 10.0 or px_z / px_xy < 0.25):
-                warnings.append("Suspicious Z spacing")
+            if (
+                size_z > 1
+                and "pixel_size_z" not in acknowledged
+                and px_xy > 0
+                and px_z > 0
+                and (px_z / px_xy > 10.0 or px_z / px_xy < 0.25)
+            ):
+                issues.append(MetadataIssue(
+                    key="suspicious_z_spacing",
+                    title="Suspicious Z spacing",
+                    tooltip=f"Pixel Z / Pixel XY ratio is {px_z / px_xy:.2f}. Check that the axial spacing is correct.",
+                    field_key="pixel_size_z",
+                    ack_key="pixel_size_z",
+                ))
         except (TypeError, ValueError):
             pass
-        return warnings
+        return issues
 
-    def _set_metadata_warnings(self, warnings: list[str]) -> None:
-        layout = self._metadata_warning_bar.layout()
-        for label in self._metadata_warning_labels:
-            layout.removeWidget(label)
-            label.deleteLater()
-        self._metadata_warning_labels = []
-        for text in warnings[:6]:
-            label = QLabel(text)
-            label.setStyleSheet(
-                "QLabel { background: #7c2d12; color: #fff7ed; border-radius: 4px; padding: 2px 6px; }"
+    def _set_metadata_warnings(self, issues: list[MetadataIssue]) -> None:
+        self._metadata_issue_by_key = {issue.key: issue for issue in issues}
+        for button in self._metadata_issue_buttons.values():
+            button.setVisible(False)
+            button.setToolTip("Metadata warning")
+
+        by_field: dict[str, list[MetadataIssue]] = {}
+        for issue in issues:
+            if issue.field_key:
+                by_field.setdefault(issue.field_key, []).append(issue)
+
+        for field_key, field_issues in by_field.items():
+            button = self._metadata_issue_buttons.get(field_key)
+            if button is None:
+                continue
+            lines = []
+            for issue in field_issues:
+                lines.append(f"{issue.title}: {issue.tooltip}")
+            lines.append("Click to accept the current value for this field.")
+            button.setToolTip("\n".join(lines))
+            button.setVisible(True)
+
+        has_warnings = bool(issues)
+        if has_warnings:
+            count = len(issues)
+            noun = "issue" if count == 1 else "issues"
+            self._metadata_warning_summary.setText(f"Metadata: {count} {noun}")
+            self._metadata_warning_summary.setStyleSheet(
+                "QLabel { background: #7c2d12; color: #fff7ed; border-radius: 4px; padding: 3px 7px; }"
             )
-            layout.insertWidget(max(0, layout.count() - 2), label)
-            self._metadata_warning_labels.append(label)
-        has_warnings = bool(warnings)
+            self._metadata_warning_summary.setToolTip(
+                "Metadata issues:\n" + "\n".join(f"- {issue.title}: {issue.tooltip}" for issue in issues)
+            )
+        else:
+            self._metadata_warning_summary.setText("Metadata: OK")
+            self._metadata_warning_summary.setStyleSheet(
+                "QLabel { background: #1f2933; color: #d7dde5; border-radius: 4px; padding: 3px 7px; }"
+            )
+            self._metadata_warning_summary.setToolTip("No metadata issues detected.")
         self._btn_reset_metadata.setVisible(bool(self._metadata))
         self._btn_accept_metadata.setVisible(has_warnings)
         self._metadata_warning_bar.setVisible(has_warnings or bool(self._metadata))
@@ -8069,17 +8342,13 @@ class DeconvolveCIWindow(QMainWindow):
         if not self._metadata:
             return
         self._metadata_acknowledged_fields.add(key)
-        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+        self._set_metadata_warnings(self._metadata_issues(self._metadata))
 
     def _on_accept_current_metadata_values(self) -> None:
-        self._metadata_acknowledged_fields.update({
-            "pixel_size_x",
-            "pixel_size_z",
-            "emission_wavelength",
-            "microscope_type",
-            "sample_refractive_index",
-        })
-        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+        self._metadata_acknowledged_fields.update(
+            issue.ack_key or issue.key for issue in self._metadata_issues(self._metadata)
+        )
+        self._set_metadata_warnings(self._metadata_issues(self._metadata))
         self._status.showMessage("Current metadata/default values accepted", 3000)
 
     def _on_reset_fields_to_image_metadata(self) -> None:
@@ -8362,6 +8631,27 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_rel_thresh.setEnabled(auto)
         self._sp_check_every.setEnabled(auto)
 
+    @staticmethod
+    def _metadata_field_background(found: bool) -> str:
+        if found:
+            return "background-color: #c8e6c9; color: black;"
+        return "background-color: #ffe0b2; color: black;"
+
+    def _refresh_confocal_only_metadata_styles(self, from_file: Optional[set[str]] = None) -> None:
+        from_file = set(from_file if from_file is not None else self._metadata.get("_from_file", set()))
+        if self._micro_combo.currentText() == "widefield":
+            style = self._metadata_field_background(True)
+        else:
+            style = self._metadata_field_background("excitation_wavelength" in from_file)
+        self._le_excitation.setStyleSheet(style)
+
+        if self._micro_combo.currentText() == "widefield":
+            pinhole_style = self._metadata_field_background(True)
+        else:
+            pinhole_style = self._metadata_field_background("pinhole_airy_units" in from_file)
+        self._le_pinhole_airy.setStyleSheet(pinhole_style)
+        self._le_pinhole_na.setStyleSheet(pinhole_style)
+
     def _on_micro_changed(self, text: str):
         if text == "confocal":
             self._le_excitation.setEnabled(True)
@@ -8378,6 +8668,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._pinhole_airy_saved = self._le_pinhole_airy.text()
             self._pinhole_stack.setCurrentWidget(self._le_pinhole_na)
             self._le_niter.setText("80")
+        self._refresh_confocal_only_metadata_styles()
         self._refresh_two_d_wf_expert_state()
         self._maybe_load_default_ci_rl_dl_model()
 
@@ -8425,11 +8716,13 @@ class DeconvolveCIWindow(QMainWindow):
         microscope = str(self._micro_combo.currentText() or self._metadata.get("microscope_type") or "").strip().lower()
         if microscope not in {"confocal", "widefield"}:
             return None
-        model_dir = _REPO_ROOT / "models" / ("defaultconfocal" if microscope == "confocal" else "defaultwidefield")
-        model_path = model_dir / "best_model.pt"
-        meta_path = model_dir / "best_model.json"
-        if model_dir.is_dir() and model_path.exists() and meta_path.exists():
-            return model_path
+        model_name = "defaultconfocal" if microscope == "confocal" else "defaultwidefield"
+        for root in _resource_roots():
+            model_dir = root / "models" / model_name
+            model_path = model_dir / "best_model.pt"
+            meta_path = model_dir / "best_model.json"
+            if model_dir.is_dir() and model_path.exists() and meta_path.exists():
+                return model_path
         return None
 
     def _maybe_load_default_ci_rl_dl_model(self) -> None:
@@ -8675,6 +8968,8 @@ class DeconvolveCIWindow(QMainWindow):
         if context is None:
             return
         container = Path(context.container_path)
+        leica_id = _leica_context_id(context)
+        leica_locator = f"{context.container_path}::{getattr(context, 'internal_path', leica_id or context.name)}"
         if browsed_root is None:
             self._set_last_leica_dir(container.parent if container.is_file() else container, persist=True)
         self._reset_log(f"CIDeconvolve GUI log — opening Leica image {context.name}")
@@ -8688,6 +8983,9 @@ class DeconvolveCIWindow(QMainWindow):
                 context.name,
                 source_path=Path(context.container_path),
                 source_factory=lambda _context=context: _build_leica_source(_context),
+                recent_kind="leica",
+                recent_id=leica_id,
+                recent_locator=leica_locator,
             )
             self._log(f"Open metadata complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
@@ -8737,6 +9035,9 @@ class DeconvolveCIWindow(QMainWindow):
         display_name: str,
         source_path: Optional[Path] = None,
         source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
+        recent_kind: Optional[str] = None,
+        recent_id: str = "",
+        recent_locator: str = "",
     ):
         """Apply a lazy timepoint source to the UI (shared by file and OMERO open)."""
         self._input_source = source
@@ -8755,9 +9056,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         def _bg(found: bool) -> str:
             """Stylesheet snippet: green if from metadata, orange if default."""
-            if found:
-                return "background-color: #c8e6c9; color: black;"   # soft green
-            return "background-color: #ffe0b2; color: black;"       # soft orange
+            return self._metadata_field_background(found)
 
         try:
             if meta.get("na"):
@@ -8801,8 +9100,7 @@ class DeconvolveCIWindow(QMainWindow):
                 # (widefield: field stays N/A and disabled)
             self._le_emission.setStyleSheet(
                 _bg("emission_wavelength" in from_file))
-            self._le_excitation.setStyleSheet(
-                _bg("excitation_wavelength" in from_file))
+            self._refresh_confocal_only_metadata_styles(set(from_file))
             if ch_info:
                 pinhole_text = _format_channel_values(
                     ch_info, "pinhole_airy_units", _DEFAULT_PINHOLE_AIRY_UNITS, digits=2
@@ -8810,10 +9108,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._pinhole_airy_saved = pinhole_text
                 if self._micro_combo.currentText() == "confocal":
                     self._le_pinhole_airy.setText(pinhole_text)
-            self._le_pinhole_airy.setStyleSheet(
-                _bg("pinhole_airy_units" in from_file))
-            self._le_pinhole_na.setStyleSheet(
-                _bg("pinhole_airy_units" in from_file))
+            self._refresh_confocal_only_metadata_styles(set(from_file))
 
             self._refresh_two_d_wf_expert_state()
 
@@ -8877,12 +9172,15 @@ class DeconvolveCIWindow(QMainWindow):
         self._sync_preview_buttons()
         self._viewer.set_input_data([], self._metadata)
         self._viewer.refresh_view()
-        self._set_metadata_warnings(self._metadata_warning_texts(self._metadata))
+        self._set_metadata_warnings(self._metadata_issues(self._metadata))
         self._set_default_movie_output_path(display_name, source_path)
         self._initial_load_context = {
             "display_name": display_name,
             "source_path": source_path,
             "source_is_pyramidal": source_is_pyramidal,
+            "recent_kind": recent_kind,
+            "recent_id": recent_id,
+            "recent_locator": recent_locator,
         }
         self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
 
@@ -10460,6 +10758,9 @@ class DeconvolveCIWindow(QMainWindow):
             if source_path is not None and not isinstance(source_path, Path):
                 source_path = Path(str(source_path))
             source_is_pyramidal = bool(context.get("source_is_pyramidal", False))
+            recent_kind = str(context.get("recent_kind") or "")
+            recent_id = str(context.get("recent_id") or "")
+            recent_locator = str(context.get("recent_locator") or "")
             self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
             self._btn_run.setEnabled(True)
             self._btn_fit_psf.setEnabled(not source_is_pyramidal)
@@ -10469,8 +10770,14 @@ class DeconvolveCIWindow(QMainWindow):
                 self._btn_fit_psf.setEnabled(False)
             self._maybe_load_default_ci_rl_dl_model()
             if source_path is not None:
-                kind = "zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file"
-                self._remember_recent_source(kind, display_name, source_path)
+                kind = recent_kind or ("zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file")
+                self._remember_recent_source(
+                    kind,
+                    display_name,
+                    source_path,
+                    source_id=recent_id,
+                    locator=recent_locator,
+                )
             elif display_name.startswith("OMERO:"):
                 self._remember_recent_source("omero", display_name)
             self._status.showMessage(f"Loaded {display_name}", 5000)

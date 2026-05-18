@@ -30,7 +30,7 @@ bioio-nd2==1.7.0
 omero-browser-qt[viewer]==0.2.5
 
 # Leica browser (Open Leica… button)
-leica-browser-qt>=0.2.0
+leica-browser-qt>=0.3.1
 
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0

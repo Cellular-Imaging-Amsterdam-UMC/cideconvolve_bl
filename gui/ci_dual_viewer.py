@@ -2275,10 +2275,6 @@ class DualViewerWidget(QWidget):
         self._z_slider.setMaximum(size_z - 1)
         self._z_slider.setValue(default_z)
         self._z_slider.blockSignals(False)
-        if size_z > 1:
-            self._projection_combo.blockSignals(True)
-            self._projection_combo.setCurrentText("Slice")
-            self._projection_combo.blockSignals(False)
         self._time_bar.setVisible(size_t > 1)
         self._update_labels()
         self._fit_on_next_render = True
@@ -3437,7 +3433,6 @@ class DualViewerWidget(QWidget):
         if not channels:
             self.cursorInfoChanged.emit("")
             return
-        projection = self._projection_combo.currentText()
         stride = 1
         for idx in self._active_channel_indices():
             if 0 <= idx < len(channels):
@@ -3445,24 +3440,12 @@ class DualViewerWidget(QWidget):
                 break
         x = int(round(scene_x * stride))
         y = int(round(scene_y * stride))
-        z = int(self._z_slider.value()) if projection == "Slice" else -1
-        values: list[str] = []
-        for idx in self._active_channel_indices():
-            if idx >= len(channels):
-                continue
-            stack = channels[idx]
-            try:
-                plane = _project_stack(stack, projection, self._z_slider.value())
-                if 0 <= y < plane.shape[0] and 0 <= x < plane.shape[1]:
-                    values.append(f"Ch{idx + 1}={float(plane[y, x]):.4g}")
-            except Exception:
-                continue
+        z = int(self._z_slider.value()) if self._projection_combo.currentText() == "Slice" else -1
         px_um = self._pixel_size_x_um()
         physical = f" | {x * px_um:.2f} um, {y * px_um:.2f} um" if px_um else ""
         z_text = f" Z={z}" if z >= 0 else ""
-        value_text = " | " + ", ".join(values) if values else ""
         self.cursorInfoChanged.emit(
-            f"{pane} X={x} Y={y}{z_text} T={self.current_timepoint()}{physical}{value_text}"
+            f"{pane} X={x} Y={y}{z_text} T={self.current_timepoint()}{physical}"
         )
 
     def _build_3d_channel_payload(

@@ -3,11 +3,14 @@
 #              (run from the repository root)
 #
 # Produces:  dist/cideconvolve.exe  (single-file executable)
+#            dist/models/           (visible default DL models; also embedded)
 #
 # NOTE: icon.ico is used for the Windows executable icon.
 
 import os
 import pkgutil
+import shutil
+from PyInstaller.building.datastruct import Tree
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
@@ -61,6 +64,12 @@ mpl_datas, mpl_binaries, mpl_hiddenimports = collect_all('matplotlib')
 # ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
+# ── Collect leica_browser_qt (Open Leica… button) ────────────────────────────
+leica_datas, leica_binaries, leica_hiddenimports = collect_all('leica_browser_qt')
+
+# ── Collect Pillow (movie frames / PNG exports / overlays) ───────────────────
+pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
+
 # ── Collect bioio reader plugins (as installed per requirements_gui.txt) ─────
 bioio_datas,    bioio_binaries,    bioio_hiddenimports    = collect_all('bioio')
 bioio_b_datas,  bioio_b_binaries,  bioio_b_hiddenimports  = collect_all('bioio_base')
@@ -81,6 +90,7 @@ a = Analysis(
         pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
         + zarr_binaries + numcodecs_binaries
         + ome_binaries + omero_binaries + obqt_binaries
+        + leica_binaries + pil_binaries
         + xsdata_binaries + xspb_binaries
         + pyd_binaries + pyde_binaries + dask_binaries
         + imc_binaries
@@ -96,6 +106,7 @@ a = Analysis(
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
+      + leica_datas + pil_datas
       + xsdata_datas + xspb_datas
       + pyd_datas + pyde_datas + dask_datas
       + imc_datas
@@ -103,13 +114,16 @@ a = Analysis(
       + mpl_datas
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
-      + bioio_cz_datas + bioio_nd_datas,
+      + bioio_cz_datas + bioio_nd_datas
+      + Tree('models', prefix='models'),  # default ci_rl_dl models
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
         'core.deconvolve_ci',
         'core.deconvolve_ci_dl',
         'core.deconvolve',
+        'core.streaming',
+        'core._meta_helpers',
         'wrapper',
         # ── numeric / array ─────────────────────────────────────────────────
         'numpy',
@@ -164,6 +178,9 @@ a = Analysis(
         'omero_browser_qt.tree_model',
         'omero_browser_qt.widgets',
         'omero_browser_qt.view_backends',
+        'omero_browser_qt.omero_viewer',
+        # ── Leica browser (optional Open Leica… button) ─────────────────────
+        'leica_browser_qt',
         # ── GPU / hardware monitoring ───────────────────────────────────────
         'psutil',
         'pynvml',
@@ -195,12 +212,13 @@ a = Analysis(
     ] + pyqt6_hiddenimports + vispy_hiddenimports + ogl_hiddenimports
       + torch_hiddenimports
       + zarr_hiddenimports + numcodecs_hiddenimports
-      + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports + ice_toplevel
+      + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports + leica_hiddenimports + ice_toplevel
       + xsdata_hiddenimports + xspb_hiddenimports
       + pyd_hiddenimports + pyde_hiddenimports + dask_hiddenimports
       + imc_hiddenimports
       + imgio_hiddenimports + imgff_hiddenimports
       + mpl_hiddenimports
+      + pil_hiddenimports
       + bioio_hiddenimports + bioio_b_hiddenimports
       + bioio_ot_hiddenimports + bioio_oz_hiddenimports
       + bioio_cz_hiddenimports + bioio_nd_hiddenimports,
@@ -242,3 +260,12 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+# Also copy the model folder next to the one-file executable.  The models are
+# embedded above, but this visible folder lets releases swap/update defaults
+# without rebuilding the executable.
+_dist_models = os.path.join(DISTPATH, 'models')
+if os.path.isdir(_dist_models):
+    shutil.rmtree(_dist_models)
+shutil.copytree(os.path.abspath('models'), _dist_models)
+print(f'Copied default DL models: {_dist_models}')
