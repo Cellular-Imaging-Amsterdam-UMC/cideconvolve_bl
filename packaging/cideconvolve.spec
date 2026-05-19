@@ -262,7 +262,11 @@ splash = Splash(
     _splash_image,
     binaries=a.binaries,
     datas=a.datas,
-    text_pos=None,
+    text_pos=(205, 58),
+    text_size=10,
+    text_color='#f4f2a0',
+    text_default='0% - Starting CI Deconvolve...',
+    always_on_top=True,
     minify_script=True,
 )
 

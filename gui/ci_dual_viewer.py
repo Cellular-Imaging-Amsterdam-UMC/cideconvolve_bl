@@ -3186,8 +3186,9 @@ class DualViewerWidget(QWidget):
         z = self._z_slider.value()
         self._t_label.setText(f"{t}/{max(self._t_slider.maximum(), 0)}")
         z_max = max(self._z_slider.maximum(), 0)
-        z_width = max(1, len(str(z_max)))
-        self._z_label.setText(f"{z:0{z_width}d}/{z_max}")
+        z_count = z_max + 1
+        z_width = max(1, len(str(z_count)))
+        self._z_label.setText(f"{z + 1:0{z_width}d}/{z_count}")
 
     def _ensure_mode_valid(self) -> None:
         can_show_3d = self._can_show_3d()
@@ -3470,9 +3471,10 @@ class DualViewerWidget(QWidget):
         x = int(round(scene_x * stride))
         y = int(round(scene_y * stride))
         z = int(self._z_slider.value()) if self._projection_combo.currentText() == "Slice" else -1
+        z_count = max(int(self._z_slider.maximum()) + 1, 1)
         px_um = self._pixel_size_x_um()
         physical = f" | {x * px_um:.2f} um, {y * px_um:.2f} um" if px_um else ""
-        z_text = f" Z={z}" if z >= 0 else ""
+        z_text = f" Z={z_count}" if z >= 0 else ""
         self.cursorInfoChanged.emit(
             f"{pane} X={x} Y={y}{z_text} T={self.current_timepoint()}{physical}"
         )

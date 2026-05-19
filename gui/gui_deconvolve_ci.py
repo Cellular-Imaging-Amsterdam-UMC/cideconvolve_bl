@@ -37,6 +37,18 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
+def _update_pyinstaller_splash(text: str) -> None:
+    """Update PyInstaller's bootloader splash text when running from a bundle."""
+    try:
+        import pyi_splash
+    except Exception:
+        return
+    try:
+        pyi_splash.update_text(text)
+    except Exception:
+        return
+
+
 def _resource_roots() -> list[Path]:
     """Candidate roots for bundled resources in source and PyInstaller builds."""
     roots: list[Path] = []
@@ -54,6 +66,7 @@ def _resource_roots() -> list[Path]:
             unique.append(root)
     return unique
 
+_update_pyinstaller_splash("10% - Loading numeric libraries...")
 import numpy as np
 
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon
@@ -63,6 +76,7 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
+_update_pyinstaller_splash("25% - Loading Qt interface...")
 from PyQt6.QtCore import QObject, QEvent, QPointF, Qt, QRectF, QSize, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import (
@@ -113,6 +127,7 @@ try:
 except ImportError:
     QSvgRenderer = None
 
+_update_pyinstaller_splash("45% - Loading image viewer...")
 from ci_dual_viewer import DualViewerWidget
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -254,6 +269,27 @@ def _split_icon_pixmap(size: int = 18, color: str = "#7dd3fc") -> QPixmap:
     return pixmap
 
 
+def _sampling_warning_icon(size: int = 16) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QPen(QColor("#b45309"), 1.4))
+    painter.setBrush(QColor("#fef3c7"))
+    painter.drawEllipse(QRectF(1.5, 1.5, size - 3, size - 3))
+    painter.setPen(QPen(QColor("#92400e"), 1.5))
+    center = size / 2
+    painter.drawLine(QPointF(center, 3.5), QPointF(center, size - 3.5))
+    painter.drawLine(QPointF(3.5, center), QPointF(size - 3.5, center))
+    painter.setPen(QPen(QColor("#92400e"), 1.0))
+    for tick in (5.0, size - 5.0):
+        painter.drawLine(QPointF(tick, center - 2.0), QPointF(tick, center + 2.0))
+        painter.drawLine(QPointF(center - 2.0, tick), QPointF(center + 2.0, tick))
+    painter.end()
+    return QIcon(pixmap)
+
+
+_update_pyinstaller_splash("60% - Loading metadata helpers...")
 from core._meta_helpers import (
     _DEFAULT_PINHOLE_AIRY_UNITS,
     _apply_map_metadata,
@@ -531,7 +567,7 @@ def _apply_metadata_defaults(images: list, meta: dict) -> dict:
 
     meta.setdefault("na", 1.4)
     meta.setdefault("pixel_size_x", 0.065)
-    meta.setdefault("pixel_size_z", 0.2)
+    meta.setdefault("pixel_size_z", 0.17)
     meta.setdefault("refractive_index", 1.515)
     meta.setdefault("microscope_type", "widefield")
     if "channels" not in meta:
@@ -896,6 +932,94 @@ def _parse_float_list(text: str) -> list[float]:
         except ValueError:
             continue
     return values
+
+
+def _format_nm(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "unknown"
+    value = float(value)
+    if value >= 100:
+        return f"{value:.0f} nm"
+    if value >= 10:
+        return f"{value:.1f} nm"
+    return f"{value:.2f} nm"
+
+
+def _interpolate_pinhole_factor(pinhole_au: float, points: Sequence[tuple[float, float]]) -> float:
+    pinhole_au = max(float(pinhole_au), 0.0)
+    if pinhole_au <= points[0][0]:
+        x0, y0 = 0.0, 1.0
+        x1, y1 = points[0]
+        if x1 <= x0:
+            return y1
+        return y0 + (y1 - y0) * ((pinhole_au - x0) / (x1 - x0))
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if pinhole_au <= x1:
+            if math.isclose(x0, x1):
+                return y1
+            return y0 + (y1 - y0) * ((pinhole_au - x0) / (x1 - x0))
+    return points[-1][1]
+
+
+def _nyquist_confocal_pinhole_factors(pinhole_au: Optional[float]) -> tuple[float, float]:
+    if pinhole_au is None or float(pinhole_au) <= 0:
+        return 1.0, 1.0
+    cxy = _interpolate_pinhole_factor(float(pinhole_au), ((0.5, 1.2), (0.68, 1.4), (1.0, 1.7)))
+    cz = _interpolate_pinhole_factor(float(pinhole_au), ((0.5, 1.0), (0.68, 1.1), (1.0, 1.3)))
+    return cxy, cz
+
+
+def _nyquist_sampling_nm(
+    wavelength_nm: float,
+    na: float,
+    refractive_index: float,
+    pinhole_au: Optional[float],
+    microscope_type: str,
+) -> Optional[dict[str, float]]:
+    try:
+        wavelength_nm = float(wavelength_nm)
+        na = float(na)
+        refractive_index = float(refractive_index)
+        pinhole = None if pinhole_au is None else float(pinhole_au)
+    except (TypeError, ValueError):
+        return None
+    if wavelength_nm <= 0 or na <= 0 or refractive_index <= 0 or na >= refractive_index:
+        return None
+
+    microscope = str(microscope_type).strip().lower()
+    alpha = math.asin(na / refractive_index)
+    optical_section_nm = float("nan")
+
+    if microscope == "confocal":
+        cxy, cz = _nyquist_confocal_pinhole_factors(pinhole)
+        dxy_nm = cxy * wavelength_nm / (8.0 * na)
+        dz_nm = cz * wavelength_nm / (4.0 * refractive_index * (1.0 - math.cos(alpha)))
+    else:
+        cxy, cz = 1.0, 1.0
+        dxy_nm = wavelength_nm / (4.0 * na)
+        dz_nm = wavelength_nm / (2.0 * refractive_index * (1.0 - math.cos(alpha)))
+
+    if microscope == "confocal" and pinhole is not None and pinhole > 0:
+        optical_section_nm = math.sqrt(
+            (wavelength_nm * refractive_index / (na ** 2)) ** 2
+            + (
+                pinhole
+                * refractive_index
+                * math.sqrt(2.0)
+                * 1.22
+                * wavelength_nm
+                / (na ** 2)
+            ) ** 2
+        )
+
+    return {
+        "xy_nm": dxy_nm,
+        "z_nm": dz_nm,
+        "optical_section_nm": optical_section_nm,
+        "cxy": cxy,
+        "cz": cz,
+        "microscope_type": microscope,
+    }
 
 
 def _format_bytes(mb: float) -> str:
@@ -7047,6 +7171,7 @@ class DeconvolveCIWindow(QMainWindow):
         warning_layout.setSpacing(4)
         self._metadata_issue_by_key: dict[str, MetadataIssue] = {}
         self._metadata_issue_buttons: dict[str, QToolButton] = {}
+        self._sampling_issue_buttons: dict[str, QToolButton] = {}
         self._metadata_field_rows: dict[QWidget, QWidget] = {}
         self._metadata_field_labels: dict[QWidget, QWidget] = {}
         self._metadata_warning_summary = QLabel("Metadata: OK")
@@ -7074,7 +7199,25 @@ class DeconvolveCIWindow(QMainWindow):
             if label is not None:
                 label.setToolTip(text)
 
-        def _add_metadata_row(form_layout: QFormLayout, label: str, widget: QWidget, field_key: str) -> QWidget:
+        def _make_sampling_button(sampling_key: str) -> QToolButton:
+            button = QToolButton()
+            button.setAutoRaise(True)
+            button.setIcon(_sampling_warning_icon())
+            button.setFixedSize(22, 22)
+            button.setIconSize(QSize(16, 16))
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setToolTip("Nyquist sampling warning")
+            button.setVisible(False)
+            self._sampling_issue_buttons[sampling_key] = button
+            return button
+
+        def _add_metadata_row(
+            form_layout: QFormLayout,
+            label: str,
+            widget: QWidget,
+            field_key: str,
+            sampling_key: Optional[str] = None,
+        ) -> QWidget:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -7089,12 +7232,24 @@ class DeconvolveCIWindow(QMainWindow):
             button.setVisible(False)
             button.clicked.connect(lambda _checked=False, key=field_key: self._ack_metadata_field(key))
             row_layout.addWidget(button)
+            if sampling_key is not None:
+                row_layout.addWidget(_make_sampling_button(sampling_key))
             form_layout.addRow(label, row)
             self._metadata_issue_buttons[field_key] = button
             self._metadata_field_rows[widget] = row
             label_widget = form_layout.labelForField(row)
             if label_widget is not None:
                 self._metadata_field_labels[widget] = label_widget
+            return row
+
+        def _add_sampling_row(form_layout: QFormLayout, label: str, widget: QWidget, sampling_key: str) -> QWidget:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(widget, stretch=1)
+            row_layout.addWidget(_make_sampling_button(sampling_key))
+            form_layout.addRow(label, row)
             return row
 
         # --- Method ---
@@ -7340,14 +7495,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_px_xy.setDecimals(3)
         self._sp_px_xy.setSingleStep(1.0)
         self._sp_px_xy.setValue(65.0)
-        _add_metadata_row(ol, "Pixel XY (nm):", self._sp_px_xy, "pixel_size_x")
+        _add_metadata_row(ol, "Pixel XY (nm):", self._sp_px_xy, "pixel_size_x", "pixel_size_x")
 
         self._sp_px_z = NoWheelDoubleSpinBox()
         self._sp_px_z.setRange(1.0, 50000.0)
         self._sp_px_z.setDecimals(3)
         self._sp_px_z.setSingleStep(10.0)
-        self._sp_px_z.setValue(200.0)
-        _add_metadata_row(ol, "Pixel Z (nm):", self._sp_px_z, "pixel_size_z")
+        self._sp_px_z.setValue(170.0)
+        _add_metadata_row(ol, "Pixel Z (nm):", self._sp_px_z, "pixel_size_z", "pixel_size_z")
 
         self._micro_combo = NoWheelComboBox()
         self._micro_combo.addItems(["widefield", "confocal"])
@@ -7373,7 +7528,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._pinhole_stack = QStackedWidget()
         self._pinhole_stack.addWidget(self._le_pinhole_airy)
         self._pinhole_stack.addWidget(self._le_pinhole_na)
-        ol.addRow("Pinhole (AU):", self._pinhole_stack)
+        _add_sampling_row(ol, "Pinhole (AU):", self._pinhole_stack, "pinhole_airy_units")
 
         ctrl_layout.addWidget(optics_group)
 
@@ -7417,6 +7572,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._le_emission.textEdited.connect(lambda _text: self._ack_metadata_field("emission_wavelength"))
         self._micro_combo.currentTextChanged.connect(lambda _text: self._ack_metadata_field("microscope_type"))
         self._sp_ri_sample.valueChanged.connect(lambda _value: self._ack_metadata_field("sample_refractive_index"))
+        self._sp_na.valueChanged.connect(lambda _value: self._update_sampling_warnings())
+        self._sp_ri_imm.valueChanged.connect(lambda _value: self._update_sampling_warnings())
+        self._sp_px_xy.valueChanged.connect(lambda _value: self._update_sampling_warnings())
+        self._sp_px_z.valueChanged.connect(lambda _value: self._update_sampling_warnings())
+        self._le_emission.textChanged.connect(lambda _text: self._update_sampling_warnings())
+        self._le_excitation.textChanged.connect(lambda _text: self._update_sampling_warnings())
+        self._le_pinhole_airy.textChanged.connect(lambda _text: self._update_sampling_warnings())
+        self._micro_combo.currentTextChanged.connect(lambda _text: self._update_sampling_warnings())
         _add_metadata_row(rl, "RI sample:", self._sp_ri_sample, "sample_refractive_index")
 
 
@@ -7965,15 +8128,20 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._btn_save.setEnabled(False)
         save_menu = QMenu(self._btn_save)
-        self._act_save_ome_tiff = save_menu.addAction("Save as OME-TIFF\u2026", self._on_save)
-        self._act_save_ome_tiff_mip = save_menu.addAction("Save as MIP Projection OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "MIP"))
-        self._act_save_ome_tiff_sum = save_menu.addAction("Save as SUM Projection OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "SUM"))
-        self._act_save_ome_zarr = save_menu.addAction("Save as OME-Zarr\u2026", self._on_save_zarr)
-        self._act_save_ome_zarr_mip = save_menu.addAction("Save as MIP Projection OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "MIP"))
-        self._act_save_ome_zarr_sum = save_menu.addAction("Save as SUM Projection OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "SUM"))
+        save_menu.addSection("Full")
+        self._act_save_ome_tiff = save_menu.addAction("Current timepoint as OME-TIFF\u2026", self._on_save)
+        self._act_save_ome_zarr = save_menu.addAction("Current timepoint as OME-Zarr\u2026", self._on_save_zarr)
+        self._act_save_t_series = save_menu.addAction("Full T-series as OME-TIFF\u2026", self._on_save_t_series)
         save_menu.addSeparator()
-        self._act_save_views = save_menu.addAction("Save Views as PNG\u2026", self._on_save_view)
-        self._act_save_comparison = save_menu.addAction("Save Comparison as PNG\u2026", self._on_save_comparison_view)
+        save_menu.addSection("Projection")
+        self._act_save_ome_tiff_mip = save_menu.addAction("MIP as OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "MIP"))
+        self._act_save_ome_tiff_sum = save_menu.addAction("SUM as OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "SUM"))
+        self._act_save_ome_zarr_mip = save_menu.addAction("MIP as OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "MIP"))
+        self._act_save_ome_zarr_sum = save_menu.addAction("SUM as OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "SUM"))
+        save_menu.addSeparator()
+        save_menu.addSection("Preview")
+        self._act_save_views = save_menu.addAction("Viewer panes as PNG\u2026", self._on_save_view)
+        self._act_save_comparison = save_menu.addAction("Comparison view as PNG\u2026", self._on_save_comparison_view)
         self._btn_save.setMenu(save_menu)
         export_layout.addWidget(self._btn_save)
 
@@ -7982,7 +8150,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save_series.setEnabled(False)
         self._btn_save_series.setVisible(False)
         self._btn_save_series.clicked.connect(self._on_save_t_series)
-        export_layout.addWidget(self._btn_save_series)
         bottom.addWidget(export_group)
 
         settings_group = _bar_section(QStyle.StandardPixmap.SP_FileDialogDetailedView, "Settings and Log")
@@ -8054,6 +8221,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._refresh_recent_menu()
         self._refresh_run_history_table()
         self._set_operation_state("Idle")
+        self._update_sampling_warnings()
 
     # -----------------------------------------------------------------------
     # Persistent GUI state, recents, metadata confidence, run history
@@ -8346,6 +8514,188 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_reset_metadata.setVisible(bool(self._metadata))
         self._btn_accept_metadata.setVisible(has_warnings)
         self._metadata_warning_bar.setVisible(has_warnings or bool(self._metadata))
+
+    @staticmethod
+    def _list_value(values: Sequence[float], index: int, default: Optional[float] = None) -> Optional[float]:
+        if values:
+            return float(values[index] if index < len(values) else values[-1])
+        return default
+
+    def _nyquist_channel_rows(self) -> tuple[list[dict[str, Any]], list[str]]:
+        warnings: list[str] = []
+        is_confocal = self._micro_combo.currentText().strip().lower() == "confocal"
+        emission_values = _parse_float_list(self._le_emission.text())
+        excitation_values = _parse_float_list(self._le_excitation.text()) if is_confocal else []
+        pinhole_values = _parse_float_list(self._le_pinhole_airy.text()) if is_confocal else []
+
+        wavelengths = excitation_values if is_confocal and excitation_values else emission_values
+        wavelength_source = "excitation" if is_confocal and excitation_values else "emission"
+        if not wavelengths:
+            if is_confocal:
+                warnings.append("Enter excitation wavelength(s), or emission wavelength(s) as a fallback.")
+            else:
+                warnings.append("Enter emission wavelength(s) for widefield Nyquist sampling.")
+            return [], warnings
+
+        try:
+            na = float(self._sp_na.value())
+            refractive_index = float(self._sp_ri_imm.value())
+        except (TypeError, ValueError):
+            warnings.append("NA and immersion refractive index must be numeric.")
+            return [], warnings
+        if na >= refractive_index:
+            warnings.append(
+                f"NA must be smaller than the immersion refractive index for this calculation "
+                f"(NA={na:.3f}, n={refractive_index:.4f})."
+            )
+            return [], warnings
+
+        n_channels = max(
+            len(wavelengths),
+            len(pinhole_values) if is_confocal else 0,
+            int(self._metadata.get("size_c", self._metadata.get("n_channels", 1)) or 1),
+            1,
+        )
+        rows: list[dict[str, Any]] = []
+        for idx in range(n_channels):
+            wavelength = self._list_value(wavelengths, idx)
+            pinhole = self._list_value(pinhole_values, idx, _DEFAULT_PINHOLE_AIRY_UNITS) if is_confocal else None
+            if wavelength is None:
+                continue
+            result = _nyquist_sampling_nm(
+                wavelength,
+                na,
+                refractive_index,
+                pinhole,
+                "confocal" if is_confocal else "widefield",
+            )
+            if result is None:
+                continue
+            rows.append({
+                "index": idx,
+                "wavelength_nm": wavelength,
+                "wavelength_source": wavelength_source,
+                "pinhole_au": pinhole,
+                **result,
+            })
+        if not rows:
+            warnings.append("Could not calculate Nyquist sampling from the current optics values.")
+        return rows, warnings
+
+    def _update_sampling_warnings(self) -> None:
+        buttons = getattr(self, "_sampling_issue_buttons", {})
+        for button in buttons.values():
+            button.setVisible(False)
+            button.setToolTip("Nyquist sampling warning")
+        if not buttons:
+            return
+
+        rows, setup_warnings = self._nyquist_channel_rows()
+        is_confocal = self._micro_combo.currentText().strip().lower() == "confocal"
+        if not rows:
+            if setup_warnings:
+                tooltip = "Nyquist sampling could not be checked:\n" + "\n".join(f"- {line}" for line in setup_warnings)
+                for key in ("pixel_size_x", "pixel_size_z", "pinhole_airy_units"):
+                    button = buttons.get(key)
+                    if button is not None and (key != "pinhole_airy_units" or is_confocal):
+                        button.setToolTip(tooltip)
+                        button.setVisible(True)
+            return
+
+        limit_xy = min(row["xy_nm"] for row in rows)
+        limit_z = min(row["z_nm"] for row in rows)
+        current_xy = float(self._sp_px_xy.value())
+        current_z = float(self._sp_px_z.value())
+        try:
+            size_z = int(self._metadata.get("size_z", 2) or 2)
+        except (TypeError, ValueError):
+            size_z = 2
+        z_relevant = size_z > 1
+
+        def _channel_lines(quantity: str) -> list[str]:
+            lines = []
+            for row in rows:
+                ch = int(row["index"]) + 1
+                if quantity == "xy":
+                    rec = _format_nm(row["xy_nm"])
+                elif quantity == "z":
+                    rec = _format_nm(row["z_nm"])
+                else:
+                    rec = f"XY <= {_format_nm(row['xy_nm'])}, Z <= {_format_nm(row['z_nm'])}"
+                ph = ""
+                if is_confocal and row["pinhole_au"] is not None:
+                    ph = f", pinhole {row['pinhole_au']:.2f} AU"
+                lines.append(
+                    f"- Ch {ch}: {rec} using {row['wavelength_source']} "
+                    f"{row['wavelength_nm']:.1f} nm{ph}"
+                )
+            return lines
+
+        if is_confocal:
+            xy_formula = (
+                "Confocal formula: Cxy(pinhole) * lambda / (8 * NA). "
+                "Cxy is interpolated from the actual pinhole AU value."
+            )
+            z_formula = (
+                "Confocal formula: Cz(pinhole) * lambda / (4 * n * (1 - cos(alpha))), "
+                "where alpha = asin(NA / n). Cz is interpolated from the actual pinhole AU value."
+            )
+        else:
+            xy_formula = "Widefield formula: lambda_em / (4 * NA)."
+            z_formula = (
+                "Widefield formula: lambda_em / (2 * n * (1 - cos(alpha))), "
+                "where alpha = asin(NA / n)."
+            )
+
+        if current_xy > limit_xy * 1.01:
+            button = buttons.get("pixel_size_x")
+            if button is not None:
+                button.setToolTip(
+                    "Pixel XY is coarser than Nyquist sampling.\n"
+                    f"Current: {_format_nm(current_xy)}\n"
+                    f"Use Pixel XY <= {_format_nm(limit_xy)}.\n\n"
+                    "Per-channel limits:\n" + "\n".join(_channel_lines("xy")) + "\n\n"
+                    + xy_formula
+                )
+                button.setVisible(True)
+
+        if z_relevant and current_z > limit_z * 1.01:
+            button = buttons.get("pixel_size_z")
+            if button is not None:
+                button.setToolTip(
+                    "Pixel Z is coarser than Nyquist sampling.\n"
+                    f"Current: {_format_nm(current_z)}\n"
+                    f"Use Pixel Z <= {_format_nm(limit_z)}.\n\n"
+                    "Per-channel limits:\n" + "\n".join(_channel_lines("z")) + "\n\n"
+                    + z_formula
+                )
+                button.setVisible(True)
+
+        if is_confocal:
+            pixel_warning = current_xy > limit_xy * 1.01 or (z_relevant and current_z > limit_z * 1.01)
+            if pixel_warning:
+                optical_sections = [
+                    row["optical_section_nm"] for row in rows
+                    if math.isfinite(float(row.get("optical_section_nm", float("nan"))))
+                ]
+                section_text = ""
+                if optical_sections:
+                    section_text = (
+                        f"\nOptical section range: {_format_nm(min(optical_sections))}"
+                        f" - {_format_nm(max(optical_sections))}."
+                    )
+                button = buttons.get("pinhole_airy_units")
+                if button is not None:
+                    button.setToolTip(
+                        "Confocal Nyquist sampling uses the actual pinhole Airy value.\n"
+                        f"Use Pixel XY <= {_format_nm(limit_xy)} and Pixel Z <= {_format_nm(limit_z)}."
+                        f"{section_text}\n\n"
+                        "Per-channel limits:\n" + "\n".join(_channel_lines("both"))
+                        + "\n\nXY/Z formulas use Cxy(pinhole) and Cz(pinhole) factors. "
+                        "Optical section formula: sqrt((lambda*n/NA^2)^2 + "
+                        "(pinhole*n*sqrt(2)*1.22*lambda/NA^2)^2)."
+                    )
+                    button.setVisible(True)
 
     def _ack_metadata_field(self, key: str) -> None:
         if getattr(self, "_applying_metadata_to_fields", False):
@@ -8682,6 +9032,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._refresh_confocal_only_metadata_styles()
         self._refresh_two_d_wf_expert_state()
         self._maybe_load_default_ci_rl_dl_model()
+        self._update_sampling_warnings()
 
     def _refresh_two_d_wf_expert_state(self, _text: str = ""):
         rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
@@ -8844,14 +9195,44 @@ class DeconvolveCIWindow(QMainWindow):
     def _operation_busy(self) -> bool:
         return self._operation_state not in ("Idle", "")
 
+    def _has_3d_source(self) -> bool:
+        try:
+            return int(self._metadata.get("size_z", 1) or 1) > 1
+        except (TypeError, ValueError):
+            return False
+
+    def _has_time_series(self) -> bool:
+        try:
+            return int(self._metadata.get("size_t", 1) or 1) > 1
+        except (TypeError, ValueError):
+            return False
+
+    def _refresh_save_menu_labels(self) -> None:
+        has_time = self._has_time_series()
+        has_z = self._has_3d_source()
+        full_label = "Current timepoint" if has_time else ("Full stack" if has_z else "Image")
+        action = getattr(self, "_act_save_ome_tiff", None)
+        if action is not None:
+            action.setText(f"{full_label} as OME-TIFF...")
+        action = getattr(self, "_act_save_ome_zarr", None)
+        if action is not None:
+            action.setText(f"{full_label} as OME-Zarr...")
+        action = getattr(self, "_act_save_t_series", None)
+        if action is not None:
+            action.setText("Full T-series as OME-TIFF..." if has_time else "Full T-series as OME-TIFF")
+
     def _update_operation_controls(self) -> None:
         if not hasattr(self, "_btn_run"):
             return
+        self._refresh_save_menu_labels()
         state = self._operation_state
         busy = self._operation_busy()
         has_input = bool(self._input_channels)
         has_preview = self._viewer.current_timepoint() in self._preview_outputs_by_t if hasattr(self, "_viewer") else False
         streamed_pyramid = self._is_streamed_omero_pyramid_source() if hasattr(self, "_input_source") else False
+        can_save_preview = has_preview and state == "Idle"
+        can_save_t_series = has_input and state == "Idle" and self._has_time_series() and not streamed_pyramid
+        can_save_projection = can_save_preview and self._has_3d_source()
         worker_running = self._worker is not None and self._worker.isRunning()
         fit_worker_running = self._fit_psf_worker is not None and self._fit_psf_worker.isRunning()
         self._btn_run.setEnabled(
@@ -8862,23 +9243,30 @@ class DeconvolveCIWindow(QMainWindow):
             (has_input and state == "Idle" and not streamed_pyramid)
             or (state == "Deconvolving" and fit_worker_running)
         )
-        self._btn_save_series.setEnabled(
-            has_input and state == "Idle" and self._viewer.has_time_axis() and not streamed_pyramid
-        )
-        self._btn_save.setEnabled(has_preview and state == "Idle")
+        self._btn_save_series.setVisible(False)
+        self._btn_save_series.setEnabled(can_save_t_series)
+        self._btn_save.setEnabled(can_save_preview or can_save_t_series)
+
+        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(can_save_preview)
+        action = getattr(self, "_act_save_t_series", None)
+        if action is not None:
+            action.setEnabled(can_save_t_series)
         for action_name in (
-            "_act_save_ome_tiff",
             "_act_save_ome_tiff_mip",
             "_act_save_ome_tiff_sum",
-            "_act_save_ome_zarr",
             "_act_save_ome_zarr_mip",
             "_act_save_ome_zarr_sum",
-            "_act_save_views",
-            "_act_save_comparison",
         ):
             action = getattr(self, action_name, None)
             if action is not None:
-                action.setEnabled(has_preview and state == "Idle")
+                action.setEnabled(can_save_projection)
+        for action_name in ("_act_save_views", "_act_save_comparison"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(can_save_preview)
         for widget_name in ("_open_button", "_recent_button", "_settings_button", "_recent_settings_button"):
             widget = getattr(self, widget_name, None)
             if widget is not None:
@@ -9187,12 +9575,13 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_run.setEnabled(False)
         self._btn_fit_psf.setEnabled(False)
         self._btn_save_series.setEnabled(False)
-        self._btn_save_series.setVisible(self._viewer.has_time_axis())
+        self._btn_save_series.setVisible(False)
         self._btn_save.setEnabled(False)
         self._sync_preview_buttons()
         self._viewer.set_input_data([], self._metadata)
         self._viewer.refresh_view()
         self._set_metadata_warnings(self._metadata_issues(self._metadata))
+        self._update_sampling_warnings()
         self._set_default_movie_output_path(display_name, source_path)
         self._initial_load_context = {
             "display_name": display_name,
@@ -10369,6 +10758,13 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_save_t_series(self):
         if not self._input_channels:
             return
+        if not self._has_time_series():
+            QMessageBox.information(
+                self,
+                "No time series",
+                "This image has only one timepoint. Use the current-timepoint OME-TIFF or OME-Zarr save instead.",
+            )
+            return
         if self._is_streamed_omero_pyramid_source():
             QMessageBox.information(
                 self,
@@ -10674,6 +11070,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._cb_integrate.setChecked(bool(val))
         if data.get("last_leica_dir") is not None:
             self._last_leica_dir = _accessible_directory_or_home(data.get("last_leica_dir"))
+        self._update_sampling_warnings()
 
     def _save_last_settings(self):
         """Auto-save settings to .last_settings.json."""
@@ -10871,8 +11268,8 @@ class DeconvolveCIWindow(QMainWindow):
             self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
             self._btn_run.setEnabled(True)
             self._btn_fit_psf.setEnabled(not source_is_pyramidal)
-            self._btn_save_series.setEnabled(self._viewer.has_time_axis() and not source_is_pyramidal)
-            self._btn_save_series.setVisible(self._viewer.has_time_axis())
+            self._btn_save_series.setEnabled(False)
+            self._btn_save_series.setVisible(False)
             if source_is_pyramidal:
                 self._btn_fit_psf.setEnabled(False)
             self._maybe_load_default_ci_rl_dl_model()
@@ -10896,8 +11293,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._update_operation_controls()
 
     def _on_viewer_cursor_info(self, text: str) -> None:
-        if text:
-            self._status.showMessage(text)
+        del text
 
     def _on_viewer_time_changed(self, timepoint: int) -> None:
         previous_t = self._loaded_timepoint
@@ -10979,8 +11375,21 @@ def _excepthook(exc_type, exc_value, exc_tb):
     QMessageBox.critical(None, "Fatal Error", msg)
 
 
+def _close_pyinstaller_splash() -> None:
+    """Close PyInstaller's bootloader splash once the Qt window is visible."""
+    try:
+        import pyi_splash
+    except ImportError:
+        return
+    try:
+        pyi_splash.close()
+    except Exception:
+        log.debug("Could not close PyInstaller splash screen", exc_info=True)
+
+
 def main():
     sys.excepthook = _excepthook
+    _update_pyinstaller_splash("75% - Preparing application...")
 
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
@@ -11001,8 +11410,12 @@ def main():
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
+    _update_pyinstaller_splash("90% - Building main window...")
     window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf)
+    _update_pyinstaller_splash("100% - Starting CI Deconvolve...")
     window.show()
+    app.processEvents()
+    _close_pyinstaller_splash()
     sys.exit(app.exec())
 
 
