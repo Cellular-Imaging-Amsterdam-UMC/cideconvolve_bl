@@ -1,7 +1,7 @@
 {
   "values": {
     "method": "ci_rl",
-    "iterations": "150",
+    "iterations": "80",
     "convergence": "auto",
     "rel_threshold": 0.005,
     "overrule_image_metadata": false,

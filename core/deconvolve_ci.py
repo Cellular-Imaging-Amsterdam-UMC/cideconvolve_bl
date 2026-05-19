@@ -274,13 +274,24 @@ def _estimate_background_local_plane(
     radius_um: float = 0.5,
 ) -> float:
     """Estimate 2D background from the darkest local neighborhoods."""
-    px_nm = max(float(pixel_size_xy), 1e-6) if pixel_size_xy is not None else 100.0
+    if pixel_size_xy is None:
+        px_nm = 100.0
+    else:
+        px_val = max(float(pixel_size_xy), 1e-6)
+        # GUI callers pass nm, while metadata-driven paths historically pass
+        # um. Normalize small metadata-style values to nm before sizing the
+        # local neighborhood.
+        px_nm = px_val * 1000.0 if px_val < 10.0 else px_val
     radius_px = max(int(round((radius_um * 1000.0) / px_nm)), 1)
+    radius_px = min(radius_px, max(min(int(image.shape[-2]), int(image.shape[-1])) - 1, 0))
     kernel = 2 * radius_px + 1
     work = image[None, None]
-    padded = torch.nn.functional.pad(
-        work, (radius_px, radius_px, radius_px, radius_px), mode="reflect",
-    )
+    if radius_px > 0:
+        padded = torch.nn.functional.pad(
+            work, (radius_px, radius_px, radius_px, radius_px), mode="reflect",
+        )
+    else:
+        padded = work
     local_mean = torch.nn.functional.avg_pool2d(
         padded, kernel_size=kernel, stride=1,
     ).squeeze(0).squeeze(0)

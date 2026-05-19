@@ -70,6 +70,21 @@ _IMMERSION_RI = {
     "MULTI": 1.515,
 }
 
+
+def _pixel_size_to_backend_nm(value: Optional[float]) -> Optional[float]:
+    """Normalize metadata-style um values and GUI-style nm values to nm."""
+    if value is None:
+        return None
+    px = float(value)
+    if not np.isfinite(px) or px <= 0.0:
+        return None
+    # Image metadata in this module is stored in micrometers, while the GUI
+    # and CI PSF code use nanometers. Microscope pixel sizes below 10 are
+    # overwhelmingly metadata-style micrometers.
+    if px < 10.0:
+        return px * 1000.0
+    return px
+
 # ---------------------------------------------------------------------------
 # Helper: detect GPU availability
 # ---------------------------------------------------------------------------
@@ -981,6 +996,9 @@ def _deconvolve_ci_method(
         ci_sparse_hessian_deconvolve,
     )
 
+    pixel_size_xy_nm = _pixel_size_to_backend_nm(pixel_size_xy)
+    pixel_size_z_nm = _pixel_size_to_backend_nm(pixel_size_z)
+
     common = dict(
         image=image,
         psf=psf,
@@ -992,8 +1010,8 @@ def _deconvolve_ci_method(
         convergence=convergence,
         rel_threshold=rel_threshold,
         check_every=check_every,
-        pixel_size_xy=pixel_size_xy,
-        pixel_size_z=pixel_size_z,
+        pixel_size_xy=pixel_size_xy_nm,
+        pixel_size_z=pixel_size_z_nm,
         device=device,
     )
 
@@ -1011,8 +1029,8 @@ def _deconvolve_ci_method(
             psf,
             model_path=dl_model_path,
             optical_params={
-                "pixel_size_xy_nm": pixel_size_xy,
-                "pixel_size_z_nm": pixel_size_z,
+                "pixel_size_xy_nm": pixel_size_xy_nm,
+                "pixel_size_z_nm": pixel_size_z_nm,
                 "microscope_type": microscope_type,
             },
             device=device or "auto",
