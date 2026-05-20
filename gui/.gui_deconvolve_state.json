@@ -1,6 +1,14 @@
 {
   "recent_sources": [
     {
+      "kind": "leica",
+      "label": "TileScan_day7_633",
+      "path": "L:\\Archief\\active\\cellular_imaging\\OMERO_test\\Leica-LIF\\Swiss Rolls GM1748 LEX277AD.lif",
+      "time": "2026-05-20 10:18:37",
+      "id": "3b4303d8-0aa9-11e9-9d13-28107b9f42d1",
+      "locator": "L:\\Archief\\active\\cellular_imaging\\OMERO_test\\Leica-LIF\\Swiss Rolls GM1748 LEX277AD.lif::Swiss Rolls GM1748 LEX277AD.lif/TileScan_day7_633"
+    },
+    {
       "kind": "file",
       "label": "WF-2D-3Ch-Actin.ome.tiff",
       "path": "C:\\rahoebe\\Python\\cideconvolve\\localdata\\WF-2D-3Ch-Actin.ome.tiff",
@@ -69,12 +77,6 @@
       "label": "Position007_Crop",
       "path": "U:\\aaData\\Peroxisomes (Tracking)\\2016_10_07_17_52_01--Cropped Live\\Project002.xlef",
       "time": "2026-05-18 10:52:01"
-    },
-    {
-      "kind": "file",
-      "label": "00001_01.ome.tiff",
-      "path": "C:\\Users\\p000881\\Downloads\\cidata\\00001_01.ome.tiff",
-      "time": "2026-05-18 10:50:28"
     }
   ],
   "recent_settings": [
