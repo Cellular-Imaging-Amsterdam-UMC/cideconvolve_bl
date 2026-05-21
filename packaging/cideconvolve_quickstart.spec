@@ -82,6 +82,7 @@ bioio_ot_datas, bioio_ot_binaries, bioio_ot_hiddenimports = collect_all('bioio_o
 bioio_oz_datas, bioio_oz_binaries, bioio_oz_hiddenimports = collect_all('bioio_ome_zarr')
 bioio_cz_datas, bioio_cz_binaries, bioio_cz_hiddenimports = collect_all('bioio_czi')
 bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_nd2')
+omezarr_datas, omezarr_binaries, omezarr_hiddenimports = collect_all('ome_zarr')
 
 # ── Collect imagecodecs (TIFF/OME-TIFF codec extensions required by tifffile) ─
 imc_datas, imc_binaries, imc_hiddenimports = collect_all('imagecodecs')
@@ -96,8 +97,11 @@ mpl_datas, mpl_binaries, mpl_hiddenimports = collect_all('matplotlib')
 # ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
-# ── Collect leica_browser_qt (Open Leica… button) ────────────────────────────
+# ── Collect microscope browsers (Open Leica/Zeiss/Nikon/Olympus… buttons) ───
 leica_datas, leica_binaries, leica_hiddenimports = collect_all('leica_browser_qt')
+zeiss_datas, zeiss_binaries, zeiss_hiddenimports = collect_all('zeiss_browser_qt')
+nikon_datas, nikon_binaries, nikon_hiddenimports = collect_all('nikon_browser_qt')
+olympus_datas, olympus_binaries, olympus_hiddenimports = collect_all('olympus_browser_qt')
 
 # ── Collect Pillow (movie frames / PNG exports / overlays) ───────────────────
 pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
@@ -117,7 +121,7 @@ a = Analysis(
         pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
         + zarr_binaries + numcodecs_binaries
         + ome_binaries + omero_binaries + obqt_binaries
-        + leica_binaries + pil_binaries
+        + leica_binaries + zeiss_binaries + nikon_binaries + olympus_binaries + pil_binaries
         + xsdata_binaries + xspb_binaries
         + pyd_binaries + pyde_binaries + dask_binaries
         + imc_binaries
@@ -126,14 +130,17 @@ a = Analysis(
         + bioio_binaries + bioio_b_binaries
         + bioio_ot_binaries + bioio_oz_binaries
         + bioio_cz_binaries + bioio_nd_binaries
+        + omezarr_binaries
     ),
     datas=[
         (os.path.join(_ROOT, 'gui', 'icon.svg'), '.'),      # runtime window icon (loaded by the app)
         (os.path.join(_ROOT, 'gui', 'icon.ico'), '.'),      # Windows executable icon
+        (os.path.join(_ROOT, 'gui', 'icon.svg'), 'gui'),    # source-layout fallback for runtime icon lookup
+        (os.path.join(_ROOT, 'gui', 'icon.ico'), 'gui'),
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
-      + leica_datas + pil_datas
+      + leica_datas + zeiss_datas + nikon_datas + olympus_datas + pil_datas
       + xsdata_datas + xspb_datas
       + pyd_datas + pyde_datas + dask_datas
       + imgio_datas + imgff_datas
@@ -142,6 +149,7 @@ a = Analysis(
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
       + bioio_cz_datas + bioio_nd_datas
+      + omezarr_datas
       + _collect_model_datas(),  # default ci_rl_dl models
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
@@ -206,8 +214,11 @@ a = Analysis(
         'omero_browser_qt.widgets',
         'omero_browser_qt.view_backends',
         'omero_browser_qt.omero_viewer',
-        # ── Leica browser (optional Open Leica… button) ─────────────────────
+        # ── Microscope browsers (optional Open Leica/Zeiss/Nikon/Olympus…) ──
         'leica_browser_qt',
+        'zeiss_browser_qt',
+        'nikon_browser_qt',
+        'olympus_browser_qt',
         # ── GPU / hardware monitoring ───────────────────────────────────────
         'psutil',
         'pynvml',
@@ -239,7 +250,8 @@ a = Analysis(
     ] + pyqt6_hiddenimports + vispy_hiddenimports + ogl_hiddenimports
       + torch_hiddenimports
       + zarr_hiddenimports + numcodecs_hiddenimports
-      + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports + leica_hiddenimports + ice_toplevel
+      + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports
+      + leica_hiddenimports + zeiss_hiddenimports + nikon_hiddenimports + olympus_hiddenimports + ice_toplevel
       + xsdata_hiddenimports + xspb_hiddenimports
       + pyd_hiddenimports + pyde_hiddenimports + dask_hiddenimports
       + imc_hiddenimports
@@ -248,7 +260,8 @@ a = Analysis(
       + pil_hiddenimports
       + bioio_hiddenimports + bioio_b_hiddenimports
       + bioio_ot_hiddenimports + bioio_oz_hiddenimports
-      + bioio_cz_hiddenimports + bioio_nd_hiddenimports,
+      + bioio_cz_hiddenimports + bioio_nd_hiddenimports
+      + omezarr_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import json
 import logging
 import math
@@ -135,6 +136,7 @@ log = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
+ICON_ICO_PATH = SCRIPT_DIR / "icon.ico"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
 GUI_STATE_PATH = SCRIPT_DIR / ".gui_deconvolve_state.json"
 OMERO_SESSION_REUSE_S = 10 * 60
@@ -172,16 +174,48 @@ class _QtLogHandler(logging.Handler):
             pass
 
 
-def _load_app_icon() -> QIcon:
-    """Build a Windows-friendly multi-size icon from the bundled SVG."""
-    if not ICON_PATH.exists():
-        return QIcon()
-    if QSvgRenderer is None:
-        return QIcon(str(ICON_PATH))
+def _icon_resource_candidates(filename: str) -> list[Path]:
+    candidates: list[Path] = []
+    for root in _resource_roots():
+        candidates.extend((root / filename, root / "gui" / filename))
+    candidates.append(SCRIPT_DIR / filename)
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(path)
+    return out
 
-    renderer = QSvgRenderer(str(ICON_PATH))
+
+def _first_existing_icon_resource(filename: str) -> Optional[Path]:
+    for path in _icon_resource_candidates(filename):
+        if path.exists():
+            return path
+    return None
+
+
+def _load_app_icon() -> QIcon:
+    """Build a Windows-friendly runtime icon from bundled icon resources."""
+    ico_path = _first_existing_icon_resource("icon.ico")
+    if sys.platform == "win32" and ico_path is not None:
+        icon = QIcon(str(ico_path))
+        if not icon.isNull():
+            return icon
+
+    svg_path = _first_existing_icon_resource("icon.svg")
+    if svg_path is None:
+        return QIcon(str(ico_path)) if ico_path is not None else QIcon()
+    if QSvgRenderer is None:
+        return QIcon(str(svg_path))
+
+    renderer = QSvgRenderer(str(svg_path))
     if not renderer.isValid():
-        return QIcon(str(ICON_PATH))
+        return QIcon(str(svg_path))
 
     icon = QIcon()
     for size in (16, 20, 24, 32, 40, 48, 64, 128, 256):
@@ -300,6 +334,7 @@ from core._meta_helpers import (
     _metadata_float_list,
     _ome_enum_name,
     _pinhole_size_to_um,
+    apply_dye_wavelength_fallbacks,
 )
 
 
@@ -571,13 +606,26 @@ def _apply_metadata_defaults(images: list, meta: dict) -> dict:
     meta.setdefault("refractive_index", 1.515)
     meta.setdefault("microscope_type", "widefield")
     if "channels" not in meta:
-        meta["channels"] = [{"emission_wavelength": 520.0} for _ in images]
-    if _apply_pinhole_airy_units(meta):
-        meta_keys_from_file.add("pinhole_airy_units")
+        meta["channels"] = [{} for _ in images]
     channel_names = [str(name) for name in meta.get("channel_names", []) if str(name).strip()]
     if len(channel_names) < len(images):
         channel_names.extend(_default_channel_name(i) for i in range(len(channel_names), len(images)))
     meta["channel_names"] = channel_names
+    inferred = apply_dye_wavelength_fallbacks(meta, len(images))
+    if not meta.get("channels"):
+        meta["channels"] = [{} for _ in images]
+    emission_defaulted = False
+    for channel_meta in meta["channels"]:
+        if channel_meta.get("emission_wavelength") is None:
+            channel_meta["emission_wavelength"] = 520.0
+            emission_defaulted = True
+    if emission_defaulted:
+        defaulted = set(meta.get("_defaulted_keys") or set())
+        defaulted.add("emission_wavelength")
+        meta["_defaulted_keys"] = defaulted
+    if _apply_pinhole_airy_units(meta):
+        meta_keys_from_file.add("pinhole_airy_units")
+    meta["_inferred_keys"] = set(meta.get("_inferred_keys") or set()).union(inferred)
     meta["n_channels"] = len(images)
     meta["_from_file"] = meta_keys_from_file
     return meta
@@ -917,6 +965,75 @@ def _normalize_stack_to_zyx(arr: np.ndarray) -> np.ndarray:
     if stack.ndim == 3:
         return stack
     raise ValueError(f"Unsupported stack shape {stack.shape}; expected YX or ZYX.")
+
+
+def _normalise_roi_rect(rect: Optional[dict], size_y: int, size_x: int, *, min_size: int = 2) -> Optional[dict[str, int]]:
+    if not rect:
+        return None
+    try:
+        x = int(rect.get("x", 0))
+        y = int(rect.get("y", 0))
+        width = int(rect.get("width", 0))
+        height = int(rect.get("height", 0))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    x0 = max(0, min(x, int(size_x)))
+    y0 = max(0, min(y, int(size_y)))
+    x1 = max(0, min(x + max(width, 0), int(size_x)))
+    y1 = max(0, min(y + max(height, 0), int(size_y)))
+    if x1 - x0 < min_size or y1 - y0 < min_size:
+        return None
+    return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
+
+
+def _expand_roi_rect(rect: dict[str, int], size_y: int, size_x: int, padding: int) -> dict[str, int]:
+    pad = max(int(padding), 0)
+    x0 = max(0, int(rect["x"]) - pad)
+    y0 = max(0, int(rect["y"]) - pad)
+    x1 = min(int(size_x), int(rect["x"]) + int(rect["width"]) + pad)
+    y1 = min(int(size_y), int(rect["y"]) + int(rect["height"]) + pad)
+    return {"x": x0, "y": y0, "width": max(0, x1 - x0), "height": max(0, y1 - y0)}
+
+
+def _crop_channels_to_roi(channels: list[np.ndarray], rect: dict[str, int]) -> list[np.ndarray]:
+    x0 = int(rect["x"])
+    y0 = int(rect["y"])
+    x1 = x0 + int(rect["width"])
+    y1 = y0 + int(rect["height"])
+    return [
+        np.asarray(_normalize_stack_to_zyx(ch)[:, y0:y1, x0:x1], dtype=np.float32)
+        for ch in channels
+    ]
+
+
+def _place_roi_channels_on_full_canvas(
+    roi_channels: list[np.ndarray],
+    source_channels: list[np.ndarray],
+    roi_payload: dict,
+) -> list[np.ndarray]:
+    display = dict(roi_payload.get("display_rect") or {})
+    compute = dict(roi_payload.get("compute_rect") or {})
+    x0 = int(display.get("x", 0))
+    y0 = int(display.get("y", 0))
+    w = int(display.get("width", 0))
+    h = int(display.get("height", 0))
+    cx0 = int(compute.get("x", x0))
+    cy0 = int(compute.get("y", y0))
+    ox = max(0, x0 - cx0)
+    oy = max(0, y0 - cy0)
+    out: list[np.ndarray] = []
+    for idx, roi_ch in enumerate(roi_channels):
+        src = _normalize_stack_to_zyx(source_channels[idx if idx < len(source_channels) else 0])
+        canvas = np.zeros(src.shape, dtype=np.float32)
+        roi_stack = _normalize_stack_to_zyx(roi_ch)
+        crop = roi_stack[:, oy:oy + h, ox:ox + w]
+        z = min(canvas.shape[0], crop.shape[0])
+        hh = min(h, crop.shape[1], max(canvas.shape[1] - y0, 0))
+        ww = min(w, crop.shape[2], max(canvas.shape[2] - x0, 0))
+        if z > 0 and hh > 0 and ww > 0:
+            canvas[:z, y0:y0 + hh, x0:x0 + ww] = crop[:z, :hh, :ww]
+        out.append(canvas)
+    return out
 
 
 def _parse_float_list(text: str) -> list[float]:
@@ -1277,7 +1394,8 @@ def _image_detail_lines(display_name: str, source_path: Optional[Path], meta: di
         f"  Pixel size : XY={_format_value(meta.get('pixel_size_x'), 'um')}  "
         f"Z={_format_value(meta.get('pixel_size_z'), 'um')}",
         f"  Microscope : {meta.get('microscope_type', '?')}",
-        f"  Objective  : NA={_format_value(meta.get('na'))}  "
+        f"  Objective  : {(meta.get('objective_name') + '  ') if meta.get('objective_name') else ''}"
+        f"NA={_format_value(meta.get('na'))}  "
         f"Mag={_format_value(meta.get('magnification'), 'x')}  Immersion={meta.get('immersion', '?')}",
         f"  RI         : immersion={_format_value(meta.get('refractive_index'))}  "
         f"sample={_format_value(meta.get('sample_refractive_index'))}",
@@ -1297,6 +1415,13 @@ def _image_detail_lines(display_name: str, source_path: Optional[Path], meta: di
             f"ex={_format_value(ch_meta.get('excitation_wavelength'), 'nm')}  "
             f"mode={ch_meta.get('acquisition_mode', '?')}"
         )
+        inferred_parts = []
+        if ch_meta.get("emission_wavelength_source") == "dye_name":
+            inferred_parts.append("emission")
+        if ch_meta.get("excitation_wavelength_source") == "dye_name":
+            inferred_parts.append("excitation")
+        if inferred_parts:
+            lines.append(f"    inferred   : {', '.join(inferred_parts)} wavelength from dye/channel name")
         lines.append(
             f"    pinhole    : size={_format_value(ch_meta.get('pinhole_size'), ch_meta.get('pinhole_size_unit') or '')}  "
             f"effective={_format_value(ch_meta.get('pinhole_airy_units'), 'AU')}"
@@ -1357,11 +1482,14 @@ class _BaseTimepointSource:
 
 
 class _BioImageTimepointSource(_BaseTimepointSource):
-    def __init__(self, path_str: str):
+    def __init__(self, path_str: str, reader: Any = None):
         from bioio import BioImage
 
         self._path_str = str(path_str)
-        self._img = BioImage(self._path_str)
+        if reader is None:
+            self._img = BioImage(self._path_str)
+        else:
+            self._img = BioImage(self._path_str, reader=reader)
         meta = _extract_bioio_metadata(self._img, self._path_str)
         size_c = _bioio_dim_size(self._img, "C", default=1)
         meta = _apply_metadata_defaults([None] * size_c, meta)
@@ -1449,6 +1577,96 @@ class _HcsZarrTimepointSource(_BaseTimepointSource):
             channels.append(_normalize_stack_to_zyx(channel))
             if progress_cb is not None:
                 progress_cb(c_index + 1, total, f"Loading HCS field {self._row}/{self._col}/{self._field} channel {c_index + 1}/{total}")
+        return channels
+
+
+class _OmeZarrTimepointSource(_BaseTimepointSource):
+    def __init__(self, path_str: str):
+        from core.ome_zarr_io import open_ome_zarr_image_node
+
+        self._path, self._node = open_ome_zarr_image_node(path_str)
+        self._levels = self._node.data
+        self._level0 = self._levels[0]
+        self._layout = self._infer_layout(tuple(int(v) for v in self._level0.shape))
+        meta = self._metadata_from_node()
+        size_c = max(int(meta.get("size_c", 1)), 1)
+        meta = _apply_metadata_defaults([None] * size_c, meta)
+        meta["default_t"] = 0
+        meta["default_z"] = meta["size_z"] // 2 if meta["size_z"] > 1 else 0
+        super().__init__(meta)
+
+    @staticmethod
+    def _infer_layout(shape: tuple[int, ...]) -> dict[str, Any]:
+        if len(shape) == 5:
+            return {"kind": "TCZYX", "shape_tczyx": shape}
+        if len(shape) == 4:
+            c, z, y, x = shape
+            return {"kind": "CZYX", "shape_tczyx": (1, c, z, y, x)}
+        if len(shape) == 3:
+            c, y, x = shape
+            return {"kind": "CYX", "shape_tczyx": (1, c, 1, y, x)}
+        if len(shape) == 2:
+            y, x = shape
+            return {"kind": "YX", "shape_tczyx": (1, 1, 1, y, x)}
+        raise ValueError(f"Unsupported OME-Zarr array shape {shape}")
+
+    def _metadata_from_node(self) -> dict:
+        t, c, z, y, x = self._layout["shape_tczyx"]
+        meta: dict[str, Any] = {
+            "size_t": t,
+            "size_c": c,
+            "size_z": z,
+            "size_y": y,
+            "size_x": x,
+            "n_channels": c,
+            "name": getattr(self._node, "metadata", {}).get("name"),
+        }
+        transforms = getattr(self._node, "metadata", {}).get("coordinateTransformations") or []
+        if transforms and isinstance(transforms[0], list):
+            for transform in transforms[0]:
+                if transform.get("type") != "scale":
+                    continue
+                scale = transform.get("scale", [])
+                if len(scale) == 5:
+                    meta["pixel_size_z"] = scale[2]
+                    meta["pixel_size_y"] = scale[3]
+                    meta["pixel_size_x"] = scale[4]
+                elif len(scale) == 4:
+                    meta["pixel_size_z"] = scale[1]
+                    meta["pixel_size_y"] = scale[2]
+                    meta["pixel_size_x"] = scale[3]
+                elif len(scale) == 3:
+                    meta["pixel_size_y"] = scale[1]
+                    meta["pixel_size_x"] = scale[2]
+                break
+        return {k: v for k, v in meta.items() if v is not None}
+
+    def load_timepoint(
+        self,
+        t_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        size_c = max(int(self.metadata.get("size_c", 1)), 1)
+        size_t = max(int(self.metadata.get("size_t", 1)), 1)
+        target_t = max(0, min(int(t_index), size_t - 1))
+        kind = self._layout["kind"]
+        channels: list[np.ndarray] = []
+        for c_index in range(size_c):
+            if progress_cb is not None:
+                progress_cb(c_index, size_c, f"Loading OME-Zarr channel {c_index + 1}/{size_c}")
+            if kind == "TCZYX":
+                arr = self._level0[target_t, c_index].compute()
+            elif kind == "CZYX":
+                arr = self._level0[c_index].compute()
+            elif kind == "CYX":
+                arr = self._level0[c_index].compute()[np.newaxis, :, :]
+            elif kind == "YX":
+                arr = self._level0.compute()[np.newaxis, :, :]
+            else:
+                raise ValueError(f"Unsupported OME-Zarr layout {kind}")
+            channels.append(_normalize_stack_to_zyx(arr))
+            if progress_cb is not None:
+                progress_cb(c_index + 1, size_c, f"Loading OME-Zarr channel {c_index + 1}/{size_c}")
         return channels
 
 
@@ -1710,7 +1928,50 @@ class _TimepointLoadWorker(QThread):
             )
 
 
-def _leica_microscope_type(metadata: dict) -> str:
+_BROWSER_VENDOR_SPECS: dict[str, dict[str, str]] = {
+    "leica": {
+        "label": "Leica",
+        "package": "leica-browser-qt",
+        "module": "leica_browser_qt",
+        "dialog": "LeicaBrowserDialog",
+        "minimum": "0.4.0",
+    },
+    "zeiss": {
+        "label": "Zeiss",
+        "package": "zeiss-browser-qt",
+        "module": "zeiss_browser_qt",
+        "dialog": "ZeissBrowserDialog",
+        "minimum": "0.4.0",
+    },
+    "nikon": {
+        "label": "Nikon",
+        "package": "nikon-browser-qt",
+        "module": "nikon_browser_qt",
+        "dialog": "NikonBrowserDialog",
+        "minimum": "0.1.0",
+    },
+    "olympus": {
+        "label": "Olympus",
+        "package": "olympus-browser-qt",
+        "module": "olympus_browser_qt",
+        "dialog": "OlympusBrowserDialog",
+        "minimum": "0.1.0",
+    },
+}
+_BROWSER_VENDOR_KEYS = tuple(_BROWSER_VENDOR_SPECS)
+
+
+def _browser_vendor_label(vendor_key: str) -> str:
+    return _BROWSER_VENDOR_SPECS.get(vendor_key, {}).get("label", str(vendor_key).title())
+
+
+def _import_browser_dialog(vendor_key: str):
+    spec = _BROWSER_VENDOR_SPECS[vendor_key]
+    module = importlib.import_module(spec["module"])
+    return getattr(module, spec["dialog"])
+
+
+def _browser_microscope_type(metadata: dict) -> str:
     raw = str(
         metadata.get("microscope_type")
         or metadata.get("mic_type2")
@@ -1722,7 +1983,7 @@ def _leica_microscope_type(metadata: dict) -> str:
     return "widefield"
 
 
-_LEICA_COLOR_NAMES = {
+_BROWSER_COLOR_NAMES = {
     "gray": (192, 192, 192),
     "grey": (192, 192, 192),
     "white": (255, 255, 255),
@@ -1741,8 +2002,8 @@ def _coerce_channel_color(value: Any) -> Optional[tuple[int, int, int]]:
         return None
     if isinstance(value, str):
         text = value.strip().lower()
-        if text in _LEICA_COLOR_NAMES:
-            return _LEICA_COLOR_NAMES[text]
+        if text in _BROWSER_COLOR_NAMES:
+            return _BROWSER_COLOR_NAMES[text]
         hex_text = text.lstrip("#")
         if len(hex_text) == 8:
             # Leica/OME-like values may include alpha first; keep RGB tail.
@@ -1765,7 +2026,7 @@ def _coerce_channel_color(value: Any) -> Optional[tuple[int, int, int]]:
     return None
 
 
-def _leica_channel_color(metadata: dict, idx: int) -> Optional[tuple[int, int, int]]:
+def _browser_channel_color(metadata: dict, idx: int) -> Optional[tuple[int, int, int]]:
     for key in ("channel_colors", "colors", "lut_colors", "lutcolors", "color"):
         values = metadata.get(key)
         if idx == 0 and isinstance(values, (str, int)):
@@ -1788,7 +2049,7 @@ def _leica_channel_color(metadata: dict, idx: int) -> Optional[tuple[int, int, i
     return None
 
 
-def _leica_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
+def _browser_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
     emissions = metadata.get("emission")
     excitations = metadata.get("excitation")
     names = metadata.get("channel_names") or metadata.get("lutname") or []
@@ -1799,7 +2060,7 @@ def _leica_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
             ch["name"] = str(names[idx])
         else:
             ch["name"] = _default_channel_name(idx)
-        color = _leica_channel_color(metadata, idx)
+        color = _browser_channel_color(metadata, idx)
         if color is not None and color != (255, 255, 255):
             ch["color"] = color
         if isinstance(emissions, list) and idx < len(emissions):
@@ -1816,7 +2077,7 @@ def _leica_channel_metadata(metadata: dict, size_c: int) -> list[dict]:
                     ch["excitation_wavelength"] = value
             except (TypeError, ValueError):
                 pass
-        ch["acquisition_mode"] = _leica_microscope_type(metadata)
+        ch["acquisition_mode"] = _browser_microscope_type(metadata)
         pinhole = metadata.get("pinhole_airy")
         if pinhole is not None:
             ch["pinhole_airy_units"] = pinhole
@@ -1832,51 +2093,78 @@ def _positive_float(value: Any) -> Optional[float]:
     return number if number > 0 else None
 
 
-def _leica_resolution_m_to_um(value: Any) -> Optional[float]:
+def _resolution_m_to_um(value: Any) -> Optional[float]:
     number = _positive_float(value)
     if number is None:
         return None
     return number * 1_000_000.0
 
 
-class _LeicaTimepointSource(_BaseTimepointSource):
-    def __init__(self, context):
+def _context_positive_int(context: Any, attr: str, metadata: dict, *keys: str, default: int = 1) -> int:
+    for value in (getattr(context, attr, None), *(metadata.get(key) for key in keys)):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return max(int(default), 1)
+
+
+def _browser_pixel_size_um(context: Any, metadata: dict, axis: str) -> Optional[float]:
+    attr_value = _positive_float(getattr(context, f"pixel_size_{axis}_um", None))
+    if attr_value is not None:
+        return attr_value
+    for key in (
+        f"pixel_size_{axis}_um",
+        f"pixel_size_{axis}",
+        f"PhysicalSize{axis.upper()}",
+        f"physical_size_{axis}",
+        f"{axis}res2",
+    ):
+        value = _positive_float(metadata.get(key))
+        if value is not None:
+            return value
+    return _resolution_m_to_um(metadata.get(f"{axis}res"))
+
+
+class _BrowserTimepointSource(_BaseTimepointSource):
+    def __init__(self, context, vendor_key: str):
+        self._vendor_key = vendor_key
+        self._vendor_label = _browser_vendor_label(vendor_key)
         self._context = context
         self._handle = context.open()
-        src = dict(context.metadata)
-        size_c = max(int(context.size_c or src.get("channels") or 1), 1)
+        src = dict(getattr(context, "metadata", {}) or {})
+        size_c = _context_positive_int(context, "size_c", src, "channels", "size_c", default=1)
+        size_t = _context_positive_int(context, "size_t", src, "ts", "size_t", default=1)
+        size_z = _context_positive_int(context, "size_z", src, "zs", "size_z", default=1)
+        size_y = _context_positive_int(context, "size_y", src, "ys", "size_y", default=1)
+        size_x = _context_positive_int(context, "size_x", src, "xs", "size_x", default=1)
+        context_dict = _browser_context_dict(context)
         meta = {
-            "id": _leica_context_id(context),
-            "pixel_size_x": (
-                _leica_resolution_m_to_um(src.get("xres"))
-                or _positive_float(context.pixel_size_x_um)
-                or _positive_float(src.get("xres2"))
-            ),
-            "pixel_size_y": (
-                _leica_resolution_m_to_um(src.get("yres"))
-                or _positive_float(context.pixel_size_y_um)
-                or _positive_float(src.get("yres2"))
-            ),
-            "pixel_size_z": (
-                _leica_resolution_m_to_um(src.get("zres"))
-                or _positive_float(context.pixel_size_z_um)
-                or _positive_float(src.get("zres2"))
-            ),
-            "na": src.get("na"),
+            "id": _browser_context_id(context),
+            "pixel_size_x": _browser_pixel_size_um(context, src, "x"),
+            "pixel_size_y": _browser_pixel_size_um(context, src, "y"),
+            "pixel_size_z": _browser_pixel_size_um(context, src, "z"),
+            "na": src.get("na") or src.get("numerical_aperture"),
             "refractive_index": src.get("refractiveindex") or src.get("refractive_index"),
-            "magnification": src.get("magnification"),
-            "microscope_type": _leica_microscope_type(src),
-            "channel_names": list(context.channel_names or src.get("channel_names") or []),
-            "channels": _leica_channel_metadata(src, size_c),
-            "size_t": max(int(context.size_t or src.get("ts") or 1), 1),
-            "size_z": max(int(context.size_z or src.get("zs") or 1), 1),
-            "size_y": max(int(context.size_y or src.get("ys") or 1), 1),
-            "size_x": max(int(context.size_x or src.get("xs") or 1), 1),
+            "magnification": src.get("magnification") or src.get("objective_mag"),
+            "objective_name": src.get("objective_name"),
+            "microscope_type": _browser_microscope_type(src),
+            "channel_names": list(getattr(context, "channel_names", None) or src.get("channel_names") or []),
+            "channels": _browser_channel_metadata(src, size_c),
+            "size_t": size_t,
+            "size_z": size_z,
+            "size_y": size_y,
+            "size_x": size_x,
             "size_c": size_c,
             "default_t": 0,
-            "default_z": max(int(context.size_z or src.get("zs") or 1) // 2, 0),
-            "leica_context": context.to_dict(),
+            "default_z": max(size_z // 2, 0),
+            "browser_vendor": vendor_key,
+            "browser_context": context_dict,
         }
+        if vendor_key == "leica":
+            meta["leica_context"] = context_dict
         meta = {k: v for k, v in meta.items() if v is not None}
         meta = _apply_metadata_defaults([None] * size_c, meta)
         super().__init__(meta)
@@ -1891,20 +2179,21 @@ class _LeicaTimepointSource(_BaseTimepointSource):
         target_t = max(0, min(int(t_index), size_t - 1))
         channels: list[np.ndarray] = []
         total = size_c
+        selected_s = getattr(self._context, "selected_s", None)
         for c_index in range(size_c):
             if progress_cb is not None:
                 progress_cb(
                     c_index,
                     total,
-                    f"Loading Leica stack… channel {c_index + 1}/{total}",
+                    f"Loading {self._vendor_label} stack… channel {c_index + 1}/{total}",
                 )
-            stack = self._handle.read_stack(c=c_index, t=target_t)
+            stack = self._handle.read_stack(c=c_index, t=target_t, s=selected_s)
             channels.append(_normalize_stack_to_zyx(stack))
             if progress_cb is not None:
                 progress_cb(
                     c_index + 1,
                     total,
-                    f"Loading Leica stack… channel {c_index + 1}/{total}",
+                    f"Loading {self._vendor_label} stack… channel {c_index + 1}/{total}",
                 )
         return channels
 
@@ -1913,6 +2202,12 @@ def _build_file_source(path_str: str) -> _BaseTimepointSource:
     path = Path(path_str)
     if path.is_dir() and path.suffix.lower() == ".zarr" and _is_hcs_zarr_plate(path):
         return _HcsZarrTimepointSource(path_str)
+    if path.is_dir() and path.suffix.lower() == ".zarr":
+        return _OmeZarrTimepointSource(path_str)
+    if path.is_dir():
+        from core.ome_zarr_io import is_ome_zarr_image_group
+        if is_ome_zarr_image_group(path):
+            return _OmeZarrTimepointSource(path_str)
     return _BioImageTimepointSource(path_str)
 
 
@@ -1920,11 +2215,60 @@ def _build_omero_source(image) -> _BaseTimepointSource:
     return _OmeroTimepointSource(image)
 
 
+def _build_browser_source(context, vendor_key: str) -> _BaseTimepointSource:
+    return _BrowserTimepointSource(context, vendor_key)
+
+
 def _build_leica_source(context) -> _BaseTimepointSource:
-    return _LeicaTimepointSource(context)
+    return _build_browser_source(context, "leica")
 
 
-def _leica_context_dict(context: Any) -> dict[str, Any]:
+def _zarr_attrs(path: Path) -> dict:
+    try:
+        attrs_path = path / ".zattrs"
+        if attrs_path.is_file():
+            data = json.loads(attrs_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _is_ome_zarr_image_group(path: Path) -> bool:
+    attrs = _zarr_attrs(path)
+    return isinstance(attrs.get("multiscales"), list)
+
+
+def _bioformats2raw_primary_series_path(path: Path) -> Optional[Path]:
+    attrs = _zarr_attrs(path)
+    if "bioformats2raw.layout" not in attrs:
+        return None
+
+    series: list[str] = []
+    ome_attrs = _zarr_attrs(path / "OME")
+    raw_series = ome_attrs.get("series")
+    if isinstance(raw_series, list):
+        series.extend(str(item) for item in raw_series if str(item))
+
+    if not series:
+        try:
+            series.extend(
+                child.name
+                for child in sorted(path.iterdir(), key=lambda p: p.name)
+                if child.is_dir() and _is_ome_zarr_image_group(child)
+            )
+        except Exception:
+            pass
+
+    for series_name in series:
+        candidate = path / series_name
+        if _is_ome_zarr_image_group(candidate):
+            return candidate
+    return None
+
+
+def _browser_context_dict(context: Any) -> dict[str, Any]:
     if context is None:
         return {}
     if hasattr(context, "to_dict"):
@@ -1937,8 +2281,8 @@ def _leica_context_dict(context: Any) -> dict[str, Any]:
     return {}
 
 
-def _leica_context_id(context: Any) -> str:
-    data = _leica_context_dict(context)
+def _browser_context_id(context: Any) -> str:
+    data = _browser_context_dict(context)
     candidates = (
         "uuid", "id", "image_id", "image_uuid", "series_uuid", "series_id",
         "internal_id", "internal_path", "path", "name",
@@ -1952,6 +2296,14 @@ def _leica_context_id(context: Any) -> str:
         if value not in (None, ""):
             return str(value)
     return str(getattr(context, "internal_path", "") or getattr(context, "name", ""))
+
+
+def _leica_context_dict(context: Any) -> dict[str, Any]:
+    return _browser_context_dict(context)
+
+
+def _leica_context_id(context: Any) -> str:
+    return _browser_context_id(context)
 
 
 # ---------------------------------------------------------------------------
@@ -2415,7 +2767,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                 "html": f"""
                     <h2>Getting Started</h2>
                     <ol>
-                    <li>Open an image, Zarr folder, Leica source, or OMERO image from the Open menu.</li>
+                    <li>Open an image, Zarr folder, microscope browser source, or OMERO image from the Open menu.</li>
                     <li>Check highlighted metadata fields. Green fields are loaded or confident; red fields need attention.</li>
                     <li>Choose a method. Start with <code>ci_rl</code>, or <code>ci_rl_dl</code> when a matching DL model is available.</li>
                     <li>Inspect Original and Deconvolved views with channels, projection, scale bar, navigator, and linked zoom.</li>
@@ -2431,7 +2783,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                 "html": f"""
                     <h2>Open, Recent, Settings, Run, And Save Menus</h2>
                     <ul>
-                    <li><b>Open</b> loads local OME-TIFF, TIFF, Zarr, Leica, or OMERO sources. Drag-and-drop uses the same loading path.</li>
+                    <li><b>Open</b> loads local OME-TIFF, TIFF, Zarr, Leica, Zeiss, Nikon, Olympus, or OMERO sources. Drag-and-drop uses the same loading path.</li>
                     <li><b>Recent</b> reopens recent image sources. The settings pane has a separate recent settings menu.</li>
                     <li><b>Settings</b> restores, saves, or loads GUI parameter presets.</li>
                     <li><b>Log</b> opens the live run log with convergence charts and optional image metrics.</li>
@@ -5150,6 +5502,7 @@ class _DeconvolveWorker(QThread):
                 "timepoint": self.t_index,
                 "channels": results,
                 "metrics": metrics,
+                "roi_preview": self.params.get("roi_preview"),
             })
         except Exception as exc:
             if monitor is not None:
@@ -6275,11 +6628,13 @@ def _batch_source_stem(name: str) -> str:
 
 
 def _batch_output_base_name(item: _BatchItem) -> str:
-    if item.source_type == "leica":
+    if item.source_type in _BROWSER_VENDOR_KEYS:
         save_child_name = item.metadata.get("save_child_name")
-        leica_context = item.metadata.get("leica_context")
-        if not save_child_name and isinstance(leica_context, dict):
-            save_child_name = leica_context.get("save_child_name")
+        context_data = item.metadata.get("browser_context")
+        if context_data is None and item.source_type == "leica":
+            context_data = item.metadata.get("leica_context")
+        if not save_child_name and isinstance(context_data, dict):
+            save_child_name = context_data.get("save_child_name")
         if save_child_name:
             return str(save_child_name)
     return item.display_name
@@ -6377,9 +6732,9 @@ class _BatchDeconvolveWorker(QThread):
             if bool(getattr(source, "is_pyramidal", False)):
                 return _OmeroPyramidRegionSource(source)
             return _TimepointRegionSource(source, source_id=f"omero:{item.locator}")
-        if item.source_type == "leica":
-            source = _build_leica_source(item.source_obj)
-            return _TimepointRegionSource(source, source_id=f"leica:{item.locator}")
+        if item.source_type in _BROWSER_VENDOR_KEYS:
+            source = _build_browser_source(item.source_obj, item.source_type)
+            return _TimepointRegionSource(source, source_id=f"{item.source_type}:{item.locator}")
         raise ValueError(f"Unsupported source type: {item.source_type}")
 
     def run(self):
@@ -6523,9 +6878,11 @@ class _BatchDeconvolverDialog(QDialog):
         btn_zarr = QPushButton("Open Zarr\u2026")
         btn_zarr.clicked.connect(self._on_add_zarr)
         add_bar.addWidget(btn_zarr)
-        btn_leica = QPushButton("Open Leica\u2026")
-        btn_leica.clicked.connect(self._on_add_leica)
-        add_bar.addWidget(btn_leica)
+        for vendor_key in _BROWSER_VENDOR_KEYS:
+            label = _browser_vendor_label(vendor_key)
+            btn_browser = QPushButton(f"Open {label}\u2026")
+            btn_browser.clicked.connect(lambda _checked=False, key=vendor_key: self._on_add_browser(key))
+            add_bar.addWidget(btn_browser)
         btn_omero = QPushButton("Open OMERO\u2026")
         btn_omero.clicked.connect(self._on_add_omero)
         add_bar.addWidget(btn_omero)
@@ -6797,18 +7154,25 @@ class _BatchDeconvolverDialog(QDialog):
         self._host._last_zarr_dir = str(Path(paths[0]).parent)
         self._add_items([_file_or_zarr_batch_item(path, "zarr") for path in paths])
 
-    def _on_add_leica(self) -> None:
+    def _on_add_browser(self, vendor_key: str) -> None:
+        label = _browser_vendor_label(vendor_key)
+        spec = _BROWSER_VENDOR_SPECS[vendor_key]
         try:
-            from leica_browser_qt import LeicaBrowserDialog
+            DialogClass = _import_browser_dialog(vendor_key)
         except ImportError:
-            QMessageBox.critical(self, "Leica Browser Missing", "leica-browser-qt is not installed.")
+            QMessageBox.critical(
+                self,
+                f"{label} Browser Missing",
+                f"{spec['package']} is not installed.\n\n"
+                f"Install version {spec['minimum']} or newer to open {label} data.",
+            )
             return
-        start_dir = _accessible_directory_or_home(self._host._last_leica_dir)
-        dialog = LeicaBrowserDialog(roots=[start_dir], selection_mode="multiple", parent=self)
+        start_dir = _accessible_directory_or_home(self._host._last_browser_dir(vendor_key))
+        dialog = DialogClass(roots=[start_dir], selection_mode="multiple", parent=self)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        browsed_root = self._host._leica_dialog_current_root(dialog)
+        browsed_root = self._host._browser_dialog_current_root(dialog)
         if browsed_root is not None:
-            self._host._set_last_leica_dir(browsed_root, persist=True)
+            self._host._set_last_browser_dir(vendor_key, browsed_root, persist=True)
         if not accepted:
             return
         if hasattr(dialog, "selected_contexts"):
@@ -6819,21 +7183,28 @@ class _BatchDeconvolverDialog(QDialog):
         items = []
         for ctx in contexts:
             meta = dict(getattr(ctx, "metadata", {}) or {})
+            context_dict = ctx.to_dict() if hasattr(ctx, "to_dict") else {}
             meta.update({
-                "name": getattr(ctx, "name", "Leica image"),
+                "name": getattr(ctx, "name", f"{label} image"),
                 "size_t": max(int(getattr(ctx, "size_t", 1) or meta.get("ts", 1)), 1),
                 "size_c": max(int(getattr(ctx, "size_c", 1) or meta.get("channels", 1)), 1),
                 "size_z": max(int(getattr(ctx, "size_z", 1) or meta.get("zs", 1)), 1),
                 "size_y": max(int(getattr(ctx, "size_y", 0) or meta.get("ys", 0)), 0),
                 "size_x": max(int(getattr(ctx, "size_x", 0) or meta.get("xs", 0)), 0),
-                "leica_context": ctx.to_dict() if hasattr(ctx, "to_dict") else {},
+                "browser_vendor": vendor_key,
+                "browser_context": context_dict,
             })
+            if vendor_key == "leica":
+                meta["leica_context"] = context_dict
             locator = f"{getattr(ctx, 'container_path', '')}::{getattr(ctx, 'internal_path', getattr(ctx, 'name', ''))}"
             display_name = _batch_output_base_name(
-                _BatchItem("leica", str(getattr(ctx, "name", "Leica image")), locator, meta)
+                _BatchItem(vendor_key, str(getattr(ctx, "name", f"{label} image")), locator, meta)
             )
-            items.append(_BatchItem("leica", display_name, locator, meta, source_obj=ctx))
+            items.append(_BatchItem(vendor_key, display_name, locator, meta, source_obj=ctx))
         self._add_items(items)
+
+    def _on_add_leica(self) -> None:
+        self._on_add_browser("leica")
 
     def _on_add_omero(self) -> None:
         try:
@@ -7077,6 +7448,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._input_source_factory: Optional[Callable[[], _BaseTimepointSource]] = None
         self._loaded_timepoint: Optional[int] = None
         self._preview_outputs_by_t: dict[int, list[np.ndarray]] = {}
+        self._preview_roi_by_t: dict[int, dict] = {}
         self._metadata: dict = {}
         self._worker: Optional[_DeconvolveWorker] = None
         self._load_worker: Optional[_TimepointLoadWorker] = None
@@ -7107,6 +7479,9 @@ class DeconvolveCIWindow(QMainWindow):
         self._input_path: Optional[Path] = None
         self._last_open_dir: str = _default_settings_dir()
         self._last_leica_dir: str = _default_settings_dir()
+        self._last_browser_dirs: dict[str, str] = {
+            key: _default_settings_dir() for key in _BROWSER_VENDOR_KEYS
+        }
         self._last_zarr_dir: str = _default_settings_dir()
         self._last_save_dir: str = _default_settings_dir()
         self._last_settings_dir: str = _default_settings_dir()
@@ -8033,6 +8408,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._viewer.timepointChanged.connect(self._on_viewer_time_changed)
         self._viewer.logRequested.connect(self._open_log_dialog)
         self._viewer.cursorInfoChanged.connect(self._on_viewer_cursor_info)
+        self._viewer.roiChanged.connect(self._on_viewer_roi_changed)
         vl.addWidget(self._viewer, stretch=1)
         splitter.addWidget(viewer)
 
@@ -8067,7 +8443,12 @@ class DeconvolveCIWindow(QMainWindow):
         open_menu = QMenu(self._open_button)
         open_menu.addAction("Open File\u2026", self._on_open)
         open_menu.addAction("Open OME-Zarr\u2026", self._on_open_zarr)
-        open_menu.addAction("Open Leica\u2026", self._on_open_leica)
+        for vendor_key in _BROWSER_VENDOR_KEYS:
+            label = _browser_vendor_label(vendor_key)
+            open_menu.addAction(
+                f"Open {label}\u2026",
+                lambda _checked=False, key=vendor_key: self._on_open_browser(key),
+            )
         open_menu.addAction("Open OMERO\u2026", self._on_open_omero)
         self._open_button.setMenu(open_menu)
         open_layout.addWidget(self._open_button)
@@ -8329,16 +8710,17 @@ class DeconvolveCIWindow(QMainWindow):
             self._status.showMessage("Open OMERO and select the recent image again", 5000)
             self._on_open_omero()
             return
-        if kind == "leica":
+        if kind in _BROWSER_VENDOR_KEYS:
+            label = _browser_vendor_label(kind)
             if raw_path:
                 path = Path(raw_path)
-                self._set_last_leica_dir(path.parent if path.is_file() else path)
+                self._set_last_browser_dir(kind, path.parent if path.is_file() else path)
             self._status.showMessage(
-                "Opening Leica browser; select the stored image"
+                f"Opening {label} browser; select the stored image"
                 + (f" (ID: {entry.get('id')})" if entry.get("id") else ""),
                 7000,
             )
-            self._on_open_leica()
+            self._on_open_browser(kind)
             return
         path = Path(raw_path)
         if not raw_path or not path.exists():
@@ -8393,6 +8775,7 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _metadata_issues(self, meta: dict) -> list[MetadataIssue]:
         from_file = set(meta.get("_from_file") or [])
+        inferred = set(meta.get("_inferred_keys") or [])
         acknowledged = set(self._metadata_acknowledged_fields)
         issues: list[MetadataIssue] = []
         size_z = int(meta.get("size_z", 1) or 1)
@@ -8413,7 +8796,11 @@ class DeconvolveCIWindow(QMainWindow):
                 field_key="pixel_size_z",
                 ack_key="pixel_size_z",
             ))
-        if "emission_wavelength" not in from_file and "emission_wavelength" not in acknowledged:
+        if (
+            "emission_wavelength" not in from_file
+            and "emission_wavelength" not in inferred
+            and "emission_wavelength" not in acknowledged
+        ):
             issues.append(MetadataIssue(
                 key="emission_wavelength_default",
                 title="Emission default",
@@ -8721,6 +9108,7 @@ class DeconvolveCIWindow(QMainWindow):
         factory = self._input_source_factory
         channels = list(self._input_channels)
         previews = dict(self._preview_outputs_by_t)
+        preview_rois = dict(self._preview_roi_by_t)
         loaded_t = self._loaded_timepoint
         if source is None:
             return
@@ -8729,6 +9117,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._input_channels = channels
             self._loaded_timepoint = loaded_t
             self._preview_outputs_by_t = previews
+            self._preview_roi_by_t = preview_rois
         self._status.showMessage("Fields reset to image metadata", 3000)
 
     def _begin_run_timeline(self, kind: str) -> None:
@@ -9000,10 +9389,13 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _refresh_confocal_only_metadata_styles(self, from_file: Optional[set[str]] = None) -> None:
         from_file = set(from_file if from_file is not None else self._metadata.get("_from_file", set()))
+        inferred = set(self._metadata.get("_inferred_keys") or [])
         if self._micro_combo.currentText() == "widefield":
             style = self._metadata_field_background(True)
         else:
-            style = self._metadata_field_background("excitation_wavelength" in from_file)
+            style = self._metadata_field_background(
+                "excitation_wavelength" in from_file or "excitation_wavelength" in inferred
+            )
         self._le_excitation.setStyleSheet(style)
 
         if self._micro_combo.currentText() == "widefield":
@@ -9293,14 +9685,34 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_leica_dir = _accessible_directory_or_home(
             data.get("last_leica_dir", self._last_leica_dir)
         )
+        self._last_browser_dirs["leica"] = self._last_leica_dir
+        for vendor_key in _BROWSER_VENDOR_KEYS:
+            key = f"last_{vendor_key}_dir"
+            value = data.get(key)
+            if value is not None:
+                self._last_browser_dirs[vendor_key] = _accessible_directory_or_home(value)
+        self._last_leica_dir = self._last_browser_dirs["leica"]
 
-    def _set_last_leica_dir(self, path_like: Any, *, persist: bool = False) -> None:
-        self._last_leica_dir = _accessible_directory_or_home(path_like)
+    def _last_browser_dir(self, vendor_key: str) -> str:
+        if vendor_key == "leica":
+            self._last_browser_dirs["leica"] = self._last_leica_dir
+        return _accessible_directory_or_home(
+            self._last_browser_dirs.get(vendor_key, _default_settings_dir())
+        )
+
+    def _set_last_browser_dir(self, vendor_key: str, path_like: Any, *, persist: bool = False) -> None:
+        value = _accessible_directory_or_home(path_like)
+        self._last_browser_dirs[vendor_key] = value
+        if vendor_key == "leica":
+            self._last_leica_dir = value
         if persist:
             self._save_last_settings()
 
+    def _set_last_leica_dir(self, path_like: Any, *, persist: bool = False) -> None:
+        self._set_last_browser_dir("leica", path_like, persist=persist)
+
     @staticmethod
-    def _leica_dialog_current_root(dialog) -> Optional[Path]:
+    def _browser_dialog_current_root(dialog) -> Optional[Path]:
         root = getattr(dialog, "_current_root", None)
         if root:
             return Path(root)
@@ -9309,6 +9721,10 @@ class DeconvolveCIWindow(QMainWindow):
             current_path = Path(current_file)
             return current_path.parent if current_path.is_file() else current_path
         return None
+
+    @staticmethod
+    def _leica_dialog_current_root(dialog) -> Optional[Path]:
+        return DeconvolveCIWindow._browser_dialog_current_root(dialog)
 
     # -----------------------------------------------------------------------
     # File open
@@ -9341,7 +9757,9 @@ class DeconvolveCIWindow(QMainWindow):
         self._batch_dialog.raise_()
         self._batch_dialog.activateWindow()
 
-    def _on_open_leica(self):
+    def _on_open_browser(self, vendor_key: str):
+        label = _browser_vendor_label(vendor_key)
+        spec = _BROWSER_VENDOR_SPECS[vendor_key]
         if self._operation_busy() and self._operation_state != "Loading":
             self._status.showMessage("Wait for the current operation to finish.", 5000)
             return
@@ -9349,60 +9767,72 @@ class DeconvolveCIWindow(QMainWindow):
             self._status.showMessage("Wait for the current image load to finish, or cancel it first.", 5000)
             return
         try:
-            from leica_browser_qt import LeicaBrowserDialog
+            DialogClass = _import_browser_dialog(vendor_key)
         except ImportError:
             QMessageBox.critical(
                 self,
-                "Leica Browser Missing",
-                "leica-browser-qt is not installed.\n\n"
-                "Install version 0.2.0 or newer to open Leica LIF, XLEF, and LOF data.",
+                f"{label} Browser Missing",
+                f"{spec['package']} is not installed.\n\n"
+                f"Install version {spec['minimum']} or newer to open {label} data.",
             )
             return
 
-        start_dir = _accessible_directory_or_home(self._last_leica_dir)
-        self._last_leica_dir = start_dir
-        dialog = LeicaBrowserDialog(
+        start_dir = _accessible_directory_or_home(self._last_browser_dir(vendor_key))
+        self._set_last_browser_dir(vendor_key, start_dir)
+        dialog = DialogClass(
             roots=[start_dir],
             selection_mode="single",
             parent=self,
         )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        browsed_root = self._leica_dialog_current_root(dialog)
+        browsed_root = self._browser_dialog_current_root(dialog)
         if browsed_root is not None:
-            self._set_last_leica_dir(browsed_root, persist=True)
+            self._set_last_browser_dir(vendor_key, browsed_root, persist=True)
         if not accepted:
             return
         context = dialog.selected_context()
         if context is None:
             return
         container = Path(context.container_path)
-        leica_id = _leica_context_id(context)
-        leica_locator = f"{context.container_path}::{getattr(context, 'internal_path', leica_id or context.name)}"
+        browser_id = _browser_context_id(context)
+        browser_locator = f"{context.container_path}::{getattr(context, 'internal_path', browser_id or context.name)}"
         if browsed_root is None:
-            self._set_last_leica_dir(container.parent if container.is_file() else container, persist=True)
-        self._reset_log(f"CIDeconvolve GUI log — opening Leica image {context.name}")
-        self._log(f"Opening Leica source: {context.container_path} :: {context.internal_path}")
+            self._set_last_browser_dir(vendor_key, container.parent if container.is_file() else container, persist=True)
+        self._reset_log(f"CIDeconvolve GUI log — opening {label} image {context.name}")
+        self._log(f"Opening {label} source: {context.container_path} :: {context.internal_path}")
         t_open = time.time()
         try:
             self._begin_busy_progress(f"Opening {context.name} …")
-            source = _build_leica_source(context)
+            source = _build_browser_source(context, vendor_key)
             self._apply_image_source(
                 source,
                 context.name,
                 source_path=Path(context.container_path),
-                source_factory=lambda _context=context: _build_leica_source(_context),
-                recent_kind="leica",
-                recent_id=leica_id,
-                recent_locator=leica_locator,
+                source_factory=lambda _context=context, _vendor_key=vendor_key: _build_browser_source(_context, _vendor_key),
+                recent_kind=vendor_key,
+                recent_id=browser_id,
+                recent_locator=browser_locator,
             )
             self._log(f"Open metadata complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
-            self._log(f"Leica load failed: {exc}")
-            QMessageBox.critical(self, "Leica Load Error", str(exc))
-            self._status.showMessage("Leica load failed", 5000)
+            self._log(f"{label} load failed: {exc}")
+            QMessageBox.critical(self, f"{label} Load Error", str(exc))
+            self._status.showMessage(f"{label} load failed", 5000)
         finally:
             if self._load_worker is None or not self._load_worker.isRunning():
                 self._end_progress()
+
+    def _on_open_leica(self):
+        self._on_open_browser("leica")
+
+    def _on_open_zeiss(self):
+        self._on_open_browser("zeiss")
+
+    def _on_open_nikon(self):
+        self._on_open_browser("nikon")
+
+    def _on_open_olympus(self):
+        self._on_open_browser("olympus")
 
     def _do_load(self, path: str):
         if self._operation_busy() and self._operation_state != "Loading":
@@ -9454,12 +9884,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._loaded_timepoint = None
         self._metadata = dict(source.metadata)
         self._preview_outputs_by_t.clear()
+        self._preview_roi_by_t.clear()
         self._input_path = source_path
         self._metadata_acknowledged_fields.clear()
 
         # Populate UI from metadata
         meta = self._metadata
         from_file = meta.get("_from_file", set())
+        inferred = set(meta.get("_inferred_keys") or [])
         self._applying_metadata_to_fields = True
 
         def _bg(found: bool) -> str:
@@ -9507,7 +9939,7 @@ class DeconvolveCIWindow(QMainWindow):
                     self._le_excitation.setEnabled(True)
                 # (widefield: field stays N/A and disabled)
             self._le_emission.setStyleSheet(
-                _bg("emission_wavelength" in from_file))
+                _bg("emission_wavelength" in from_file or "emission_wavelength" in inferred))
             self._refresh_confocal_only_metadata_styles(set(from_file))
             if ch_info:
                 pinhole_text = _format_channel_values(
@@ -9579,6 +10011,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         self._sync_preview_buttons()
         self._viewer.set_input_data([], self._metadata)
+        self._viewer.set_roi_available(not source_is_pyramidal)
         self._viewer.refresh_view()
         self._set_metadata_warnings(self._metadata_issues(self._metadata))
         self._update_sampling_warnings()
@@ -10025,12 +10458,47 @@ class DeconvolveCIWindow(QMainWindow):
         if self._log_dialog is not None:
             self._log_dialog.clear_charts()
         self._set_log_running(True)
+        worker_channels = self._input_channels
+        worker_metadata = self._metadata
+        roi_payload = None
+        roi_rect = self._viewer.current_roi_rect() if hasattr(self._viewer, "current_roi_rect") else None
+        if roi_rect and self._input_channels:
+            first = _normalize_stack_to_zyx(self._input_channels[0])
+            full_z, full_y, full_x = (int(first.shape[0]), int(first.shape[1]), int(first.shape[2]))
+            display_rect = _normalise_roi_rect(roi_rect, full_y, full_x)
+            if display_rect is not None:
+                padding = max(8, int(math.ceil(_estimate_psf_xy_for_params(params) / 2.0)))
+                compute_rect = _expand_roi_rect(display_rect, full_y, full_x, padding)
+                worker_channels = _crop_channels_to_roi(self._input_channels, compute_rect)
+                worker_metadata = dict(self._metadata)
+                worker_metadata["size_x"] = int(compute_rect["width"])
+                worker_metadata["size_y"] = int(compute_rect["height"])
+                worker_metadata["size_z"] = full_z
+                worker_metadata["roi_preview"] = True
+                roi_payload = {
+                    "enabled": True,
+                    "display_rect": dict(display_rect),
+                    "compute_rect": dict(compute_rect),
+                    "padding_xy_px": int(padding),
+                    "full_shape_zyx": [full_z, full_y, full_x],
+                }
+                params = dict(params)
+                params["roi_preview"] = roi_payload
         self._log("")
         self._log("=" * 70)
         self._log(f"Starting deconvolution preview for T={current_t + 1}")
+        if roi_payload is not None:
+            disp = roi_payload["display_rect"]
+            comp = roi_payload["compute_rect"]
+            self._log(
+                "ROI preview: "
+                f"display X={disp['x']} Y={disp['y']} W={disp['width']} H={disp['height']}; "
+                f"compute X={comp['x']} Y={comp['y']} W={comp['width']} H={comp['height']} "
+                f"(padding={roi_payload['padding_xy_px']} px)"
+            )
         self._log("=" * 70)
         self._worker = _DeconvolveWorker(
-            self._input_channels, self._metadata, params, current_t, parent=self
+            worker_channels, worker_metadata, params, current_t, parent=self
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_deconv_done)
@@ -10095,13 +10563,29 @@ class DeconvolveCIWindow(QMainWindow):
                 return
 
             timepoint = int(result["timepoint"])
-            self._preview_outputs_by_t[timepoint] = result["channels"]
-            self._viewer.set_preview_result(timepoint, result["channels"])
+            channels = list(result["channels"])
+            roi_payload = result.get("roi_preview") if isinstance(result, dict) else None
+            if roi_payload:
+                channels = _place_roi_channels_on_full_canvas(channels, self._input_channels, dict(roi_payload))
+                self._preview_roi_by_t[timepoint] = dict(roi_payload)
+                disp = dict(roi_payload.get("display_rect") or {})
+                self._log(
+                    "ROI preview placed on full canvas: "
+                    f"X={disp.get('x', '?')} Y={disp.get('y', '?')} "
+                    f"W={disp.get('width', '?')} H={disp.get('height', '?')}"
+                )
+            else:
+                self._preview_roi_by_t.pop(timepoint, None)
+            self._preview_outputs_by_t[timepoint] = channels
+            self._viewer.set_preview_result(timepoint, channels)
             self._sync_preview_buttons()
             self._log("Deconvolution complete.")
             self._status.showMessage(f"Deconvolution complete for T={timepoint + 1}", 5000)
             self._finish_run_timeline("Done")
-            self._add_run_history("Done", message=f"Preview T={timepoint + 1}")
+            history_message = f"Preview T={timepoint + 1}"
+            if roi_payload:
+                history_message += " ROI"
+            self._add_run_history("Done", message=history_message)
             # Push final residual to live chart panel if enabled
             if self._log_dialog is not None and self._log_dialog.is_charts_enabled():
                 payload = self._last_final_iteration_payload
@@ -10115,6 +10599,13 @@ class DeconvolveCIWindow(QMainWindow):
                     ):
                         raw_arr = np.asarray(self._input_channels[ch_idx], dtype=np.float32)
                         est_arr = np.asarray(estimated, dtype=np.float32)
+                        if roi_payload:
+                            rect = dict(roi_payload.get("compute_rect") or {})
+                            rx = int(rect.get("x", 0))
+                            ry = int(rect.get("y", 0))
+                            rw = int(rect.get("width", raw_arr.shape[-1]))
+                            rh = int(rect.get("height", raw_arr.shape[-2]))
+                            raw_arr = _normalize_stack_to_zyx(raw_arr)[:, ry:ry + rh, rx:rx + rw]
 
                         def _central_z(arr: np.ndarray) -> np.ndarray:
                             if arr.ndim == 2:
@@ -10480,6 +10971,9 @@ class DeconvolveCIWindow(QMainWindow):
         metadata["cideconvolve_processing"] = dict(metadata.get("cideconvolve_processing") or {})
         metadata["cideconvolve_processing"]["tile_streaming"] = False
         metadata["cideconvolve_processing"]["preview_timepoint"] = int(current_t)
+        roi_payload = self._preview_roi_by_t.get(current_t)
+        if roi_payload:
+            metadata["cideconvolve_processing"]["roi_preview"] = dict(roi_payload)
         return current_t, data, metadata
 
     def _project_preview_export_data(
@@ -10927,6 +11421,9 @@ class DeconvolveCIWindow(QMainWindow):
             "movie_info_overlay": self._cb_movie_info.isChecked() if self._movie_available else False,
             "movie_log_convergence": self._cb_movie_log_convergence.isChecked() if self._movie_available else False,
             "last_leica_dir": self._last_leica_dir,
+            "last_zeiss_dir": self._last_browser_dirs.get("zeiss", _default_settings_dir()),
+            "last_nikon_dir": self._last_browser_dirs.get("nikon", _default_settings_dir()),
+            "last_olympus_dir": self._last_browser_dirs.get("olympus", _default_settings_dir()),
         }
 
     def _apply_settings(self, data: dict):
@@ -11069,7 +11566,11 @@ class DeconvolveCIWindow(QMainWindow):
         if val is not None:
             self._cb_integrate.setChecked(bool(val))
         if data.get("last_leica_dir") is not None:
-            self._last_leica_dir = _accessible_directory_or_home(data.get("last_leica_dir"))
+            self._set_last_browser_dir("leica", data.get("last_leica_dir"))
+        for vendor_key in ("zeiss", "nikon", "olympus"):
+            key = f"last_{vendor_key}_dir"
+            if data.get(key) is not None:
+                self._set_last_browser_dir(vendor_key, data.get(key))
         self._update_sampling_warnings()
 
     def _save_last_settings(self):
@@ -11294,6 +11795,19 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_viewer_cursor_info(self, text: str) -> None:
         del text
+
+    def _on_viewer_roi_changed(self, rect: object) -> None:
+        if not rect:
+            return
+        data = dict(rect) if isinstance(rect, dict) else {}
+        try:
+            self._status.showMessage(
+                f"ROI preview X={int(data.get('x', 0))} Y={int(data.get('y', 0))} "
+                f"W={int(data.get('width', 0))} H={int(data.get('height', 0))}",
+                3000,
+            )
+        except Exception:
+            pass
 
     def _on_viewer_time_changed(self, timepoint: int) -> None:
         previous_t = self._loaded_timepoint

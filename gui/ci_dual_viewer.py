@@ -378,6 +378,7 @@ class ZoomableImageView(QGraphicsView):
 
     cursorMoved = pyqtSignal(float, float, bool)
     rightSplitDragged = pyqtSignal(float)
+    roiSceneRectChanged = pyqtSignal(object)
     panDragStarted = pyqtSignal()
     panDragFinished = pyqtSignal()
 
@@ -399,6 +400,13 @@ class ZoomableImageView(QGraphicsView):
         self._navigator_dragging = False
         self._navigator_rect = QRectF()
         self._right_dragging_pan = False
+        self._roi_selection_enabled = False
+        self._roi_dragging = False
+        self._roi_start_scene = QPointF()
+        self._roi_drag_start_rect = QRectF()
+        self._roi_scene_rect = QRectF()
+        self._roi_drag_mode = "new"
+        self._roi_resize_edges: set[str] = set()
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -443,6 +451,78 @@ class ZoomableImageView(QGraphicsView):
     def set_interaction_cursor(self, shape: Qt.CursorShape) -> None:
         self.setCursor(shape)
         self.viewport().setCursor(shape)
+
+    def set_roi_selection_enabled(self, enabled: bool) -> None:
+        self._roi_selection_enabled = bool(enabled)
+        self.setDragMode(
+            QGraphicsView.DragMode.NoDrag
+            if self._roi_selection_enabled
+            else QGraphicsView.DragMode.ScrollHandDrag
+        )
+        self.set_interaction_cursor(
+            Qt.CursorShape.CrossCursor
+            if self._roi_selection_enabled
+            else Qt.CursorShape.ArrowCursor
+        )
+
+    def set_roi_scene_rect(self, rect: Optional[QRectF]) -> None:
+        self._roi_scene_rect = QRectF(rect) if rect is not None else QRectF()
+        self.viewport().update()
+
+    def _roi_hit_tolerance_scene(self) -> float:
+        scale = max(abs(float(self.transform().m11())), 1e-6)
+        return max(2.0, 8.0 / scale)
+
+    def _roi_hit_edges(self, scene_pos: QPointF) -> set[str]:
+        rect = self._roi_scene_rect.normalized()
+        if rect.isNull() or rect.width() <= 0 or rect.height() <= 0:
+            return set()
+        tol = self._roi_hit_tolerance_scene()
+        expanded = rect.adjusted(-tol, -tol, tol, tol)
+        if not expanded.contains(scene_pos):
+            return set()
+        edges: set[str] = set()
+        if abs(scene_pos.x() - rect.left()) <= tol:
+            edges.add("left")
+        if abs(scene_pos.x() - rect.right()) <= tol:
+            edges.add("right")
+        if abs(scene_pos.y() - rect.top()) <= tol:
+            edges.add("top")
+        if abs(scene_pos.y() - rect.bottom()) <= tol:
+            edges.add("bottom")
+        return edges
+
+    def _roi_cursor_for_edges(self, edges: set[str]) -> Qt.CursorShape:
+        if {"left", "top"}.issubset(edges) or {"right", "bottom"}.issubset(edges):
+            return Qt.CursorShape.SizeFDiagCursor
+        if {"right", "top"}.issubset(edges) or {"left", "bottom"}.issubset(edges):
+            return Qt.CursorShape.SizeBDiagCursor
+        if "left" in edges or "right" in edges:
+            return Qt.CursorShape.SizeHorCursor
+        if "top" in edges or "bottom" in edges:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.CrossCursor
+
+    def _clamp_roi_rect_to_scene(self, rect: QRectF, *, preserve_size: bool) -> QRectF:
+        scene = self._scene.sceneRect()
+        rect = rect.normalized()
+        if scene.isEmpty():
+            return rect
+        if preserve_size:
+            if rect.width() > scene.width() or rect.height() > scene.height():
+                return rect.intersected(scene).normalized()
+            dx = 0.0
+            dy = 0.0
+            if rect.left() < scene.left():
+                dx = scene.left() - rect.left()
+            elif rect.right() > scene.right():
+                dx = scene.right() - rect.right()
+            if rect.top() < scene.top():
+                dy = scene.top() - rect.top()
+            elif rect.bottom() > scene.bottom():
+                dy = scene.bottom() - rect.bottom()
+            return rect.translated(dx, dy)
+        return rect.intersected(scene).normalized()
 
     def set_pixmap(self, pixmap: Optional[QPixmap]) -> None:
         self._scene.clear()
@@ -522,10 +602,31 @@ class ZoomableImageView(QGraphicsView):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
+        self._draw_roi_overlay()
         self._draw_minimap()
         self._draw_scale_bar()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._roi_selection_enabled
+            and self._pix_item is not None
+        ):
+            self._roi_dragging = True
+            self._roi_start_scene = self.mapToScene(event.pos())
+            self._roi_drag_start_rect = QRectF(self._roi_scene_rect).normalized()
+            self._roi_resize_edges = self._roi_hit_edges(self._roi_start_scene)
+            if self._roi_resize_edges:
+                self._roi_drag_mode = "resize"
+            elif self._roi_drag_start_rect.contains(self._roi_start_scene):
+                self._roi_drag_mode = "move"
+            else:
+                self._roi_drag_mode = "new"
+                self._roi_scene_rect = QRectF(self._roi_start_scene, self._roi_start_scene)
+            self.roiSceneRectChanged.emit(QRectF(self._roi_scene_rect))
+            self.viewport().update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._pix_item is not None:
             self._emit_split_ratio(event.position().x())
             event.accept()
@@ -557,6 +658,43 @@ class ZoomableImageView(QGraphicsView):
             self._pan_from_navigator(event.position())
             event.accept()
             return
+        if self._roi_dragging:
+            scene_pos = self.mapToScene(event.pos())
+            if self._roi_drag_mode == "move":
+                delta = scene_pos - self._roi_start_scene
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(
+                    self._roi_drag_start_rect.translated(delta),
+                    preserve_size=True,
+                )
+            elif self._roi_drag_mode == "resize":
+                rect = QRectF(self._roi_drag_start_rect)
+                if "left" in self._roi_resize_edges:
+                    rect.setLeft(scene_pos.x())
+                if "right" in self._roi_resize_edges:
+                    rect.setRight(scene_pos.x())
+                if "top" in self._roi_resize_edges:
+                    rect.setTop(scene_pos.y())
+                if "bottom" in self._roi_resize_edges:
+                    rect.setBottom(scene_pos.y())
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(rect, preserve_size=False)
+            else:
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(
+                    QRectF(self._roi_start_scene, scene_pos),
+                    preserve_size=False,
+                )
+            self.roiSceneRectChanged.emit(QRectF(self._roi_scene_rect))
+            self.viewport().update()
+            event.accept()
+            return
+        if self._roi_selection_enabled and self._pix_item is not None:
+            scene_pos = self.mapToScene(event.pos())
+            edges = self._roi_hit_edges(scene_pos)
+            if edges:
+                self.set_interaction_cursor(self._roi_cursor_for_edges(edges))
+            elif self._roi_scene_rect.normalized().contains(scene_pos):
+                self.set_interaction_cursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.set_interaction_cursor(Qt.CursorShape.CrossCursor)
         if event.buttons() & Qt.MouseButton.LeftButton and self._pix_item is not None:
             self._emit_split_ratio(event.position().x())
             event.accept()
@@ -580,6 +718,35 @@ class ZoomableImageView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._roi_dragging:
+            self._roi_dragging = False
+            scene_pos = self.mapToScene(event.pos())
+            if self._roi_drag_mode == "move":
+                delta = scene_pos - self._roi_start_scene
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(
+                    self._roi_drag_start_rect.translated(delta),
+                    preserve_size=True,
+                )
+            elif self._roi_drag_mode == "resize":
+                rect = QRectF(self._roi_drag_start_rect)
+                if "left" in self._roi_resize_edges:
+                    rect.setLeft(scene_pos.x())
+                if "right" in self._roi_resize_edges:
+                    rect.setRight(scene_pos.x())
+                if "top" in self._roi_resize_edges:
+                    rect.setTop(scene_pos.y())
+                if "bottom" in self._roi_resize_edges:
+                    rect.setBottom(scene_pos.y())
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(rect, preserve_size=False)
+            else:
+                self._roi_scene_rect = self._clamp_roi_rect_to_scene(
+                    QRectF(self._roi_start_scene, scene_pos),
+                    preserve_size=False,
+                )
+            self.roiSceneRectChanged.emit(QRectF(self._roi_scene_rect))
+            self.viewport().update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._navigator_dragging:
             self._navigator_dragging = False
             self._pan_from_navigator(event.position())
@@ -651,6 +818,21 @@ class ZoomableImageView(QGraphicsView):
         painter.setPen(QPen(QColor("#f8fafc"), 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(visible_rect)
+        painter.end()
+
+    def _draw_roi_overlay(self) -> None:
+        if self._roi_scene_rect.isNull() or self._roi_scene_rect.width() <= 0 or self._roi_scene_rect.height() <= 0:
+            return
+        viewport_rect = self.mapFromScene(self._roi_scene_rect).boundingRect()
+        if viewport_rect.width() < 1 or viewport_rect.height() < 1:
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(QColor("#facc15"), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawRect(viewport_rect)
         painter.end()
 
     def _emit_split_ratio(self, viewport_x: float) -> None:
@@ -1966,6 +2148,7 @@ class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
     logRequested = pyqtSignal()
     cursorInfoChanged = pyqtSignal(str)
+    roiChanged = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1995,6 +2178,8 @@ class DualViewerWidget(QWidget):
         self._smooth_zoom_enabled = False
         self._scale_bar_enabled = True
         self._navigator_enabled = True
+        self._roi_enabled = False
+        self._roi_image_rect: Optional[dict[str, int]] = None
         self._blink_show_deconvolved = False
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(550)
@@ -2106,6 +2291,14 @@ class DualViewerWidget(QWidget):
         self._fit_button.setMinimumWidth(54)
         self._fit_button.clicked.connect(self.fit_views)
         view_section_layout.addWidget(self._fit_button)
+
+        self._roi_toggle = QCheckBox("ROI")
+        self._roi_toggle.setToolTip("Enable drag-selection ROI preview on the Original pane")
+        self._roi_toggle.toggled.connect(self._on_roi_toggled)
+        view_section_layout.addWidget(self._roi_toggle)
+        self._roi_label = QLabel("ROI: none")
+        self._roi_label.setMinimumWidth(90)
+        view_section_layout.addWidget(self._roi_label)
 
         display_section = _group("display", "Display")
         top.addWidget(display_section)
@@ -2219,6 +2412,7 @@ class DualViewerWidget(QWidget):
             lambda x, y, inside: self._on_cursor_moved("Original", x, y, inside)
         )
         self._input_pane.view2d.rightSplitDragged.connect(self._on_split_dragged)
+        self._input_pane.view2d.roiSceneRectChanged.connect(self._on_roi_scene_rect_changed)
         self._input_pane.view2d.panDragStarted.connect(self._set_pan_drag_cursor)
         self._input_pane.view2d.panDragFinished.connect(self._refresh_split_cursor)
         self._output_pane.view2d.cursorMoved.connect(
@@ -2275,6 +2469,9 @@ class DualViewerWidget(QWidget):
         self._loaded_input_timepoint = None
         self._metadata = metadata
         self._preview_by_t.clear()
+        self._roi_image_rect = None
+        self._input_pane.view2d.set_roi_scene_rect(None)
+        self._refresh_roi_label()
         channels_meta = self._display_channels()
         self._channel_colors = _resolve_channel_colors(channels_meta)
         self._rebuild_channel_buttons(channels_meta)
@@ -2298,6 +2495,97 @@ class DualViewerWidget(QWidget):
         self._ensure_mode_valid()
         self._sync_advanced_scaling_window()
         self._refresh_view()
+
+    def set_roi_available(self, available: bool) -> None:
+        available = bool(available)
+        self._roi_toggle.setEnabled(available)
+        if not available and self._roi_enabled:
+            self._roi_toggle.setChecked(False)
+
+    def current_roi_rect(self) -> Optional[dict[str, int]]:
+        if not self._roi_enabled or not self._roi_image_rect:
+            return None
+        if int(self._roi_image_rect.get("width", 0)) < 2 or int(self._roi_image_rect.get("height", 0)) < 2:
+            return None
+        return dict(self._roi_image_rect)
+
+    def clear_roi(self) -> None:
+        self._roi_image_rect = None
+        self._input_pane.view2d.set_roi_scene_rect(None)
+        self._roi_label.setText("ROI: none")
+        self.roiChanged.emit(None)
+        self._refresh_view()
+
+    def _on_roi_toggled(self, enabled: bool) -> None:
+        self._roi_enabled = bool(enabled)
+        self._input_pane.view2d.set_roi_selection_enabled(self._roi_enabled)
+        if not self._roi_enabled:
+            self._roi_image_rect = None
+            self._input_pane.view2d.set_roi_scene_rect(None)
+        self._refresh_roi_label()
+        self._refresh_split_cursor()
+        self.roiChanged.emit(self.current_roi_rect())
+
+    def _current_input_display_stride(self) -> int:
+        for idx in self._active_channel_indices():
+            if 0 <= idx < len(self._input_channels):
+                stack = self._input_channels[idx]
+                if getattr(stack, "ndim", 0) >= 2:
+                    return _display_stride(tuple(int(v) for v in stack.shape[-2:]))
+        for stack in self._input_channels:
+            if getattr(stack, "ndim", 0) >= 2:
+                return _display_stride(tuple(int(v) for v in stack.shape[-2:]))
+        return 1
+
+    def _input_image_size_yx(self) -> tuple[int, int]:
+        for stack in self._input_channels:
+            if getattr(stack, "ndim", 0) >= 2:
+                return int(stack.shape[-2]), int(stack.shape[-1])
+        return 0, 0
+
+    def _roi_scene_rect_from_image_rect(self) -> Optional[QRectF]:
+        if not self._roi_image_rect:
+            return None
+        stride = max(int(self._current_input_display_stride()), 1)
+        rect = self._roi_image_rect
+        return QRectF(
+            float(rect["x"]) / stride,
+            float(rect["y"]) / stride,
+            float(rect["width"]) / stride,
+            float(rect["height"]) / stride,
+        )
+
+    def _on_roi_scene_rect_changed(self, scene_rect: object) -> None:
+        if not self._roi_enabled or not isinstance(scene_rect, QRectF):
+            return
+        stride = max(int(self._current_input_display_stride()), 1)
+        size_y, size_x = self._input_image_size_yx()
+        if size_y <= 0 or size_x <= 0:
+            return
+        x0 = int(math.floor(scene_rect.left() * stride))
+        y0 = int(math.floor(scene_rect.top() * stride))
+        x1 = int(math.ceil(scene_rect.right() * stride))
+        y1 = int(math.ceil(scene_rect.bottom() * stride))
+        x0 = max(0, min(x0, size_x))
+        y0 = max(0, min(y0, size_y))
+        x1 = max(0, min(x1, size_x))
+        y1 = max(0, min(y1, size_y))
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        self._roi_image_rect = {"x": x0, "y": y0, "width": width, "height": height}
+        self._input_pane.view2d.set_roi_scene_rect(self._roi_scene_rect_from_image_rect())
+        self._refresh_roi_label()
+        self.roiChanged.emit(self.current_roi_rect())
+
+    def _refresh_roi_label(self) -> None:
+        if not self._roi_enabled:
+            self._roi_label.setText("ROI: off")
+            return
+        if not self._roi_image_rect:
+            self._roi_label.setText("ROI: drag")
+            return
+        rect = self._roi_image_rect
+        self._roi_label.setText(f"ROI: {rect['width']} x {rect['height']}")
 
     def set_tiled_input_provider(self, provider) -> None:
         """Enable progressive pyramid rendering for the original pane."""
@@ -2323,6 +2611,9 @@ class DualViewerWidget(QWidget):
         self._ensure_channel_scaling_defaults()
         self._ensure_mode_valid()
         self._sync_advanced_scaling_window()
+        self._input_pane.view2d.set_roi_scene_rect(
+            self._roi_scene_rect_from_image_rect() if self._roi_enabled else None
+        )
         self._refresh_view()
 
     def clear_preview_results(self) -> None:
@@ -2534,6 +2825,10 @@ class DualViewerWidget(QWidget):
         self._compare_split_slider.setValue(value)
 
     def _refresh_split_cursor(self) -> None:
+        if self._roi_enabled and self._mode_combo.currentText() == _TWO_D_MODE:
+            self._input_pane.view2d.set_interaction_cursor(Qt.CursorShape.CrossCursor)
+            self._output_pane.view2d.set_interaction_cursor(Qt.CursorShape.ArrowCursor)
+            return
         cursor = (
             Qt.CursorShape.SplitHCursor
             if self._mode_combo.currentText() == _TWO_D_MODE and self._view_mode_text() == "Linked split"
@@ -2982,6 +3277,7 @@ class DualViewerWidget(QWidget):
         self._smooth_zoom_check.setEnabled(mode == _TWO_D_MODE)
         self._navigator_check.setEnabled(mode == _TWO_D_MODE)
         self._scale_bar_check.setEnabled(mode == _TWO_D_MODE)
+        self._input_pane.view2d.set_roi_selection_enabled(self._roi_enabled and mode == _TWO_D_MODE)
         self._z_slider.setEnabled(mode == _TWO_D_MODE and self._z_slider.maximum() > 0 and self._projection_combo.currentText() == "Slice")
         self._refresh_navigator_state()
         self._refresh_view()
@@ -3267,6 +3563,9 @@ class DualViewerWidget(QWidget):
         else:
             input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
             self._input_pane.set_pixmap(input_pixmap)
+        self._input_pane.view2d.set_roi_scene_rect(
+            self._roi_scene_rect_from_image_rect() if self._roi_enabled else None
+        )
 
         if preview:
             output_was_placeholder = self._output_pane._display_stack.currentIndex() == 1

@@ -22,6 +22,7 @@ imagecodecs>=2024.1.1
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
 bioio-ome-zarr==3.3.0
+ome-zarr>=0.16.0
 bioio-czi==2.6.1
 bioio-nd2==1.7.0
 
@@ -29,8 +30,11 @@ bioio-nd2==1.7.0
 # Requires ZeroC ICE wheel installed separately — see README.md
 omero-browser-qt[viewer]==0.2.5
 
-# Leica browser (Open Leica… button)
+# Microscope browsers (Open Leica/Zeiss/Nikon/Olympus… buttons)
 leica-browser-qt>=0.4.0
+zeiss-browser-qt>=0.4.0
+nikon-browser-qt>=0.1.0
+olympus-browser-qt>=0.2.0
 
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0

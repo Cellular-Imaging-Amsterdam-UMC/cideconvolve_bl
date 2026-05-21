@@ -21,6 +21,7 @@ import numpy as np
 from ._meta_helpers import (
     _DEFAULT_PINHOLE_AIRY_UNITS,
     _apply_pinhole_airy_units,
+    apply_dye_wavelength_fallbacks,
 )
 
 log = logging.getLogger(__name__)
@@ -220,6 +221,15 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
     channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
     if len(channels) < c:
         channels.extend({} for _ in range(c - len(channels)))
+    names = list(meta.get("channel_names") or [])
+    if len(names) < c:
+        names.extend(f"Ch{i}" for i in range(len(names), c))
+    meta["channel_names"] = names[:c]
+    meta["channels"] = channels[:c]
+    apply_dye_wavelength_fallbacks(meta, c)
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
+    if len(channels) < c:
+        channels.extend({} for _ in range(c - len(channels)))
     for ch in channels:
         if ch.get("emission_wavelength") is None:
             ch["emission_wavelength"] = 520.0
@@ -227,10 +237,6 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
     meta["channels"] = channels[:c]
     if not _apply_pinhole_airy_units(meta, _DEFAULT_PINHOLE_AIRY_UNITS, overrule_metadata=False):
         defaulted.add("pinhole_airy_units")
-    names = list(meta.get("channel_names") or [])
-    if len(names) < c:
-        names.extend(f"Ch{i}" for i in range(len(names), c))
-    meta["channel_names"] = names[:c]
     meta["_defaulted_keys"] = defaulted
     return meta
 
@@ -458,6 +464,80 @@ class ZarrRegionSource:
             self._layout = old_layout
 
 
+class OmeZarrRegionSource:
+    """Region source backed by the official ome-zarr-py reader."""
+
+    def __init__(self, path: str | Path, *, array_path: str = "0"):
+        from core.ome_zarr_io import open_ome_zarr_image_node
+
+        self.path, self._node = open_ome_zarr_image_node(path)
+        self._level = int(array_path)
+        self._levels = self._node.data
+        self._array = self._levels[self._level]
+        self.source_id = f"ome-zarr:{self.path}:{self._level}"
+        self._layout = ZarrRegionSource._infer_layout(tuple(int(v) for v in self._array.shape))
+        self.shape = self._layout["shape_tczyx"]
+        self.metadata = _apply_basic_metadata_defaults(self._metadata_from_node(), self.shape)
+
+    def _metadata_from_node(self) -> dict[str, Any]:
+        t, c, z, y, x = self.shape
+        meta: dict[str, Any] = {
+            "size_t": t,
+            "size_c": c,
+            "size_z": z,
+            "size_y": y,
+            "size_x": x,
+            "n_channels": c,
+        }
+        node_meta = dict(getattr(self._node, "metadata", {}) or {})
+        if node_meta.get("name"):
+            meta["name"] = node_meta.get("name")
+        transforms = node_meta.get("coordinateTransformations") or []
+        if transforms and isinstance(transforms[0], list):
+            for transform in transforms[0]:
+                if transform.get("type") != "scale":
+                    continue
+                scale = transform.get("scale", [])
+                if len(scale) == 5:
+                    meta["pixel_size_z"] = scale[2]
+                    meta["pixel_size_y"] = scale[3]
+                    meta["pixel_size_x"] = scale[4]
+                elif len(scale) == 4:
+                    meta["pixel_size_z"] = scale[1]
+                    meta["pixel_size_y"] = scale[2]
+                    meta["pixel_size_x"] = scale[3]
+                elif len(scale) == 3:
+                    meta["pixel_size_y"] = scale[1]
+                    meta["pixel_size_x"] = scale[2]
+                break
+        return meta
+
+    def read_region(self, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
+        kind = self._layout["kind"]
+        if kind == "TCZYX":
+            data = self._array[int(t), int(c), z, y, x]
+        elif kind == "CZYX":
+            data = self._array[int(c), z, y, x]
+        elif kind == "CYX":
+            data = self._array[int(c), y, x][np.newaxis, :, :]
+        elif kind == "YX":
+            data = self._array[y, x][np.newaxis, :, :]
+        else:
+            raise ValueError(f"Unsupported OME-Zarr layout {kind}")
+        return np.asarray(data.compute(), dtype=np.float32)
+
+    def read_pyramid_level(self, level: int, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
+        old_array = self._array
+        old_layout = self._layout
+        self._array = self._levels[int(level)]
+        self._layout = ZarrRegionSource._infer_layout(tuple(int(v) for v in self._array.shape))
+        try:
+            return self.read_region(t=t, c=c, z=z, y=y, x=x)
+        finally:
+            self._array = old_array
+            self._layout = old_layout
+
+
 def open_region_source(
     path: str | Path,
     *,
@@ -467,7 +547,16 @@ def open_region_source(
     """Open a source with region reads, preferring native Zarr access."""
     path = Path(path)
     if path.is_dir() and path.suffix.lower() == ".zarr":
-        return ZarrRegionSource(path, hcs_field=hcs_field)
+        if hcs_field is not None:
+            return ZarrRegionSource(path, hcs_field=hcs_field)
+        try:
+            import zarr
+            root = zarr.open(str(path), mode="r")
+            if "plate" in dict(root.attrs):
+                return ZarrRegionSource(path, hcs_field=hcs_field)
+        except Exception:
+            pass
+        return OmeZarrRegionSource(path)
     return BioImageRegionSource(path, scene=scene)
 
 

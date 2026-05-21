@@ -60,6 +60,7 @@ from ._meta_helpers import (
     _metadata_float_list,
     _ome_enum_name,
     _pinhole_size_to_um,
+    apply_dye_wavelength_fallbacks,
 )
 
 _IMMERSION_RI = {
@@ -477,25 +478,65 @@ def load_image(
                 meta.update(data["metadata"])
                 images.extend(data["images"])
             else:
-                import bioio_ome_zarr
-                img = BioImage(path, reader=bioio_ome_zarr.Reader)
-                # If there are multiple images (scenes) take only the first
-                if len(img.scenes) > 1:
-                    logger.info(
-                        "OME-Zarr contains %d images (scenes); using first: %s",
-                        len(img.scenes), img.scenes[0],
-                    )
-                    img.set_scene(img.scenes[0])
-                bioio_meta = _extract_bioio_metadata(img)
-                for k, v in bioio_meta.items():
-                    if k not in meta or meta[k] is None:
-                        meta[k] = v
-                for c in range(img.dims.C):
-                    if img.dims.Z > 1:
-                        channel_data = img.get_image_data("ZYX", T=0, C=c)
-                    else:
-                        channel_data = img.get_image_data("YX", T=0, C=c)
-                    images.append(np.asarray(channel_data, dtype=np.float32))
+                from core.ome_zarr_io import open_ome_zarr_image_node
+
+                image_path, node = open_ome_zarr_image_node(path)
+                arr = node.data[0]
+                shape = tuple(int(v) for v in arr.shape)
+                node_meta = dict(getattr(node, "metadata", {}) or {})
+                logger.info("Reading OME-Zarr image group: %s", image_path)
+                if len(shape) == 5:
+                    size_t, size_c, size_z, size_y, size_x = shape
+                    for c in range(size_c):
+                        channel_data = arr[0, c].compute()
+                        images.append(np.asarray(channel_data, dtype=np.float32))
+                elif len(shape) == 4:
+                    size_t = 1
+                    size_c, size_z, size_y, size_x = shape
+                    for c in range(size_c):
+                        channel_data = arr[c].compute()
+                        images.append(np.asarray(channel_data, dtype=np.float32))
+                elif len(shape) == 3:
+                    size_t = 1
+                    size_c, size_y, size_x = shape
+                    size_z = 1
+                    for c in range(size_c):
+                        channel_data = arr[c].compute()
+                        images.append(np.asarray(channel_data, dtype=np.float32))
+                elif len(shape) == 2:
+                    size_t, size_c, size_z = 1, 1, 1
+                    size_y, size_x = shape
+                    images.append(np.asarray(arr.compute(), dtype=np.float32))
+                else:
+                    raise ValueError(f"Unsupported OME-Zarr array shape: {shape}")
+                meta.update({
+                    "size_t": size_t,
+                    "size_c": size_c,
+                    "size_z": size_z,
+                    "size_y": size_y,
+                    "size_x": size_x,
+                    "n_channels": size_c,
+                })
+                if node_meta.get("name"):
+                    meta["name"] = node_meta["name"]
+                transforms = node_meta.get("coordinateTransformations") or []
+                if transforms and isinstance(transforms[0], list):
+                    for transform in transforms[0]:
+                        if transform.get("type") != "scale":
+                            continue
+                        scale = transform.get("scale", [])
+                        if len(scale) == 5:
+                            meta["pixel_size_z"] = scale[2]
+                            meta["pixel_size_y"] = scale[3]
+                            meta["pixel_size_x"] = scale[4]
+                        elif len(scale) == 4:
+                            meta["pixel_size_z"] = scale[1]
+                            meta["pixel_size_y"] = scale[2]
+                            meta["pixel_size_x"] = scale[3]
+                        elif len(scale) == 3:
+                            meta["pixel_size_y"] = scale[1]
+                            meta["pixel_size_x"] = scale[2]
+                        break
 
         elif companion_path is not None and path.suffix == ".ome":
             # Find the associated TIFF files from the companion
@@ -552,8 +593,8 @@ def load_image(
             raise
         if _is_zarr and isinstance(exc, ImportError):
             raise ImportError(
-                "bioio-ome-zarr is required to read OME-Zarr files. "
-                "Install with: pip install bioio-ome-zarr"
+                "ome-zarr is required to read OME-Zarr files. "
+                "Install with: pip install ome-zarr"
             )
         logger.warning("bioio cannot read this format, falling back to tifffile")
         if companion_path is not None and path.suffix == ".ome":
@@ -636,10 +677,9 @@ def load_image(
     # Ensure channels list
     _em_defaulted = False
     if "channels" not in meta or not meta["channels"]:
-        meta["channels"] = [
-            {"emission_wavelength": 520.0} for _ in range(len(images))
-        ]
-        _em_defaulted = True
+        meta["channels"] = [{} for _ in range(len(images))]
+    if apply_dye_wavelength_fallbacks(meta, len(images)):
+        _defaulted.discard("emission_wavelength")
     # Fill in missing emission wavelengths with a default
     for ch in meta["channels"]:
         if ch.get("emission_wavelength") is None:
