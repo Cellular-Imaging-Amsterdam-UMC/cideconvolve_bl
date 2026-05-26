@@ -34,9 +34,9 @@ RUN python -m pip install --upgrade pip \
 
 # --- Application code ---
 COPY core/ /app/core/
-COPY bioflows_local.py /app/bioflows_local.py
-COPY wrapper.py /app/wrapper.py
-COPY descriptor.json /app/descriptor.json
+COPY bilayers_local.py /app/bilayers_local.py
+COPY wrapper_bl.py /app/wrapper_bl.py
+COPY bilayers_config.yaml /app/bilayers_config.yaml
 
 # --- BIAFLOWS data directories ---
 RUN mkdir -p /data/in /data/out /data/gt
@@ -45,4 +45,4 @@ RUN mkdir -p /data/in /data/out /data/gt
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-ENTRYPOINT ["python", "/app/wrapper.py"]
+ENTRYPOINT ["python", "/app/wrapper_bl.py"]

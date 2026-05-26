@@ -1,0 +1,590 @@
+citations:
+  - name: "cideconvolve_shb_rl"
+    doi: "10.1109/TIP.2014.2361594"
+    license: "Unknown"
+    description: "Scaled Heavy-Ball acceleration of Richardson-Lucy deconvolution."
+
+docker_image:
+  org: "cellularimagingcf"
+  name: "w_cideconvolve"
+  tag: "latest"
+  platform: "linux/amd64"
+
+algorithm_folder_name: "cideconvolve_inference"
+
+exec_function:
+  name: "generate_cli_command"
+  cli_command: "python wrapper.py"
+  hidden_args:
+    - cli_tag: "--outfolder"
+      value: "/bilayers/outputs"
+      cli_order: 2
+    - cli_tag: "--gtfolder"
+      value: "/bilayers/gt"
+      cli_order: 3
+    - cli_tag: "--local"
+      value: "True"
+      append_value: false
+      cli_order: 4
+
+inputs:
+  - name: input_images
+    type: image
+    label: "Input Images"
+    description: "Input microscopy images folder for CIDeconvolve."
+    cli_tag: "--infolder"
+    cli_order: 1
+    default: "directory"
+    optional: false
+    format:
+      - tif
+      - tiff
+      - ometif
+      - ometiff
+      - png
+      - jpg
+      - jpeg
+      - bmp
+      - npy
+      - zarr
+    folder_name: "/bilayers/inputs"
+    file_count: "multiple"
+    section_id: "inputs"
+    mode: "beginner"
+    depth: true
+    timepoints: true
+    tiled: true
+    pyramidal: true
+
+outputs:
+  - name: output_images
+    type: image
+    label: "Deconvolved Outputs"
+    description: "Output folder containing OME-TIFF and/or OME-Zarr deconvolution results."
+    default: "directory"
+    optional: false
+    format:
+      - ometiff
+      - tif
+      - tiff
+      - zarr
+      - csv
+      - png
+    folder_name: "/bilayers/outputs"
+    file_count: "multiple"
+    section_id: "outputs"
+    mode: "beginner"
+    depth: true
+    timepoints: true
+    tiled: true
+    pyramidal: true
+
+parameters:
+  - name: method
+    type: dropdown
+    label: "Deconvolution Method"
+    description: "Algorithm to use for deconvolution."
+    options:
+      - label: "ci_rl"
+        value: "ci_rl"
+      - label: "ci_rl_tv"
+        value: "ci_rl_tv"
+      - label: "ci_sparse_hessian"
+        value: "ci_sparse_hessian"
+    default: "ci_rl"
+    multiselect: false
+    cli_tag: "--method"
+    cli_order: 10
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: iterations
+    type: textbox
+    label: "RL Iterations"
+    description: "Comma-separated iterations per channel, e.g. 150 or 150,100,200."
+    default: "150"
+    cli_tag: "--iterations"
+    cli_order: 11
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: convergence
+    type: dropdown
+    label: "Convergence Mode"
+    description: "auto enables early stopping; fixed runs all requested iterations."
+    options:
+      - label: "auto"
+        value: "auto"
+      - label: "fixed"
+        value: "fixed"
+    default: "auto"
+    multiselect: false
+    cli_tag: "--convergence"
+    cli_order: 12
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: rel_threshold
+    type: float
+    label: "Convergence Threshold"
+    description: "Relative change threshold used when convergence=auto."
+    default: 0.005
+    cli_tag: "--rel_threshold"
+    cli_order: 13
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: overrule_image_metadata
+    type: checkbox
+    label: "Overrule Image Metadata"
+    description: "If enabled, descriptor values replace image metadata."
+    default: false
+    cli_tag: "--overrule_image_metadata"
+    cli_order: 14
+    optional: true
+    append_value: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: na
+    type: float
+    label: "Numerical Aperture"
+    description: "Objective numerical aperture fallback or override."
+    default: 1.4
+    cli_tag: "--na"
+    cli_order: 15
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: emission_wl
+    type: textbox
+    label: "Emission Wavelengths (nm)"
+    description: "Comma-separated emission wavelengths per channel."
+    default: "520"
+    cli_tag: "--emission_wl"
+    cli_order: 16
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: pixel_size_xy
+    type: float
+    label: "Pixel Size XY (nm)"
+    description: "Lateral pixel size in nanometers."
+    default: 65.0
+    cli_tag: "--pixel_size_xy"
+    cli_order: 17
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: pixel_size_z
+    type: float
+    label: "Pixel Size Z (nm)"
+    description: "Axial pixel size in nanometers."
+    default: 200.0
+    cli_tag: "--pixel_size_z"
+    cli_order: 18
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: microscope_type
+    type: dropdown
+    label: "Microscope Type"
+    description: "Microscope modality used for PSF generation."
+    options:
+      - label: "widefield"
+        value: "widefield"
+      - label: "confocal"
+        value: "confocal"
+    default: "confocal"
+    multiselect: false
+    cli_tag: "--microscope_type"
+    cli_order: 19
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: excitation_wl
+    type: textbox
+    label: "Excitation Wavelengths (nm)"
+    description: "Comma-separated excitation wavelengths per channel."
+    default: "488"
+    cli_tag: "--excitation_wl"
+    cli_order: 20
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: pinhole_airy
+    type: textbox
+    label: "Confocal Pinhole (AU)"
+    description: "Comma-separated pinhole sizes in Airy units per channel."
+    default: "1.0"
+    cli_tag: "--pinhole_airy"
+    cli_order: 21
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: refractive_index
+    type: dropdown
+    label: "Immersion Medium"
+    description: "Immersion medium refractive index choice."
+    options:
+      - label: "air (1.0003)"
+        value: "air (1.0003)"
+      - label: "water (1.333)"
+        value: "water (1.333)"
+      - label: "oil (1.515)"
+        value: "oil (1.515)"
+    default: "oil (1.515)"
+    multiselect: false
+    cli_tag: "--refractive_index"
+    cli_order: 22
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: sample_ri
+    type: dropdown
+    label: "Sample/Mounting Medium"
+    description: "Sample refractive index preset."
+    options:
+      - label: "water (1.333)"
+        value: "water (1.333)"
+      - label: "PBS (1.334)"
+        value: "PBS (1.334)"
+      - label: "culture medium (1.337)"
+        value: "culture medium (1.337)"
+      - label: "vectashield (1.45)"
+        value: "vectashield (1.45)"
+      - label: "prolong gold (1.47)"
+        value: "prolong gold (1.47)"
+      - label: "glycerol (1.474)"
+        value: "glycerol (1.474)"
+      - label: "oil (1.515)"
+        value: "oil (1.515)"
+      - label: "prolong glass (1.52)"
+        value: "prolong glass (1.52)"
+    default: "prolong gold (1.47)"
+    multiselect: false
+    cli_tag: "--sample_ri"
+    cli_order: 23
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: projection
+    type: dropdown
+    label: "Z Projection"
+    description: "none keeps full stack, mip/sum output projection for 3D input."
+    options:
+      - label: "none"
+        value: "none"
+      - label: "mip"
+        value: "mip"
+      - label: "sum"
+        value: "sum"
+    default: "none"
+    multiselect: false
+    cli_tag: "--projection"
+    cli_order: 24
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: output_format
+    type: dropdown
+    label: "Output Format"
+    description: "Output container for deconvolved results."
+    options:
+      - label: "ome-tiff"
+        value: "ome-tiff"
+      - label: "ome-zarr"
+        value: "ome-zarr"
+    default: "ome-tiff"
+    multiselect: false
+    cli_tag: "--output_format"
+    cli_order: 25
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: streaming
+    type: dropdown
+    label: "Large-Image Streaming"
+    description: "Streaming strategy for large images."
+    options:
+      - label: "auto"
+        value: "auto"
+      - label: "always"
+        value: "always"
+      - label: "never"
+        value: "never"
+    default: "auto"
+    multiselect: false
+    cli_tag: "--streaming"
+    cli_order: 26
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: streaming_threshold_gb
+    type: float
+    label: "Streaming Threshold (GB)"
+    description: "Estimated full-source size above which auto-streaming is enabled."
+    default: 2.0
+    cli_tag: "--streaming_threshold_gb"
+    cli_order: 27
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: hcs_field
+    type: textbox
+    label: "OME-Zarr HCS Field"
+    description: "Optional HCS field path such as A/1/0, or auto."
+    default: "auto"
+    cli_tag: "--hcs_field"
+    cli_order: 28
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: benchmark
+    type: checkbox
+    label: "Benchmark Mode"
+    description: "Run built-in benchmark over the first input image."
+    default: false
+    cli_tag: "--benchmark"
+    cli_order: 29
+    optional: true
+    append_value: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: bench_crop
+    type: checkbox
+    label: "Benchmark Crop"
+    description: "Center-crop before benchmark to speed up runs."
+    default: false
+    cli_tag: "--bench_crop"
+    cli_order: 30
+    optional: true
+    append_value: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: compute_metrics
+    type: checkbox
+    label: "Compute Image Metrics"
+    description: "Compute FFT/gradient quality metrics after deconvolution."
+    default: false
+    cli_tag: "--compute_metrics"
+    cli_order: 31
+    optional: true
+    append_value: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: tv_lambda
+    type: float
+    label: "TV Lambda"
+    description: "TV regularization strength for ci_rl_tv."
+    default: 0.0001
+    cli_tag: "--tv_lambda"
+    cli_order: 32
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: damping
+    type: textbox
+    label: "Damping"
+    description: "none, auto, or numeric damping value."
+    default: "none"
+    cli_tag: "--damping"
+    cli_order: 33
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: two_d_mode
+    type: dropdown
+    label: "2D Widefield Mode"
+    description: "2D widefield deconvolution mode."
+    options:
+      - label: "auto"
+        value: "auto"
+    default: "auto"
+    multiselect: false
+    cli_tag: "--two_d_mode"
+    cli_order: 34
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: sparse_hessian_weight
+    type: float
+    label: "Sparse Hessian Weight"
+    description: "Hessian-vs-sparsity balance for ci_sparse_hessian."
+    default: 0.6
+    cli_tag: "--sparse_hessian_weight"
+    cli_order: 35
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: sparse_hessian_reg
+    type: float
+    label: "Sparse Hessian Reg"
+    description: "Data-vs-regularizer balance for ci_sparse_hessian."
+    default: 0.98
+    cli_tag: "--sparse_hessian_reg"
+    cli_order: 36
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: background
+    type: textbox
+    label: "Background"
+    description: "auto, 0, or numeric constant subtraction value."
+    default: "auto"
+    cli_tag: "--background"
+    cli_order: 37
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: offset
+    type: textbox
+    label: "Offset"
+    description: "auto, none, 0, or numeric offset."
+    default: "auto"
+    cli_tag: "--offset"
+    cli_order: 38
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: prefilter_sigma
+    type: float
+    label: "Prefilter Sigma"
+    description: "Anscombe-domain Gaussian prefilter sigma in pixels."
+    default: 0.0
+    cli_tag: "--prefilter_sigma"
+    cli_order: 39
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: start
+    type: dropdown
+    label: "Initial Estimate"
+    description: "Initialization mode for iterative solvers."
+    options:
+      - label: "auto"
+        value: "auto"
+      - label: "flat"
+        value: "flat"
+      - label: "percentile_flat"
+        value: "percentile_flat"
+      - label: "observed"
+        value: "observed"
+      - label: "observed_bgsub"
+        value: "observed_bgsub"
+      - label: "lowpass"
+        value: "lowpass"
+      - label: "lowpass_bgsub"
+        value: "lowpass_bgsub"
+      - label: "hybrid"
+        value: "hybrid"
+    default: "auto"
+    multiselect: false
+    cli_tag: "--start"
+    cli_order: 40
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: device
+    type: dropdown
+    label: "Compute Device"
+    description: "auto selects CUDA if available, else CPU."
+    options:
+      - label: "auto"
+        value: "auto"
+      - label: "cpu"
+        value: "cpu"
+      - label: "cuda"
+        value: "cuda"
+    default: "auto"
+    multiselect: false
+    cli_tag: "--device"
+    cli_order: 41
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: two_d_wf_aggressiveness
+    type: dropdown
+    label: "2D WF Aggressiveness"
+    description: "Aggressiveness for 2D widefield auto deconvolution."
+    options:
+      - label: "Very Conservative"
+        value: "Very Conservative"
+      - label: "Conservative"
+        value: "Conservative"
+      - label: "Balanced"
+        value: "Balanced"
+      - label: "Strong"
+        value: "Strong"
+      - label: "Very Strong"
+        value: "Very Strong"
+    default: "Balanced"
+    multiselect: false
+    cli_tag: "--two_d_wf_aggressiveness"
+    cli_order: 42
+    optional: true
+    section_id: "essential"
+    mode: "beginner"
+
+  - name: two_d_wf_bg_radius_um
+    type: float
+    label: "2D WF Background Radius (um)"
+    description: "Background estimator radius in micrometers for 2D widefield mode."
+    default: 0.5
+    cli_tag: "--two_d_wf_bg_radius_um"
+    cli_order: 43
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+  - name: two_d_wf_bg_scale
+    type: float
+    label: "2D WF Background Scale"
+    description: "Scale multiplier for the 2D widefield auto background estimate."
+    default: 1.0
+    cli_tag: "--two_d_wf_bg_scale"
+    cli_order: 44
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"
+
+display_only:
+  - name: scene_note
+    type: textbox
+    label: "Scene Selection Note"
+    description: "The wrapper supports --scene, but descriptor.json currently does not expose it."
+    default: "If you need scene-specific runs, add --scene support to descriptor and this Bilayers spec."
+    optional: true
+    section_id: "advanced"
+    mode: "advanced"

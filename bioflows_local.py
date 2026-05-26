@@ -135,8 +135,8 @@ class BiaflowsJob:
 
     @staticmethod
     def _normalise_suffixes(
-        suffixes: Optional[Sequence[str]],
-    ) -> Optional[List[str]]:
+        suffixes,
+    ) -> List[str]:
         if not suffixes:
             return list(DEFAULT_SUFFIXES)
         normalised: List[str] = []
@@ -183,7 +183,7 @@ def get_discipline(job: BiaflowsJob, default: Optional[str] = None) -> Optional[
     return default
 
 
-def _collect_images(directory: Path, suffixes: Optional[Sequence[str]]) -> List[ImageResource]:
+def _collect_images(directory: Path, suffixes) -> List[ImageResource]:
     if not directory.exists():
         return []
     records: List[ImageResource] = []
@@ -279,3 +279,6 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         args.gt_dir = "/data/gt"
 
     return args
+
+
+
