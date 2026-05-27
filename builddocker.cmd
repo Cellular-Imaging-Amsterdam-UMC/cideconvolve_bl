@@ -8,7 +8,7 @@ REM Derive image name from config.yaml (strip namespace for local build)
 set "IMAGE_NAME=w_cideconvolve_bl"
 
 REM Read version from version.txt
-set "VERSION=v0.0.3"
+set "VERSION=v0.0.4"
 
 pushd "%REPO_ROOT%" >nul
 if errorlevel 1 (
