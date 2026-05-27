@@ -4,8 +4,8 @@ setlocal
 set "REPO_ROOT=%~dp0"
 if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
 
-REM Derive image name from descriptor.json (strip namespace for local build)
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "(Get-Content '%REPO_ROOT%\descriptor.json' | ConvertFrom-Json).'container-image'.image.Split('/')[-1]"`) do set "IMAGE_NAME=%%I"
+REM Derive image name from bilayers_config.yaml (strip namespace for local build)
+set "IMAGE_NAME=w_cideconvolve_bl"
 
 REM Read version from version.txt
 set /p VERSION=<"%REPO_ROOT%\version.txt"

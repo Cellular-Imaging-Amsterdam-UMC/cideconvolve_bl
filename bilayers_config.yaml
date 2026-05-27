@@ -6,7 +6,7 @@ citations:
 
 docker_image:
   org: "cellularimagingcf"
-  name: "w_cideconvolve"
+  name: "w_cideconvolve_bl"
   tag: "latest"
   platform: "linux/amd64"
 
