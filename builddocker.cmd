@@ -8,7 +8,7 @@ REM Derive image name from bilayers_config.yaml (strip namespace for local build
 set "IMAGE_NAME=w_cideconvolve_bl"
 
 REM Read version from version.txt
-set /p VERSION=<"%REPO_ROOT%\version.txt"
+set "VERSION=v0.0.3"
 
 pushd "%REPO_ROOT%" >nul
 if errorlevel 1 (
