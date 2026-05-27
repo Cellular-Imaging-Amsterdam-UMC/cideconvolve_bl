@@ -36,7 +36,7 @@ RUN python -m pip install --upgrade pip \
 COPY core/ /app/core/
 COPY bilayers_local.py /app/bilayers_local.py
 COPY wrapper_bl.py /app/wrapper_bl.py
-COPY bilayers_config.yaml /app/bilayers_config.yaml
+COPY config.yaml /app/config.yaml
 
 # --- BIAFLOWS data directories ---
 RUN mkdir -p /data/in /data/out /data/gt

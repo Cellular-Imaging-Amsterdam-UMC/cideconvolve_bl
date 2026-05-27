@@ -35,7 +35,7 @@ def _str_to_bool(value: str) -> bool:
         return False
     raise argparse.ArgumentTypeError(f"Boolean value expected, got '{value}'")
 
-_DEFAULT_BILAYERS_CONFIG = "bilayers_config.yaml"
+_DEFAULT_BILAYERS_CONFIG = "config.yaml"
 _DIR_TAG_TO_ATTR = {
     "--input-dir": "input_dir",
     "--infolder": "input_dir",
@@ -120,7 +120,7 @@ def get_discipline(job: "BilayersJob", default: Optional[str] = None) -> Optiona
     return default
 
 
-def _load_bilayers_config(config_path: Path) -> Dict[str, Any]:
+def _load_config(config_path: Path) -> Dict[str, Any]:
     """Load a Bilayers config YAML and return the parsed dictionary."""
     try:
         import yaml
@@ -192,14 +192,14 @@ def _parse_bilayers_args(
     """Parse CLI arguments using Bilayers YAML metadata."""
     bootstrap = argparse.ArgumentParser(add_help=False)
     default_cfg = config_path or (Path(__file__).with_name(_DEFAULT_BILAYERS_CONFIG))
-    bootstrap.add_argument("--bilayers-config", dest="bilayers_config", default=str(default_cfg))
+    bootstrap.add_argument("--config", dest="config", default=str(default_cfg))
     bootstrap_args, _ = bootstrap.parse_known_args(argv)
 
-    config_file = Path(bootstrap_args.bilayers_config)
-    config = _load_bilayers_config(config_file)
+    config_file = Path(bootstrap_args.config)
+    config = _load_config(config_file)
 
     parser = argparse.ArgumentParser(description="Local Bilayers runner for CIDeconvolve.")
-    parser.add_argument("--bilayers-config", dest="bilayers_config", default=str(config_file))
+    parser.add_argument("--config", dest="config", default=str(config_file))
     parser.add_argument("--temp-dir", dest="temp_dir", default=None)
     parser.add_argument(
         "--suffixes", nargs="*", default=None,
@@ -357,7 +357,7 @@ class BilayersJob:
         return cls(
             args,
             config=config,
-            config_path=Path(args.bilayers_config),
+            config_path=Path(args.config),
             parameters=parameters,
         )
 

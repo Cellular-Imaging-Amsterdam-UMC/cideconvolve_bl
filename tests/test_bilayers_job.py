@@ -6,7 +6,7 @@ from bilayers_local import BilayersJob
 
 
 def _config_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "bilayers_config.yaml"
+    return Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def test_bilayers_job_uses_yaml_defaults():
