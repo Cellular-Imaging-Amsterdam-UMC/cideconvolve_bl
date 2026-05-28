@@ -184,6 +184,9 @@ def _suffixes_from_bilayers_inputs(entries: List[dict]) -> List[str]:
     return suffixes or list(DEFAULT_SUFFIXES)
 
 
+# TODO: make this similar to _parse_args, check workflow schema param names from bilayers vs biaflows descriptor.json
+# TODO: and remove _DIR_TAG_TO_ATTR mappings
+
 def _parse_bilayers_args(
     argv: Sequence[str],
     *,
