@@ -16,11 +16,8 @@ exec_function:
   name: "generate_cli_command"
   cli_command: "python wrapper.py"
   hidden_args:
-    - cli_tag: "--outfolder"
-      value: "/bilayers/outputs"
-      cli_order: 2
     - cli_tag: "--gtfolder"
-      value: "/bilayers/gt"
+      value: "/data/gt"
       cli_order: 3
     - cli_tag: "--local"
       value: "True"
@@ -47,7 +44,7 @@ inputs:
       - bmp
       - npy
       - zarr
-    folder_name: "/bilayers/inputs"
+    folder_name: "/data"
     file_count: "multiple"
     section_id: "inputs"
     mode: "beginner"
@@ -57,7 +54,7 @@ inputs:
     pyramidal: true
 
 outputs:
-  - name: output_images
+  - name: output_dir
     type: image
     label: "Deconvolved Outputs"
     description: "Output folder containing OME-TIFF and/or OME-Zarr deconvolution results."
@@ -70,7 +67,7 @@ outputs:
       - zarr
       - csv
       - png
-    folder_name: "/bilayers/outputs"
+    folder_name: "/data"
     file_count: "multiple"
     section_id: "outputs"
     mode: "beginner"
